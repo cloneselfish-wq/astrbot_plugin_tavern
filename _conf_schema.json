@@ -1,0 +1,320 @@
+{
+  "security": {
+    "description": "权限与群范围",
+    "type": "object",
+    "items": {
+      "admin_ids": {
+        "description": "酒馆管理员 ID",
+        "type": "list",
+        "hint": "只有这些真实平台用户 ID 可以开启、暂停、继续、关闭、读档或回滚。请填写字符串形式的 QQ 号/OpenID。",
+        "default": []
+      },
+      "allowed_group_ids": {
+        "description": "允许群 ID",
+        "type": "list",
+        "hint": "可留空；已配置的管理员首次在目标群发送 /酒馆 开启 时会自动识别并加入，然后显示副本选择。也可手动填写群号或平台群 OpenID。",
+        "default": []
+      },
+      "require_group_whitelist": {
+        "description": "强制群白名单",
+        "type": "bool",
+        "default": true
+      },
+      "unauthorized_command_behavior": {
+        "description": "未授权管理命令",
+        "type": "string",
+        "options": [
+          "silent",
+          "deny"
+        ],
+        "labels": [
+          "静默拦截",
+          "回复无权限"
+        ],
+        "default": "silent"
+      },
+      "public_status": {
+        "description": "参与者可查看状态",
+        "type": "bool",
+        "default": true
+      }
+    }
+  },
+  "model": {
+    "description": "叙事模型",
+    "type": "object",
+    "items": {
+      "provider_id": {
+        "description": "固定聊天模型",
+        "type": "string",
+        "_special": "select_provider",
+        "hint": "留空则使用当前群会话所选模型。",
+        "default": ""
+      },
+      "fallback_provider_1_id": {
+        "description": "备用聊天模型 1",
+        "type": "string",
+        "_special": "select_provider",
+        "hint": "主模型不可用时首先尝试；留空可跳过。",
+        "default": ""
+      },
+      "fallback_provider_2_id": {
+        "description": "备用聊天模型 2",
+        "type": "string",
+        "_special": "select_provider",
+        "hint": "按编号依次回退；留空可跳过。",
+        "default": ""
+      },
+      "fallback_provider_3_id": {
+        "description": "备用聊天模型 3",
+        "type": "string",
+        "_special": "select_provider",
+        "hint": "按编号依次回退；留空可跳过。",
+        "default": ""
+      },
+      "fallback_provider_4_id": {
+        "description": "备用聊天模型 4",
+        "type": "string",
+        "_special": "select_provider",
+        "hint": "按编号依次回退；留空可跳过。",
+        "default": ""
+      },
+      "image_caption_provider_id": {
+        "description": "图片转述模型",
+        "type": "string",
+        "_special": "select_provider",
+        "hint": "用于把带 jg 前缀消息中的图片转成客观文字，再交给叙事模型。留空时带图行动会被明确拒绝。",
+        "default": ""
+      },
+      "image_caption_prompt": {
+        "description": "图片转述提示词",
+        "type": "text",
+        "default": "请用简洁、客观的中文描述图片中与角色行动、场景、物品、人物姿态和可见文字有关的信息。不要猜测看不见的事实。"
+      },
+      "max_images_per_turn": {
+        "description": "单回合图片上限",
+        "type": "int",
+        "hint": "只读取带 jg 前缀的当前玩家消息中的图片。",
+        "default": 4
+      },
+      "temperature": {
+        "description": "叙事随机度",
+        "type": "float",
+        "default": 0.7
+      },
+      "max_tokens": {
+        "description": "单次最大输出 Tokens",
+        "type": "int",
+        "default": 1800
+      },
+      "request_timeout_seconds": {
+        "description": "模型超时秒数",
+        "type": "int",
+        "default": 120
+      },
+      "json_repair_attempts": {
+        "description": "结构修复次数",
+        "type": "int",
+        "default": 1
+      }
+    }
+  },
+  "runtime": {
+    "description": "运行规则",
+    "type": "object",
+    "items": {
+      "default_world_slug": {
+        "description": "新副本默认世界包",
+        "type": "string",
+        "hint": "仅作为控制台建立副本时的初始选择；/酒馆 开启 仍要求明确选择副本。",
+        "default": "border-tavern"
+      },
+      "trigger_prefix": {
+        "description": "剧情触发前缀",
+        "type": "string",
+        "hint": "默认 jg。只有“前缀 + 空格 + 内容”才会进入酒馆叙事与记忆，普通群聊完全忽略。",
+        "default": "jg"
+      },
+      "two_phase_checks": {
+        "description": "严格两阶段行动判定",
+        "type": "bool",
+        "hint": "模型先申请检定，插件生成不可篡改的骰点，再由模型叙述结果。",
+        "default": true
+      },
+      "max_input_chars": {
+        "description": "玩家单次输入上限",
+        "type": "int",
+        "default": 2000
+      },
+      "max_output_chars": {
+        "description": "单次回复上限",
+        "type": "int",
+        "default": 5000
+      },
+      "recent_turns": {
+        "description": "带入最近回合数",
+        "type": "int",
+        "default": 12
+      },
+      "memory_limit": {
+        "description": "每轮检索记忆数",
+        "type": "int",
+        "default": 10
+      },
+      "user_cooldown_seconds": {
+        "description": "同一玩家冷却秒数",
+        "type": "float",
+        "default": 1.5
+      },
+      "auto_snapshot_interval": {
+        "description": "自动快照间隔回合",
+        "type": "int",
+        "default": 5
+      },
+      "ooc_prefixes": {
+        "description": "场外发言前缀",
+        "type": "list",
+        "default": [
+          "【OOC】",
+          "[OOC]",
+          "OOC:"
+        ]
+      },
+      "time_rules": {
+        "description": "全局时间与流程默认值",
+        "type": "object",
+        "hint": "世界模板可覆盖这些值，新建副本会复制快照；留空或 -1 表示不限时，0 非法。",
+        "items": {
+          "card_code_ttl_seconds": {
+            "description": "私聊建卡码有效秒数",
+            "type": "int",
+            "default": 1800
+          },
+          "card_draft_ttl_seconds": {
+            "description": "角色卡草稿保留秒数",
+            "type": "int",
+            "default": 604800
+          },
+          "card_completion_timeout_seconds": {
+            "description": "等待完成建卡秒数（-1 不限时）",
+            "type": "int",
+            "default": 86400
+          },
+          "preparation_timeout_seconds": {
+            "description": "准备大厅最长秒数（-1 不限时）",
+            "type": "int",
+            "default": 86400
+          },
+          "ready_timeout_seconds": {
+            "description": "玩家准备确认秒数（-1 不限时）",
+            "type": "int",
+            "default": 1800
+          },
+          "turn_timeout_seconds": {
+            "description": "个人回合秒数",
+            "type": "int",
+            "default": 600
+          },
+          "turn_reminder_seconds": {
+            "description": "回合提前提醒秒数",
+            "type": "int",
+            "default": 180
+          },
+          "max_consecutive_timeouts": {
+            "description": "连续超时转候补次数",
+            "type": "int",
+            "default": 2
+          },
+          "standby_timeout_seconds": {
+            "description": "候补自动退场秒数（-1 不限时）",
+            "type": "int",
+            "default": 604800
+          },
+          "delegation_ttl_seconds": {
+            "description": "代控授权有效秒数（-1 不限时）",
+            "type": "int",
+            "default": 86400
+          },
+          "check_timeout_seconds": {
+            "description": "检定或补充选择等待秒数",
+            "type": "int",
+            "default": 300
+          },
+          "vote_round_one_seconds": {
+            "description": "第一轮集体投票秒数",
+            "type": "int",
+            "default": 600
+          },
+          "vote_round_two_seconds": {
+            "description": "第二轮集体投票秒数",
+            "type": "int",
+            "default": 300
+          },
+          "vote_reminder_seconds": {
+            "description": "投票提前提醒秒数",
+            "type": "int",
+            "default": 120
+          },
+          "all_idle_pause_seconds": {
+            "description": "全员无互动后自动暂停秒数（留空关闭）",
+            "type": "int",
+            "default": 600
+          },
+          "pause_stops_clock": {
+            "description": "暂停期间停止计时",
+            "type": "bool",
+            "default": true
+          },
+          "announce_timeouts": {
+            "description": "在群内公布超时与提醒",
+            "type": "bool",
+            "default": true
+          },
+          "turn_timeout_action": {
+            "description": "个人回合超时处理",
+            "type": "string",
+            "options": ["skip", "hold"],
+            "labels": ["跳过并累计超时", "保留行动权"],
+            "default": "skip"
+          },
+          "card_timeout_action": {
+            "description": "建卡超时处理",
+            "type": "string",
+            "options": ["standby", "release", "remind"],
+            "labels": ["转候补", "释放席位", "仅提醒"],
+            "default": "standby"
+          },
+          "ready_timeout_action": {
+            "description": "准备超时处理",
+            "type": "string",
+            "options": ["standby", "remind"],
+            "labels": ["转候补", "仅提醒"],
+            "default": "standby"
+          }
+        }
+      }
+    }
+  },
+  "advanced": {
+    "description": "高级设置",
+    "type": "object",
+    "items": {
+      "audit_retention_days": {
+        "description": "审计日志保留天数",
+        "type": "int",
+        "default": 90
+      },
+      "store_model_payloads": {
+        "description": "保存原始模型结构",
+        "type": "bool",
+        "hint": "排错用途，可能增加数据库体积；默认关闭。",
+        "default": false
+      },
+      "debug": {
+        "description": "调试日志",
+        "type": "bool",
+        "default": false
+      }
+    }
+  }
+}

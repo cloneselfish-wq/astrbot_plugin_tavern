@@ -1,0 +1,1469 @@
+from __future__ import annotations
+
+import json
+import hashlib
+import os
+import re
+import shutil
+import sqlite3
+import stat
+import uuid
+import zipfile
+from contextlib import closing
+from pathlib import Path, PurePosixPath
+from typing import Any
+
+from astrbot.api.web import (
+    PluginUploadFile,
+    error_response,
+    file_response,
+    json_response,
+    request,
+    stream_response,
+)
+
+from .config import TavernConfig
+from .constants import (
+    PLUGIN_NAME,
+    PLUGIN_VERSION,
+    SESSION_CLOSED,
+    SESSION_FINISHED,
+    SESSION_MAINTENANCE,
+    SESSION_PAUSED,
+    SESSION_PREPARING,
+    SESSION_RUNNING,
+)
+from .database import (
+    DatabaseConflictError,
+    DatabaseNotFoundError,
+    InvalidTransitionError,
+    TavernDatabase,
+)
+from .events import EventBroker
+from .lifecycle import normalize_time_rules
+from .storage import (
+    file_sha256,
+    next_timestamped_path,
+    replace_with_retry,
+    unlink_with_retry,
+)
+
+
+_BACKUP_HASH_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+_MAX_BACKUP_UNCOMPRESSED = 4 * 1024 * 1024 * 1024
+
+
+def _safe_backup_member(name: str) -> PurePosixPath:
+    if not name or "\\" in name:
+        raise ValueError("ZIP 备份含非法文件路径")
+    path = PurePosixPath(name)
+    if (
+        path.is_absolute()
+        or any(part in {"", ".", ".."} for part in path.parts)
+    ):
+        raise ValueError("ZIP 备份含非法文件路径")
+    return path
+
+
+def _backup_checksums(archive: zipfile.ZipFile) -> dict[str, str]:
+    try:
+        checksum_info = archive.getinfo("checksum.sha256")
+    except KeyError as exc:
+        raise ValueError("ZIP 备份缺少 checksum.sha256") from exc
+    if checksum_info.file_size > 16 * 1024 * 1024:
+        raise ValueError("ZIP 备份校验清单过大")
+    try:
+        text = archive.read(checksum_info).decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError("ZIP 备份校验清单编码错误") from exc
+    checksums: dict[str, str] = {}
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        parts = line.split("  ", 1)
+        if len(parts) != 2:
+            raise ValueError("ZIP 备份校验清单格式错误")
+        digest, name = parts[0].strip().lower(), parts[1].strip()
+        _safe_backup_member(name)
+        if not _BACKUP_HASH_PATTERN.fullmatch(digest) or name in checksums:
+            raise ValueError("ZIP 备份校验清单格式错误")
+        checksums[name] = digest
+    return checksums
+
+
+def _verify_backup_archive(archive: zipfile.ZipFile) -> dict[str, str]:
+    infos = archive.infolist()
+    names: set[str] = set()
+    total_size = 0
+    for info in infos:
+        path = _safe_backup_member(info.filename.rstrip("/"))
+        name = path.as_posix()
+        if name in names:
+            raise ValueError("ZIP 备份含重复文件名")
+        names.add(name)
+        if info.flag_bits & 0x1:
+            raise ValueError("不支持加密 ZIP 备份")
+        mode = (info.external_attr >> 16) & 0xFFFF
+        if mode and stat.S_ISLNK(mode):
+            raise ValueError("ZIP 备份不能包含符号链接")
+        if not info.is_dir():
+            total_size += int(info.file_size)
+    if total_size > _MAX_BACKUP_UNCOMPRESSED:
+        raise ValueError("ZIP 解压后的总大小不能超过 4 GiB")
+    checksums = _backup_checksums(archive)
+    payload_names = {
+        info.filename
+        for info in infos
+        if not info.is_dir() and info.filename != "checksum.sha256"
+    }
+    if payload_names != set(checksums):
+        raise ValueError("ZIP 备份文件与校验清单不一致")
+    for info in infos:
+        if info.is_dir() or info.filename == "checksum.sha256":
+            continue
+        digest = hashlib.sha256()
+        with archive.open(info, "r") as source:
+            for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                digest.update(chunk)
+        if digest.hexdigest() != checksums[info.filename]:
+            raise ValueError(f"ZIP 备份文件校验失败：{info.filename}")
+    return checksums
+
+
+def _stage_group_files(
+    archive: zipfile.ZipFile,
+    stage_dir: Path,
+) -> list[tuple[Path, PurePosixPath]]:
+    staged: list[tuple[Path, PurePosixPath]] = []
+    for info in archive.infolist():
+        if info.is_dir():
+            continue
+        relative = _safe_backup_member(info.filename)
+        if not relative.parts or relative.parts[0] != "groups":
+            continue
+        target = stage_dir.joinpath(*relative.parts)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with archive.open(info, "r") as source, target.open("wb") as output:
+            shutil.copyfileobj(source, output, length=1024 * 1024)
+        staged.append((target, relative))
+    return staged
+
+
+def _collision_path(path: Path) -> Path:
+    if not path.exists():
+        return path
+    for index in range(2, 1000):
+        candidate = path.with_name(
+            f"{path.stem}_{index:02d}{path.suffix}"
+        )
+        if not candidate.exists():
+            return candidate
+    raise RuntimeError("同名独立存档过多")
+
+
+class TavernWebConsole:
+    def __init__(
+        self,
+        *,
+        context: Any,
+        plugin_config: Any,
+        database: TavernDatabase,
+        broker: EventBroker,
+        data_dir: Path,
+        logger: Any,
+        allow_group: Any,
+        config_lock: Any,
+    ) -> None:
+        self.context = context
+        self.plugin_config = plugin_config
+        self.database = database
+        self.broker = broker
+        self.data_dir = Path(data_dir)
+        self.logger = logger
+        self.allow_group = allow_group
+        self.config_lock = config_lock
+        self._register_routes()
+
+    def _register(self, path: str, handler: Any, methods: list[str], desc: str) -> None:
+        self.context.register_web_api(
+            f"/{PLUGIN_NAME}/{path}",
+            handler,
+            methods,
+            desc,
+        )
+
+    def _register_routes(self) -> None:
+        routes = [
+            ("overview", self.overview, ["GET"], "Tavern overview"),
+            ("worlds", self.worlds, ["GET"], "List worlds"),
+            ("worlds/save", self.world_save, ["POST"], "Save world"),
+            ("worlds/archive", self.world_archive, ["POST"], "Archive world"),
+            ("worlds/restore", self.world_restore, ["POST"], "Restore world"),
+            ("characters", self.characters, ["GET"], "List characters"),
+            (
+                "characters/save",
+                self.character_save,
+                ["POST"],
+                "Save character",
+            ),
+            (
+                "characters/delete",
+                self.character_delete,
+                ["POST"],
+                "Delete character",
+            ),
+            ("sessions", self.sessions, ["GET"], "List sessions"),
+            (
+                "sessions/detail",
+                self.session_detail,
+                ["GET"],
+                "Session detail",
+            ),
+            (
+                "sessions/action",
+                self.session_action,
+                ["POST"],
+                "Session action",
+            ),
+            (
+                "sessions/state",
+                self.session_state,
+                ["POST"],
+                "Edit session state",
+            ),
+            (
+                "sessions/turn-order",
+                self.session_turn_order,
+                ["POST"],
+                "Edit multiplayer turn order",
+            ),
+            (
+                "sessions/time-rules",
+                self.session_time_rules,
+                ["POST"],
+                "Edit instance timing rules",
+            ),
+            (
+                "sessions/rules",
+                self.session_rules,
+                ["POST"],
+                "Edit session rules and progress",
+            ),
+            (
+                "sessions/npc",
+                self.session_npc,
+                ["POST"],
+                "Create or edit a session NPC",
+            ),
+            (
+                "sessions/timer",
+                self.session_timer,
+                ["POST"],
+                "Control persistent timer",
+            ),
+            (
+                "sessions/card-review",
+                self.session_card_review,
+                ["POST"],
+                "Review a character card",
+            ),
+            (
+                "sessions/permission",
+                self.session_permission,
+                ["POST"],
+                "Grant instance role",
+            ),
+            (
+                "sessions/participant",
+                self.session_participant,
+                ["POST"],
+                "Manage participant status",
+            ),
+            (
+                "groups/remark",
+                self.group_remark,
+                ["POST"],
+                "Save a group remark",
+            ),
+            ("players", self.players, ["GET"], "List players"),
+            ("players/save", self.player_save, ["POST"], "Save player"),
+            (
+                "players/delete",
+                self.player_delete,
+                ["POST"],
+                "Delete player",
+            ),
+            ("memories", self.memories, ["GET"], "List memories"),
+            ("memories/save", self.memory_save, ["POST"], "Save memory"),
+            (
+                "memories/delete",
+                self.memory_delete,
+                ["POST"],
+                "Delete memory",
+            ),
+            ("snapshots", self.snapshots, ["GET"], "List snapshots"),
+            (
+                "snapshots/create",
+                self.snapshot_create,
+                ["POST"],
+                "Create snapshot",
+            ),
+            (
+                "snapshots/restore",
+                self.snapshot_restore,
+                ["POST"],
+                "Restore snapshot",
+            ),
+            (
+                "snapshots/delete",
+                self.snapshot_delete,
+                ["POST"],
+                "Delete snapshot",
+            ),
+            ("audit", self.audit, ["GET"], "Audit log"),
+            ("providers", self.providers, ["GET"], "List chat providers"),
+            ("settings", self.settings, ["GET"], "Tavern settings"),
+            (
+                "settings/save",
+                self.settings_save,
+                ["POST"],
+                "Save Tavern settings",
+            ),
+            (
+                "backup/export",
+                self.backup_export,
+                ["GET"],
+                "Export Tavern backup",
+            ),
+            (
+                "backup/import/<mode>",
+                self.backup_import,
+                ["POST"],
+                "Import Tavern backup",
+            ),
+            ("events", self.events, ["GET"], "Tavern activity stream"),
+        ]
+        for route in routes:
+            self._register(*route)
+
+    @staticmethod
+    def _username() -> str:
+        username = str(request.username or "").strip()
+        if not username:
+            raise PermissionError("需要登录 AstrBot 管理后台")
+        return username
+
+    @classmethod
+    def _actor(cls) -> str:
+        return f"web:{cls._username()}"
+
+    def _handle_error(self, exc: Exception):
+        if isinstance(exc, PermissionError):
+            return error_response(str(exc), status_code=401)
+        if isinstance(exc, DatabaseNotFoundError):
+            return error_response(str(exc), status_code=404)
+        if isinstance(exc, DatabaseConflictError):
+            return error_response(str(exc), status_code=409)
+        if isinstance(exc, (InvalidTransitionError, ValueError, TypeError)):
+            return error_response(str(exc), status_code=400)
+        if isinstance(exc, sqlite3.IntegrityError):
+            return error_response(
+                "数据冲突：标识、群会话或名称可能已存在",
+                status_code=409,
+            )
+        self.logger.exception("AI 酒馆 WebUI 请求失败")
+        return error_response("服务器内部错误", status_code=500)
+
+    async def _payload(self) -> dict[str, Any]:
+        value = await request.json(default={})
+        if not isinstance(value, dict):
+            raise ValueError("请求体必须是 JSON 对象")
+        return value
+
+    async def overview(self):
+        try:
+            self._username()
+            result = await self.database.overview()
+            result["plugin_version"] = PLUGIN_VERSION
+            result["sessions"] = (await self.database.list_sessions())[:8]
+            config = TavernConfig.from_mapping(self.plugin_config)
+            result["security"] = {
+                "admin_count": len(config.admin_ids),
+                "allowed_group_count": len(config.allowed_group_ids),
+                "whitelist_required": config.require_group_whitelist,
+                "ready": bool(config.admin_ids),
+            }
+            return json_response(result)
+        except Exception as exc:
+            return self._handle_error(exc)
+
+    async def worlds(self):
+        try:
+            self._username()
+            archived_value = request.query.get("include_archived", "")
+            include_archived = str(archived_value).strip().lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }
+            return json_response(
+                {"items": await self.database.list_worlds(include_archived)}
+            )
+        except Exception as exc:
+            return self._handle_error(exc)
+
+    async def world_save(self):
+        try:
+            payload = await self._payload()
+            item = await self.database.save_world(payload, self._actor())
+            await self.broker.publish({"type": "world", "action": "save"})
+            return json_response({"item": item})
+        except Exception as exc:
+            return self._handle_error(exc)
+
+    async def world_archive(self):
+        try:
+            payload = await self._payload()
+            world_id = str(payload.get("id", ""))
+            world = await self.database.get_world(world_id)
+            config = TavernConfig.from_mapping(self.plugin_config)
+            if world["slug"] == config.default_world_slug:
+                raise ValueError(
+                    "该世界是当前默认世界，请先在设置中更换默认世界"
+                )
+            item = await self.database.archive_world(
+                world_id,
+                self._actor(),
+            )
+            await self.broker.publish({"type": "world", "action": "archive"})
+            return json_response({"item": item})
+        except Exception as exc:
+            return self._handle_error(exc)
+
+    async def world_restore(self):
+        try:
+            payload = await self._payload()
+            item = await self.database.restore_world(
+                str(payload.get("id", "")),
+                self._actor(),
+            )
+            await self.broker.publish({"type": "world", "action": "restore"})
+            return json_response({"item": item})
+        except Exception as exc:
+            return self._handle_error(exc)
+
+    async def characters(self):
+        try:
+            self._username()
+            world_id = str(request.query.get("world_id", "") or "")
+            return json_response(
+                {"items": await self.database.list_characters(world_id)}
+            )
+        except Exception as exc:
+            return self._handle_error(exc)
+
+    async def character_save(self):
+        try:
+            item = await self.database.save_character(
+                await self._payload(),
+                self._actor(),
+            )
+            return json_response({"item": item})
+        except Exception as exc:
+            return self._handle_error(exc)
+
+    async def character_delete(self):
+        try:
+            payload = await self._payload()
+            await self.database.delete_character(
+                str(payload.get("id", "")),
+                self._actor(),
+            )
+            return json_response({"deleted": True})
+        except Exception as exc:
+            return self._handle_error(exc)
+
+    async def sessions(self):
+        try:
+            self._username()
+            result = await self.database.search_sessions(
+                str(request.query.get("q", "") or ""),
+                str(request.query.get("scope", "all") or "all"),
+                request.query.get("page", 1, type=int),
+                request.query.get("page_size", 20, type=int),
+            )
+            result["options"] = await self.database.list_session_options()
+            return json_response(result)
+        except Exception as exc:
+            return self._handle_error(exc)
+
+    async def session_detail(self):
+        try:
+            self._username()
+            session_id = str(request.query.get("id", "") or "")
+            session = await self.database.get_session(session_id)
+            return json_response(
+                {
+                    "session": session,
+                    "players": await self.database.list_players(session_id),
+                    "roster": await self.database.list_roster(session_id),
+                    "turn": await self.database.get_turn_status(session_id),
+                    "events": await self.database.recent_events(session_id, 80),
+                    "snapshots": await self.database.list_snapshots(session_id),
+                    "instance_config": (
+                        await self.database.get_instance_config(session_id)
+                    ),
+                    "timers": await self.database.list_timers(session_id),
+                    "choice": await self.database.active_choice_set(session_id),
+                    "vote": await self.database.active_vote(session_id),
+                    "bans": await self.database.list_bans(session_id),
+                    "permissions": (
+                        await self.database.list_permission_grants(session_id)
+                    ),
+                    "return_requests": (
+                        await self.database.list_return_requests(session_id)
+                    ),
+                    "preflight": (
+                        await self.database.opening_preflight(session_id)
+                    ),
+                    "rule_state": (
+                        await self.database.get_session_rule_state(session_id)
+                    ),
+                    "session_characters": (
+                        await self.database.list_session_characters(session_id)
+                    ),
+                    "story_ledger": (
+                        await self.database.list_story_ledger(session_id)
+                    ),
+                    "scene_clocks": (
+                        await self.database.list_scene_clocks(session_id)
+                    ),
+                    "memories": await self.database.list_memories(
+                        session_id,
+                        "",
+                        500,
+                        include_invalidated=True,
+                    ),
+                    "archive": (
+                        await self.database.get_session_archive(session_id)
+                    ),
+                    "storage": (
+                        await self.database.get_storage_info(session_id)
+                    ),
+                }
+            )
+        except Exception as exc:
+            return self._handle_error(exc)
+
+    async def group_remark(self):
+        try:
+            payload = await self._payload()
+            item = await self.database.save_group_remark(
+                str(payload.get("platform_id") or ""),
+                str(payload.get("group_id") or ""),
+                str(payload.get("remark") or ""),
+                self._actor(),
+                int(payload.get("revision") or 0),
+            )
+            await self.broker.publish(
+                {
+                    "type": "group",
+                    "action": "remark",
+                    "platform_id": item["platform_id"],
+                    "group_id": item["group_id"],
+                }
+            )
+            return json_response({"item": item})
+        except Exception as exc:
+            return self._handle_error(exc)
+
+    async def session_action(self):
+        try:
+            payload = await self._payload()
+            actor = self._actor()
+            action = str(payload.get("action", "")).strip().lower()
+            if action == "create":
+                platform_id = str(payload.get("platform_id") or "")
+                group_id = str(payload.get("group_id") or "")
+                session = await self.database.ensure_session(
+                    platform_id,
+                    group_id,
+                    str(payload.get("unified_origin") or ""),
+                    str(payload.get("world_ref") or ""),
+                    actor,
+                    str(payload.get("instance_slug") or ""),
+                    str(payload.get("instance_name") or ""),
+                )
+                config = TavernConfig.from_mapping(self.plugin_config)
+                world = await self.database.get_world(session["world_id"])
+                world_rules = world.get("rules") or {}
+                world_time = (
+                    world_rules.get("time_rules")
+                    if isinstance(world_rules, dict)
+                    else {}
+                )
+                await self.database.save_instance_time_rules(
+                    session["id"],
+                    normalize_time_rules(
+                        {
+                            **dict(config.time_rules),
+                            **(
+                                dict(world_time)
+                                if isinstance(world_time, dict)
+                                else {}
+                            ),
+                        }
+                    ),
+                    actor,
+                )
+                await self.database.grant_permission(
+                    session["id"],
+                    actor,
+                    "host",
+                    actor,
+                )
+                await self.allow_group(
+                    group_id=group_id,
+                    platform_id=platform_id,
+                    actor_id=actor,
+                    source="web_session_create",
+                )
+            elif action == "clone":
+                session = await self.database.clone_session(
+                    str(payload.get("session_id") or ""),
+                    actor,
+                    instance_slug=str(
+                        payload.get("instance_slug") or ""
+                    ),
+                    instance_name=str(
+                        payload.get("instance_name") or ""
+                    ),
+                    snapshot_ref=str(
+                        payload.get("snapshot_ref") or ""
+                    ),
+                )
+            else:
+                session_id = str(payload.get("session_id") or "")
+                if action == "perform":
+                    result = await self.database.activate_story(
+                        session_id,
+                        actor,
+                        resume=bool(payload.get("resume", False)),
+                    )
+                    if not result["started"]:
+                        raise ValueError(
+                            "；".join(result.get("blockers") or ["准备未完成"])
+                        )
+                    await self.database.resume_session_timers(
+                        session_id,
+                        actor,
+                    )
+                    session = result["session"]
+                else:
+                    if action == "pause":
+                        await self.database.pause_session_timers(
+                            session_id,
+                            actor,
+                        )
+                    if action in {"finish", "abort"}:
+                        session = await self.database.finalize_session(
+                            session_id,
+                            actor,
+                            termination_type=(
+                                "aborted"
+                                if action == "abort"
+                                else "completed"
+                            ),
+                            reason=str(
+                                payload.get("reason")
+                                or (
+                                    "正常完结"
+                                    if action == "finish"
+                                    else ""
+                                )
+                            ),
+                        )
+                        await self.broker.publish(
+                            {
+                                "type": "session",
+                                "action": action,
+                                "session_id": session["id"],
+                            }
+                        )
+                        return json_response({"session": session})
+                    target_map = {
+                        "start": SESSION_PREPARING,
+                        "resume": SESSION_PREPARING,
+                        "pause": SESSION_PAUSED,
+                        "close": SESSION_CLOSED,
+                        "maintenance": SESSION_MAINTENANCE,
+                    }
+                    if action not in target_map:
+                        raise ValueError("不支持的会话操作")
+                    session = await self.database.transition_session(
+                        session_id,
+                        target_map[action],
+                        actor,
+                        str(payload.get("world_ref") or ""),
+                    )
+            await self.broker.publish(
+                {
+                    "type": "session",
+                    "action": action,
+                    "session_id": session["id"],
+                }
+            )
+            return json_response({"session": session})
+        except Exception as exc:
+            return self._handle_error(exc)
+
+    async def session_state(self):
+        try:
+            payload = await self._payload()
+            state = payload.get("world_state")
+            if not isinstance(state, dict):
+                raise ValueError("world_state 必须是 JSON 对象")
+            session = await self.database.save_manual_state(
+                str(payload.get("session_id") or ""),
+                state,
+                int(payload.get("revision")),
+                self._actor(),
+            )
+            await self.broker.publish(
+                {
+                    "type": "session",
+                    "action": "state_edit",
+                    "session_id": session["id"],
+                }
+            )
+            return json_response({"session": session})
+        except Exception as exc:
+            return self._handle_error(exc)
+
+    async def session_turn_order(self):
+        try:
+            payload = await self._payload()
+            order = payload.get("order")
+            if not isinstance(order, list):
+                raise ValueError("order 必须是用户 ID 数组")
+            turn = await self.database.set_turn_order(
+                str(payload.get("session_id") or ""),
+                [str(item) for item in order],
+                self._actor(),
+            )
+            await self.broker.publish(
+                {
+                    "type": "session",
+                    "action": "turn_order",
+                    "session_id": str(payload.get("session_id") or ""),
+                }
+            )
+            return json_response({"turn": turn})
+        except Exception as exc:
+            return self._handle_error(exc)
+
+    async def session_time_rules(self):
+        try:
+            payload = await self._payload()
+            rules = payload.get("rules")
+            if not isinstance(rules, dict):
+                raise ValueError("rules 必须是 JSON 对象")
+            item = await self.database.save_instance_time_rules(
+                str(payload.get("session_id") or ""),
+                rules,
+                self._actor(),
+            )
+            await self.broker.publish(
+                {
+                    "type": "timing",
+                    "action": "rules_update",
+                    "session_id": item["session_id"],
+                }
+            )
+            return json_response({"instance_config": item})
+        except Exception as exc:
+            return self._handle_error(exc)
+
+    async def session_rules(self):
+        try:
+            payload = await self._payload()
+            rules = payload.get("rules")
+            if not isinstance(rules, dict):
+                raise ValueError("rules 必须是 JSON 对象")
+            item = await self.database.save_session_rule_state(
+                str(payload.get("session_id") or ""),
+                rules,
+                self._actor(),
+            )
+            await self.broker.publish(
+                {
+                    "type": "session",
+                    "action": "rules_update",
+                    "session_id": item["session_id"],
+                }
+            )
+            return json_response({"rule_state": item})
+        except Exception as exc:
+            return self._handle_error(exc)
+
+    async def session_npc(self):
+        try:
+            payload = await self._payload()
+            item = await self.database.save_session_character(
+                payload,
+                self._actor(),
+            )
+            await self.broker.publish(
+                {
+                    "type": "session",
+                    "action": "npc_update",
+                    "session_id": item["session_id"],
+                }
+            )
+            return json_response({"character": item})
+        except Exception as exc:
+            return self._handle_error(exc)
+
+    async def session_timer(self):
+        try:
+            payload = await self._payload()
+            item = await self.database.control_timer(
+                str(payload.get("timer_id") or ""),
+                str(payload.get("action") or ""),
+                self._actor(),
+                seconds=int(payload.get("seconds") or 0),
+            )
+            await self.broker.publish(
+                {
+                    "type": "timing",
+                    "action": str(payload.get("action") or ""),
+                    "session_id": item["session_id"],
+                }
+            )
+            return json_response({"timer": item})
+        except Exception as exc:
+            return self._handle_error(exc)
+
+    async def session_card_review(self):
+        try:
+            payload = await self._payload()
+            item = await self.database.review_character_card(
+                str(payload.get("session_id") or ""),
+                str(payload.get("participant_ref") or ""),
+                bool(payload.get("approved", False)),
+                self._actor(),
+                str(payload.get("note") or ""),
+            )
+            await self.broker.publish(
+                {
+                    "type": "card",
+                    "action": "review",
+                    "session_id": item["session_id"],
+                }
+            )
+            return json_response({"participant": item})
+        except Exception as exc:
+            return self._handle_error(exc)
+
+    async def session_permission(self):
+        try:
+            payload = await self._payload()
+            item = await self.database.grant_permission(
+                str(payload.get("session_id") or ""),
+                str(payload.get("user_id") or ""),
+                str(payload.get("role") or ""),
+                self._actor(),
+            )
+            return json_response({"permission": item})
+        except Exception as exc:
+            return self._handle_error(exc)
+
+    async def session_participant(self):
+        try:
+            payload = await self._payload()
+            session_id = str(payload.get("session_id") or "")
+            participant_ref = str(payload.get("participant_ref") or "")
+            action = str(payload.get("action") or "").strip().lower()
+            actor = self._actor()
+            if action == "retire":
+                result = await self.database.retire_participant(
+                    session_id,
+                    participant_ref,
+                    actor,
+                    forced=True,
+                    reason=str(payload.get("reason") or "web_retire"),
+                )
+            elif action == "ban":
+                duration = payload.get("duration_seconds")
+                result = await self.database.create_ban(
+                    session_id,
+                    participant_ref,
+                    actor,
+                    scope=str(payload.get("scope") or "instance"),
+                    duration_seconds=(
+                        int(duration) if duration not in {None, ""} else None
+                    ),
+                    reason=str(payload.get("reason") or ""),
+                )
+            elif action == "unban":
+                result = {
+                    "revoked": await self.database.revoke_ban(
+                        session_id,
+                        participant_ref,
+                        actor,
+                    )
+                }
+            elif action == "designate":
+                participant = await self.database.get_participant(
+                    session_id,
+                    participant_ref=participant_ref,
+                )
+                result = await self.database.designate_turn(
+                    session_id,
+                    participant["group_user_id"],
+                    actor,
+                )
+            else:
+                raise ValueError("不支持的参与者操作")
+            await self.broker.publish(
+                {
+                    "type": "participant",
+                    "action": action,
+                    "session_id": session_id,
+                }
+            )
+            return json_response({"result": result})
+        except Exception as exc:
+            return self._handle_error(exc)
+
+    async def players(self):
+        try:
+            self._username()
+            session_id = str(request.query.get("session_id", "") or "")
+            return json_response(
+                {"items": await self.database.list_players(session_id)}
+            )
+        except Exception as exc:
+            return self._handle_error(exc)
+
+    async def player_save(self):
+        try:
+            item = await self.database.save_player(
+                await self._payload(),
+                self._actor(),
+            )
+            return json_response({"item": item})
+        except Exception as exc:
+            return self._handle_error(exc)
+
+    async def player_delete(self):
+        try:
+            payload = await self._payload()
+            await self.database.delete_player(
+                str(payload.get("id", "")),
+                self._actor(),
+            )
+            return json_response({"deleted": True})
+        except Exception as exc:
+            return self._handle_error(exc)
+
+    async def memories(self):
+        try:
+            self._username()
+            session_id = str(request.query.get("session_id", "") or "")
+            query = str(request.query.get("q", "") or "")
+            limit = request.query.get("limit", 100, type=int)
+            return json_response(
+                {
+                    "items": await self.database.list_memories(
+                        session_id,
+                        query,
+                        limit,
+                    )
+                }
+            )
+        except Exception as exc:
+            return self._handle_error(exc)
+
+    async def memory_save(self):
+        try:
+            item = await self.database.save_memory(
+                await self._payload(),
+                self._actor(),
+            )
+            return json_response({"item": item})
+        except Exception as exc:
+            return self._handle_error(exc)
+
+    async def memory_delete(self):
+        try:
+            payload = await self._payload()
+            await self.database.delete_memory(
+                str(payload.get("id", "")),
+                self._actor(),
+            )
+            return json_response({"deleted": True})
+        except Exception as exc:
+            return self._handle_error(exc)
+
+    async def snapshots(self):
+        try:
+            self._username()
+            session_id = str(request.query.get("session_id", "") or "")
+            return json_response(
+                {"items": await self.database.list_snapshots(session_id)}
+            )
+        except Exception as exc:
+            return self._handle_error(exc)
+
+    async def snapshot_create(self):
+        try:
+            payload = await self._payload()
+            item = await self.database.create_snapshot(
+                str(payload.get("session_id") or ""),
+                str(payload.get("name") or ""),
+                self._actor(),
+                bool(payload.get("replace", False)),
+            )
+            return json_response({"item": item})
+        except Exception as exc:
+            return self._handle_error(exc)
+
+    async def snapshot_restore(self):
+        try:
+            payload = await self._payload()
+            item = await self.database.restore_snapshot(
+                str(payload.get("session_id") or ""),
+                str(payload.get("snapshot_ref") or ""),
+                self._actor(),
+            )
+            await self.database.pause_session_timers(
+                str(payload.get("session_id") or ""),
+                self._actor(),
+            )
+            await self.broker.publish(
+                {
+                    "type": "session",
+                    "action": "restore",
+                    "session_id": item["id"],
+                }
+            )
+            return json_response({"session": item})
+        except Exception as exc:
+            return self._handle_error(exc)
+
+    async def snapshot_delete(self):
+        try:
+            payload = await self._payload()
+            await self.database.delete_snapshot(
+                str(payload.get("id", "")),
+                self._actor(),
+            )
+            return json_response({"deleted": True})
+        except Exception as exc:
+            return self._handle_error(exc)
+
+    async def audit(self):
+        try:
+            self._username()
+            return json_response(
+                {
+                    "items": await self.database.list_audit(
+                        str(request.query.get("session_id", "") or ""),
+                        request.query.get("limit", 100, type=int),
+                        request.query.get("offset", 0, type=int),
+                    )
+                }
+            )
+        except Exception as exc:
+            return self._handle_error(exc)
+
+    async def providers(self):
+        try:
+            self._username()
+            getter = getattr(self.context, "get_all_providers", None)
+            providers = getter() if callable(getter) else []
+            items: list[dict[str, str]] = []
+            seen: set[str] = set()
+            for provider in providers or []:
+                meta_getter = getattr(provider, "meta", None)
+                meta = meta_getter() if callable(meta_getter) else None
+                meta_id = (
+                    meta.get("id", "")
+                    if isinstance(meta, dict)
+                    else getattr(meta, "id", "")
+                )
+                provider_id = str(
+                    meta_id
+                    or getattr(provider, "id", "")
+                    or ""
+                ).strip()
+                if not provider_id or provider_id in seen:
+                    continue
+                seen.add(provider_id)
+                meta_name = (
+                    meta.get("name", "")
+                    if isinstance(meta, dict)
+                    else getattr(meta, "name", "")
+                )
+                provider_name = (
+                    meta.get("provider_name", "")
+                    if isinstance(meta, dict)
+                    else getattr(meta, "provider_name", "")
+                )
+                name = str(
+                    meta_name
+                    or provider_name
+                    or provider_id
+                ).strip()
+                meta_model = (
+                    meta.get("model", "")
+                    if isinstance(meta, dict)
+                    else getattr(meta, "model", "")
+                )
+                meta_model_name = (
+                    meta.get("model_name", "")
+                    if isinstance(meta, dict)
+                    else getattr(meta, "model_name", "")
+                )
+                model = str(
+                    meta_model
+                    or meta_model_name
+                    or getattr(provider, "model_name", "")
+                    or ""
+                ).strip()
+                items.append(
+                    {
+                        "id": provider_id,
+                        "name": name,
+                        "model": model,
+                    }
+                )
+            return json_response({"items": items})
+        except Exception as exc:
+            return self._handle_error(exc)
+
+    async def settings(self):
+        try:
+            self._username()
+            config = TavernConfig.from_mapping(self.plugin_config)
+            settings = config.to_mapping()
+            revision = await self.database.record_configuration_revision(
+                settings,
+                self._actor(),
+            )
+            return json_response(
+                {
+                    "settings": settings,
+                    "config_state": revision,
+                    "provider_health": (
+                        await self.database.list_provider_health()
+                    ),
+                    "readiness": {
+                        "has_admin": bool(config.admin_ids),
+                        "has_allowed_group": bool(config.allowed_group_ids)
+                        or not config.require_group_whitelist,
+                    },
+                }
+            )
+        except Exception as exc:
+            return self._handle_error(exc)
+
+    async def settings_save(self):
+        try:
+            payload = await self._payload()
+            self._username()
+            normalized = TavernConfig.from_mapping(payload).to_mapping()
+            default_world = await self.database.get_world(
+                normalized["runtime"]["default_world_slug"]
+            )
+            if default_world["archived"]:
+                raise ValueError("默认世界不能使用已归档世界")
+            async with self.config_lock:
+                missing = object()
+                previous = {
+                    section: self.plugin_config.get(section, missing)
+                    for section in normalized
+                }
+                try:
+                    for section, value in normalized.items():
+                        self.plugin_config[section] = value
+                    save_async = getattr(
+                        self.plugin_config,
+                        "save_config_async",
+                        None,
+                    )
+                    if callable(save_async):
+                        await save_async()
+                    else:
+                        save = getattr(
+                            self.plugin_config,
+                            "save_config",
+                            None,
+                        )
+                        if callable(save):
+                            save()
+                except Exception:
+                    for section, value in previous.items():
+                        if value is missing:
+                            self.plugin_config.pop(section, None)
+                        else:
+                            self.plugin_config[section] = value
+                    raise
+            persisted = TavernConfig.from_mapping(
+                self.plugin_config
+            ).to_mapping()
+            if persisted != normalized:
+                raise RuntimeError("配置保存后回读校验不一致")
+            revision = await self.database.record_configuration_revision(
+                persisted,
+                self._actor(),
+            )
+            await self.database.write_audit(
+                "",
+                self._actor(),
+                "settings.update",
+                "plugin",
+                {
+                    "admin_count": len(
+                        normalized["security"]["admin_ids"]
+                    ),
+                    "group_count": len(
+                        normalized["security"]["allowed_group_ids"]
+                    ),
+                },
+            )
+            await self.broker.publish(
+                {"type": "settings", "action": "update"}
+            )
+            return json_response(
+                {
+                    "settings": persisted,
+                    "config_state": revision,
+                    "provider_health": (
+                        await self.database.list_provider_health()
+                    ),
+                }
+            )
+        except Exception as exc:
+            return self._handle_error(exc)
+
+    async def backup_export(self):
+        try:
+            self._username()
+            bundle = await self.database.export_bundle()
+            export_dir = self.data_dir / "exports"
+            export_dir.mkdir(parents=True, exist_ok=True)
+            path = next_timestamped_path(
+                export_dir,
+                "backup_tavern",
+                ".zip",
+            )
+            temporary = path.with_name(
+                f".{path.name}.{uuid.uuid4().hex}.tmp"
+            )
+            catalog_copy = export_dir / (
+                f".catalog.{uuid.uuid4().hex}.sqlite3"
+            )
+            bundle_bytes = (
+                json.dumps(
+                    bundle,
+                    ensure_ascii=False,
+                    indent=2,
+                    sort_keys=True,
+                )
+                + "\n"
+            ).encode("utf-8")
+            checksum_lines = [
+                (
+                    hashlib.sha256(bundle_bytes).hexdigest(),
+                    "bundle.json",
+                )
+            ]
+            try:
+                with closing(
+                    sqlite3.connect(self.database.path)
+                ) as source:
+                    with closing(sqlite3.connect(catalog_copy)) as target:
+                        source.backup(target)
+                checksum_lines.append(
+                    (
+                        file_sha256(catalog_copy),
+                        "catalog.sqlite3",
+                    )
+                )
+                group_files: list[tuple[Path, str]] = []
+                groups_dir = self.data_dir / "groups"
+                if groups_dir.exists():
+                    for item in sorted(groups_dir.rglob("*")):
+                        if (
+                            not item.is_file()
+                            or item.is_symlink()
+                            or item.name.endswith(("-wal", "-shm", ".tmp"))
+                            or item.name.startswith(".")
+                        ):
+                            continue
+                        archive_name = item.relative_to(
+                            self.data_dir
+                        ).as_posix()
+                        group_files.append((item, archive_name))
+                with zipfile.ZipFile(
+                    temporary,
+                    "w",
+                    compression=zipfile.ZIP_DEFLATED,
+                    compresslevel=6,
+                ) as archive:
+                    archive.writestr("bundle.json", bundle_bytes)
+                    archive.write(catalog_copy, "catalog.sqlite3")
+                    for item, archive_name in group_files:
+                        digest = hashlib.sha256()
+                        with item.open("rb") as source, archive.open(
+                            archive_name,
+                            "w",
+                            force_zip64=True,
+                        ) as output:
+                            for chunk in iter(
+                                lambda: source.read(1024 * 1024),
+                                b"",
+                            ):
+                                digest.update(chunk)
+                                output.write(chunk)
+                        checksum_lines.append(
+                            (digest.hexdigest(), archive_name)
+                        )
+                    archive.writestr(
+                        "checksum.sha256",
+                        "".join(
+                            f"{digest}  {name}\n"
+                            for digest, name in checksum_lines
+                        ).encode("utf-8"),
+                    )
+                replace_with_retry(temporary, path)
+            finally:
+                unlink_with_retry(temporary, suppress_errors=True)
+                unlink_with_retry(catalog_copy, suppress_errors=True)
+            return file_response(
+                path,
+                filename=path.name,
+                content_type="application/zip",
+            )
+        except Exception as exc:
+            return self._handle_error(exc)
+
+    async def backup_import(self, mode: str):
+        temp_path: Path | None = None
+        stage_dir: Path | None = None
+        staged_group_files: list[tuple[Path, PurePosixPath]] = []
+        try:
+            self._username()
+            if mode not in {"merge", "replace"}:
+                raise ValueError("导入模式必须为 merge 或 replace")
+            files = await request.files()
+            upload = files.get("file")
+            if not isinstance(upload, PluginUploadFile):
+                raise ValueError("缺少备份文件")
+            filename = str(upload.filename or "").lower()
+            if not filename.endswith((".json", ".zip")):
+                raise ValueError("只接受 v0.5.1 及以后 ZIP 或旧版 JSON 备份")
+            temp_dir = self.data_dir / "imports"
+            temp_dir.mkdir(parents=True, exist_ok=True)
+            suffix = ".zip" if filename.endswith(".zip") else ".json"
+            temp_path = temp_dir / f"{uuid.uuid4().hex}{suffix}"
+            await upload.save(temp_path)
+            limit = 512 * 1024 * 1024 if suffix == ".zip" else 25 * 1024 * 1024
+            if temp_path.stat().st_size > limit:
+                raise ValueError(
+                    "ZIP 备份不能超过 512 MiB"
+                    if suffix == ".zip"
+                    else "JSON 备份不能超过 25 MiB"
+                )
+            if suffix == ".zip":
+                with zipfile.ZipFile(temp_path) as archive:
+                    _verify_backup_archive(archive)
+                    try:
+                        info = archive.getinfo("bundle.json")
+                    except KeyError as exc:
+                        raise ValueError(
+                            "ZIP 备份缺少 bundle.json"
+                        ) from exc
+                    if info.file_size > 25 * 1024 * 1024:
+                        raise ValueError("ZIP 内的 bundle.json 过大")
+                    bundle = json.loads(
+                        archive.read(info).decode("utf-8")
+                    )
+                    stage_dir = temp_dir / f".stage-{uuid.uuid4().hex}"
+                    stage_dir.mkdir(parents=True)
+                    staged_group_files = _stage_group_files(
+                        archive,
+                        stage_dir,
+                    )
+            else:
+                bundle = json.loads(temp_path.read_text(encoding="utf-8"))
+            if not isinstance(bundle, dict):
+                raise ValueError("备份根节点必须是 JSON 对象")
+            counts = await self.database.import_bundle(
+                bundle,
+                mode,
+                self._actor(),
+            )
+            groups_root = (self.data_dir / "groups").resolve()
+            for staged, relative in staged_group_files:
+                destination = self.data_dir.joinpath(
+                    *relative.parts
+                ).resolve()
+                if (
+                    destination != groups_root
+                    and groups_root not in destination.parents
+                ):
+                    raise ValueError("ZIP 备份含非法群目录路径")
+                is_archive = any(
+                    part in {"saves", "backups"}
+                    for part in relative.parts
+                )
+                # Active databases and manifests have just been rebuilt from
+                # bundle.json by TavernDatabase.import_bundle(). Restoring an
+                # older physical copy over them could desynchronise the
+                # catalog, so only immutable save/backup archives are copied
+                # from the ZIP.
+                if not is_archive:
+                    continue
+                if mode == "merge" and destination.exists():
+                    if file_sha256(destination) == file_sha256(staged):
+                        continue
+                    destination = _collision_path(destination)
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                os.replace(staged, destination)
+            await self.broker.publish(
+                {"type": "backup", "action": "import", "mode": mode}
+            )
+            return json_response({"imported": counts})
+        except json.JSONDecodeError:
+            return error_response("备份 JSON 无法解析", status_code=400)
+        except UnicodeDecodeError:
+            return error_response("备份文本编码必须为 UTF-8", status_code=400)
+        except zipfile.BadZipFile:
+            return error_response("ZIP 备份已损坏或格式无效", status_code=400)
+        except Exception as exc:
+            return self._handle_error(exc)
+        finally:
+            if temp_path and temp_path.exists():
+                temp_path.unlink(missing_ok=True)
+            if stage_dir and stage_dir.exists():
+                shutil.rmtree(stage_dir, ignore_errors=True)
+
+    async def events(self):
+        try:
+            self._username()
+
+            async def stream():
+                async for item in self.broker.subscribe():
+                    yield "data: " + json.dumps(
+                        item,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ) + "\n\n"
+
+            return stream_response(stream())
+        except Exception as exc:
+            return self._handle_error(exc)
