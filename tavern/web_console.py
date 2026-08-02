@@ -47,6 +47,7 @@ from .emergency import EmergencyService
 from .operations import recovery_summary
 from .world_migration import compare_world_contracts
 from .world_preflight import inspect_world_package
+from .world_import import world_import_payload
 from .storage import (
     file_sha256,
     next_timestamped_path,
@@ -612,19 +613,7 @@ class TavernWebConsole:
                     if item["level"] == "error"
                 ]
                 raise ValueError("世界包体检未通过：" + "；".join(messages[:5]))
-            import_payload = {
-                "slug": payload["slug"],
-                "name": payload["name"],
-                "description": payload.get("description", ""),
-                "system_prompt": payload["system_prompt"],
-                "opening_scene": payload.get("opening_scene", ""),
-                "rules": rules if isinstance(rules, dict) else {},
-                "initial_state": (
-                    initial_state if isinstance(initial_state, dict) else {}
-                ),
-                "world_schema_version": payload.get("world_schema_version", 0),
-                "capabilities": payload.get("capabilities", {}),
-            }
+            import_payload = world_import_payload(payload)
             # 按 slug 更新已存在世界，否则新建（save_world 会再次校验字段合法性）
             mode = "created"
             try:

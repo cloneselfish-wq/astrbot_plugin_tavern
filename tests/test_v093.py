@@ -45,6 +45,7 @@ from tavern.resolution import CheckRequest, roll_check
 from tavern.world_contract import WORLD_SCHEMA_VERSION, validate_world_contract
 from tavern.world_migration import compare_world_contracts
 from tavern.world_preflight import inspect_world_package
+from tavern.world_import import world_import_payload
 from tavern.stat_generation import (
     assess_preset_stack_migration,
     calculate_preset_stack_stats,
@@ -154,6 +155,12 @@ class V093ContractTests(unittest.TestCase):
         self.assertEqual(report["summary"]["preset_stack_combinations"], 630)
         validation = validate_stat_generation_config(card_template(tide))
         self.assertEqual(validation["combination_count"], 7 * 9 * 10)
+
+    def test_world_import_keeps_preset_stack_minimum_plugin_version(self) -> None:
+        tide = json.loads(TIDE_WORLD_PATH.read_text("utf-8"))
+        imported = world_import_payload(tide)
+        self.assertEqual(imported["minimum_plugin_version"], "0.9.3")
+        validate_world_contract(imported)
 
     def test_tide_reference_combination_is_exact_and_traceable(self) -> None:
         tide = json.loads(TIDE_WORLD_PATH.read_text("utf-8"))
