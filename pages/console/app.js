@@ -85,7 +85,7 @@ function validateCharacterCardTemplate(template) {
   }
   if (mode === "none") return template;
   if (mode === "preset_stack") {
-    const generation = template.stat_generation;
+    const generation = template.stat_generation || template.stats?.stat_generation;
     if (!generation || generation.mode !== "preset_stack") {
       throw new Error("preset_stack 必须声明 character_card.stat_generation");
     }
@@ -99,6 +99,8 @@ function validateCharacterCardTemplate(template) {
     if (generation.allow_manual_edit !== false) {
       throw new Error("v0.9.3 的 preset_stack 必须设置 allow_manual_edit=false");
     }
+    // Canonicalize the editor value without deleting the compatibility copy.
+    template.stat_generation = generation;
   }
   const minimumBudget = attributes.reduce(
     (sum, item) => sum + Number(item.minimum || 0),
@@ -1461,8 +1463,8 @@ function openWorldEditor(world = null) {
     };
   const rulesForEditor = { ...(item.rules || {}) };
   const characterCardTemplate =
-    item.card_template ||
     rulesForEditor.character_card ||
+    item.card_template ||
     structuredClone(DEFAULT_CHARACTER_CARD_TEMPLATE);
   delete rulesForEditor.character_card;
   openEditor({
@@ -1623,7 +1625,12 @@ function openWorldEditor(world = null) {
         rules,
         initial_state: parseJSONField("#world-state", "初始世界状态"),
         archived: Boolean(item.archived),
-        world_schema_version: 3,
+        world_schema_version: Number(
+          item.world_schema_version || item.rules?.world_schema_version || 3,
+        ),
+        minimum_plugin_version:
+          item.minimum_plugin_version ||
+          (characterCard.stats.mode === "preset_stack" ? "0.9.3" : ""),
         capabilities: {
           character_stats: characterCard.stats.mode !== "none",
           attribute_checks: rules.resolution.mode === "attribute",
@@ -1717,8 +1724,8 @@ function downloadJSON(filename, payload) {
 
 function openCharacterCardTemplateManager(world) {
   const template =
-    world.card_template ||
     world.rules?.character_card ||
+    world.card_template ||
     structuredClone(DEFAULT_CHARACTER_CARD_TEMPLATE);
   openEditor({
     title: `${world.name} · 角色卡模板`,
@@ -1768,6 +1775,14 @@ function openCharacterCardTemplateManager(world) {
         opening_scene: world.opening_scene,
         rules,
         initial_state: world.initial_state,
+        world_schema_version: Number(
+          world.world_schema_version || world.rules?.world_schema_version || 3,
+        ),
+        capabilities:
+          world.capabilities || world.rules?.capabilities || {},
+        minimum_plugin_version:
+          world.minimum_plugin_version ||
+          (nextTemplate.stats?.mode === "preset_stack" ? "0.9.3" : ""),
       });
       toast("角色卡模板已校验并保存", "success");
       await loadCore();

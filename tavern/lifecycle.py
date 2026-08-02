@@ -783,6 +783,24 @@ def card_template(world: Mapping[str, Any]) -> dict[str, Any]:
         preset_sets.setdefault("origin_region_presets", origin_region_presets)
     if social_identity_presets:
         preset_sets.setdefault("social_identity_presets", social_identity_presets)
+    normalized_generation = {
+        "mode": str(generation_raw.get("mode") or mode).lower(),
+        "base_stats": dict(generation_raw.get("base_stats") or {}),
+        "bonus_sources": list(
+            generation_raw.get("bonus_sources") or []
+        ),
+        "bonus_source_rules": dict(
+            generation_raw.get("bonus_source_rules") or {}
+        ),
+        "expected_total": generation_raw.get(
+            "expected_total", budget
+        ),
+        "min_per_stat": generation_raw.get("min_per_stat"),
+        "max_per_stat": generation_raw.get("max_per_stat"),
+        "allow_manual_edit": bool(
+            generation_raw.get("allow_manual_edit", False)
+        ),
+    }
     return {
         "version": _bounded_int(raw.get("version"), 1, 1, 100000),
         "auto_approve": bool(raw.get("auto_approve", False)),
@@ -809,25 +827,11 @@ def card_template(world: Mapping[str, Any]) -> dict[str, Any]:
             "total_validation": dict(stats_raw.get("total_validation") or {}),
             "preset_selector": dict(stats_raw.get("preset_selector") or {}),
             "bonus_choices": list(stats_raw.get("bonus_choices") or []),
-            "stat_generation": {
-                "mode": str(generation_raw.get("mode") or mode).lower(),
-                "base_stats": dict(generation_raw.get("base_stats") or {}),
-                "bonus_sources": list(
-                    generation_raw.get("bonus_sources") or []
-                ),
-                "bonus_source_rules": dict(
-                    generation_raw.get("bonus_source_rules") or {}
-                ),
-                "expected_total": generation_raw.get(
-                    "expected_total", budget
-                ),
-                "min_per_stat": generation_raw.get("min_per_stat"),
-                "max_per_stat": generation_raw.get("max_per_stat"),
-                "allow_manual_edit": bool(
-                    generation_raw.get("allow_manual_edit", False)
-                ),
-            },
+            "stat_generation": dict(normalized_generation),
         },
+        # Keep the canonical v4 declaration available to editor/API clients.
+        # Runtime helpers also accept the nested compatibility copy above.
+        "stat_generation": dict(normalized_generation),
         "profession_presets": profession_presets,
         "origin_region_presets": origin_region_presets,
         "social_identity_presets": social_identity_presets,

@@ -47,7 +47,7 @@ from .emergency import EmergencyService
 from .operations import recovery_summary
 from .world_migration import compare_world_contracts
 from .world_preflight import inspect_world_package
-from .world_import import world_import_payload
+from .world_import import world_edit_payload, world_import_payload
 from .storage import (
     file_sha256,
     next_timestamped_path,
@@ -470,7 +470,12 @@ class TavernWebConsole:
 
     async def world_save(self):
         try:
-            payload = await self._payload()
+            submitted = await self._payload()
+            current = None
+            world_id = str(submitted.get("id") or "").strip()
+            if world_id:
+                current = await self.database.get_world(world_id)
+            payload = world_edit_payload(submitted, current)
             report = inspect_world_package(payload)
             if not report["compatible"]:
                 messages = [

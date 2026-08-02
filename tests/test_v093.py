@@ -45,7 +45,7 @@ from tavern.resolution import CheckRequest, roll_check
 from tavern.world_contract import WORLD_SCHEMA_VERSION, validate_world_contract
 from tavern.world_migration import compare_world_contracts
 from tavern.world_preflight import inspect_world_package
-from tavern.world_import import world_import_payload
+from tavern.world_import import world_edit_payload, world_import_payload
 from tavern.stat_generation import (
     assess_preset_stack_migration,
     calculate_preset_stack_stats,
@@ -160,7 +160,49 @@ class V093ContractTests(unittest.TestCase):
         tide = json.loads(TIDE_WORLD_PATH.read_text("utf-8"))
         imported = world_import_payload(tide)
         self.assertEqual(imported["minimum_plugin_version"], "0.9.3")
+        self.assertEqual(imported["world_content_version"], "1.1.0")
+        self.assertEqual(imported["template_metadata"], tide["template_metadata"])
         validate_world_contract(imported)
+
+    def test_preset_stack_editor_contract_survives_normalization(self) -> None:
+        tide = json.loads(TIDE_WORLD_PATH.read_text("utf-8"))
+        normalized = card_template(tide)
+        self.assertEqual(normalized["stats"]["mode"], "preset_stack")
+        self.assertEqual(
+            normalized["stat_generation"],
+            normalized["stats"]["stat_generation"],
+        )
+        validate_stat_generation_config(normalized)
+
+    def test_world_editor_merge_keeps_contract_and_extension_fields(self) -> None:
+        tide = json.loads(TIDE_WORLD_PATH.read_text("utf-8"))
+        current = {
+            **tide,
+            "id": "world-test",
+            "revision": 3,
+            "card_template": card_template(tide),
+            "player_limits": {"maximum": 8},
+            "characters": [{"name": "runtime-only"}],
+        }
+        submitted = {
+            "id": "world-test",
+            "revision": 3,
+            "slug": tide["slug"],
+            "name": "编辑后的名称",
+            "description": tide["description"],
+            "system_prompt": tide["system_prompt"],
+            "opening_scene": tide["opening_scene"],
+            "rules": tide["rules"],
+            "initial_state": tide["initial_state"],
+        }
+        merged = world_edit_payload(submitted, current)
+        self.assertEqual(merged["minimum_plugin_version"], "0.9.3")
+        self.assertEqual(merged["world_content_version"], "1.1.0")
+        self.assertEqual(merged["template_metadata"], tide["template_metadata"])
+        self.assertNotIn("card_template", merged)
+        self.assertNotIn("player_limits", merged)
+        self.assertNotIn("characters", merged)
+        validate_world_contract(merged)
 
     def test_tide_reference_combination_is_exact_and_traceable(self) -> None:
         tide = json.loads(TIDE_WORLD_PATH.read_text("utf-8"))
@@ -484,8 +526,8 @@ class V093ContractTests(unittest.TestCase):
         html = (ROOT / "pages/console/index.html").read_text("utf-8")
         style = (ROOT / "pages/console/style.css").read_text("utf-8")
         logo = (ROOT / "logo.svg").read_text("utf-8")
-        self.assertIn("style.css?v=0.9.3", html)
-        self.assertIn("app.js?v=0.9.3", html)
+        self.assertIn("style.css?v=0.9.3-savefix2", html)
+        self.assertIn("app.js?v=0.9.3-savefix2", html)
         self.assertIn("button-secondary", html)
         self.assertIn(".button-secondary", style)
         self.assertIn("viewBox=\"0 0 256 256\"", logo)
@@ -699,6 +741,37 @@ class V093DatabaseTests(unittest.IsolatedAsyncioTestCase):
             saved_again["third_party_extension"],
             {"mode": "custom", "order": [3, 1, 2]},
         )
+
+    async def test_preset_stack_import_then_console_save_round_trip(self) -> None:
+        tide = json.loads(TIDE_WORLD_PATH.read_text("utf-8"))
+        imported = await self.database.save_world(
+            world_import_payload(tide), "admin"
+        )
+        # Simulate the visual editor: it submits editable fields but omits the
+        # package extension envelope returned by the import file.
+        submitted = {
+            "id": imported["id"],
+            "revision": imported["revision"],
+            "slug": imported["slug"],
+            "name": imported["name"],
+            "description": "管理台保存后的简介",
+            "system_prompt": imported["system_prompt"],
+            "opening_scene": imported["opening_scene"],
+            "rules": imported["rules"],
+            "initial_state": imported["initial_state"],
+        }
+        saved = await self.database.save_world(
+            world_edit_payload(submitted, imported), "admin"
+        )
+        restored = await self.database.get_world(saved["id"])
+        self.assertEqual(restored["minimum_plugin_version"], "0.9.3")
+        self.assertEqual(restored["world_content_version"], "1.1.0")
+        self.assertEqual(
+            restored["rules"]["character_card"]["stat_generation"]["mode"],
+            "preset_stack",
+        )
+        self.assertEqual(restored["description"], "管理台保存后的简介")
+        self.assertTrue(inspect_world_package(restored)["compatible"])
 
     async def test_operation_receipt_is_idempotent(self) -> None:
         created = await self.database.reserve_operation(
