@@ -4,15 +4,15 @@ import json
 from pathlib import Path
 
 PLUGIN_NAME = "astrbot_plugin_tavern"
-PLUGIN_VERSION = "0.7.0"
-DATABASE_SCHEMA_VERSION = 6
+PLUGIN_VERSION = "0.9.0"
+DATABASE_SCHEMA_VERSION = 8
 
 SESSION_CLOSED = "closed"
 SESSION_PREPARING = "preparing"
 SESSION_RUNNING = "running"
 SESSION_PAUSED = "paused"
 SESSION_FINISHED = "finished"
-# 仅为旧版数据库与旧备份保留。新版界面不再把它作为主流程状态。
+# 管理员执行恢复、导入或修复时使用的只读维护态。
 SESSION_MAINTENANCE = "maintenance"
 SESSION_STATES = {
     SESSION_CLOSED,

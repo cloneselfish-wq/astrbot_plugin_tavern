@@ -50,24 +50,23 @@ CHOICE_KEYS = ("A", "B", "C", "D")
 DEFAULT_TIME_RULES: dict[str, Any] = {
     "card_code_ttl_seconds": 30 * 60,
     "card_draft_ttl_seconds": 7 * 24 * 60 * 60,
-    "card_completion_timeout_seconds": 24 * 60 * 60,
-    "preparation_timeout_seconds": 24 * 60 * 60,
-    "ready_timeout_seconds": 30 * 60,
-    "turn_timeout_seconds": 10 * 60,
-    "turn_reminder_seconds": 3 * 60,
-    "max_consecutive_timeouts": 2,
-    "standby_timeout_seconds": 7 * 24 * 60 * 60,
-    "delegation_ttl_seconds": 24 * 60 * 60,
-    "check_timeout_seconds": 5 * 60,
-    "vote_round_one_seconds": 10 * 60,
-    "vote_round_two_seconds": 5 * 60,
-    "vote_reminder_seconds": 2 * 60,
-    "all_idle_pause_seconds": 10 * 60,
+    "card_completion_timeout_seconds": None,
+    "preparation_timeout_seconds": None,
+    "ready_timeout_seconds": None,
+    "turn_timeout_seconds": None,
+    "turn_reminder_seconds": None,
+    "max_consecutive_timeouts": -1,
+    "standby_timeout_seconds": None,
+    "delegation_ttl_seconds": None,
+    "vote_round_one_seconds": None,
+    "vote_round_two_seconds": None,
+    "vote_reminder_seconds": None,
+    "all_idle_pause_seconds": None,
     "pause_stops_clock": True,
-    "announce_timeouts": True,
-    "turn_timeout_action": "skip",
-    "card_timeout_action": "standby",
-    "ready_timeout_action": "standby",
+    "announce_timeouts": False,
+    "turn_timeout_action": "hold",
+    "card_timeout_action": "remind",
+    "ready_timeout_action": "remind",
 }
 
 DEFAULT_CARD_FIELDS: tuple[dict[str, Any], ...] = (
@@ -344,7 +343,6 @@ def normalize_time_rules(value: Any = None) -> dict[str, Any]:
         "turn_reminder_seconds",
         "standby_timeout_seconds",
         "delegation_ttl_seconds",
-        "check_timeout_seconds",
         "vote_round_one_seconds",
         "vote_round_two_seconds",
         "vote_reminder_seconds",
@@ -368,26 +366,26 @@ def normalize_time_rules(value: Any = None) -> dict[str, Any]:
         source.get("pause_stops_clock", True)
     )
     result["announce_timeouts"] = bool(
-        source.get("announce_timeouts", True)
+        source.get("announce_timeouts", False)
     )
     timeout_action = str(
-        source.get("turn_timeout_action", "skip")
+        source.get("turn_timeout_action", "hold")
     ).strip()
     result["turn_timeout_action"] = (
         timeout_action
         if timeout_action in {"skip", "hold"}
-        else "skip"
+        else "hold"
     )
     for key, allowed, default in (
         (
             "card_timeout_action",
             {"standby", "release", "remind"},
-            "standby",
+            "remind",
         ),
         (
             "ready_timeout_action",
             {"standby", "remind"},
-            "standby",
+            "remind",
         ),
     ):
         action = str(source.get(key, default)).strip()

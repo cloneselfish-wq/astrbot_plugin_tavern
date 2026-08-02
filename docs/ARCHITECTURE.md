@@ -1,190 +1,100 @@
-# v0.6.0 架构与安全边界
+# AI 酒馆 v0.9.0 架构与扩展接口
 
-## 对象分层
+## 依赖方向
 
-```mermaid
-flowchart TD
-    W["世界模板与版本"] --> I["命名副本与规则快照"]
-    C["角色基础卡与版本"] --> P["副本参与记录"]
-    I --> P
-    P --> R["伤势 / 灵感 / 装备 / 关系"]
-    I --> N["副本 NPC / 认知状态"]
-    I --> F["选项 / 投票 / 检定 / 计时"]
-    I --> S["时间线 / 记忆 / 账本 / 存档"]
+```text
+AstrBot 指令 / Web 路由
+          ↓
+      服务与引擎
+          ↓
+  领域仓库 / 世界契约 / 叙事
+          ↓
+      SQLite / 独立存档
 ```
 
-角色基础卡可版本化；伤势、灵感、装备次数、NPC 关系和临时成长只属于一个副本。动态 NPC 也只属于当前副本，不回写世界模板。
+指令和 Web 路由不得直接执行 SQL；世界包解析器不得发送群消息；叙事生成器不得自行切换行动者；平台适配层不得修改副本状态。跨模块写操作必须经过服务、权限、事务防重与审计。
 
-## 群消息处理链
+## 目录职责
 
-```mermaid
-flowchart TD
-    A["AstrBot 消息事件"] --> B{"酒馆命令？"}
-    B -- 否 --> C{"精确匹配剧情入口？"}
-    C -- 否 --> X["完全旁路"]
-    C -- 是 --> D{"运行中且轮到本人？"}
-    D -- 否 --> Y["拒绝，不保存原文"]
-    D -- 是 --> E{"匹配已持久化 A—D？"}
-    E -- 否 --> Y
-    E -- 是 --> F["锁定选项、DC、风险与来源"]
-    F --> G["锁定骰池或发起集体表决"]
-    G --> H["模型依据权威结果叙事"]
-    H --> I["原子提交全部状态与下一流程"]
+```text
+main.py                       AstrBot 事件、指令入口与平台回执
+tavern/bootstrap.py           运行时依赖装配
+tavern/api/                   公共服务、事件钩子与注册式扩展
+tavern/repositories/          按领域拆分的数据访问方法
+tavern/database.py            SQLite 连接、当前 Schema 与仓库组合入口
+tavern/engine.py              回合、模型调用、质量守卫和原子提交
+tavern/presentation.py        群聊展示与角色卡格式化
+tavern/world_contract.py      世界协议 v2 运行契约
+tavern/world_preflight.py     导入前结构化体检
+tavern/narrative_quality.py   通用叙事质量检查
+tavern/emergency.py           管理员精确急救
+tavern/diagnostics.py         脱敏诊断
+tavern/web_console.py         管理台 API 路由
+pages/console/core/           前端桥接、DOM 与状态
+pages/console/                页面入口与统一设计系统
 ```
 
-管理命令只使用真实平台 `sender_id` 鉴权。昵称、群名片、引用文本和“我是管理员”等内容都不参与权限判断。
+## 数据仓库
 
-## 失败一致性与幂等
+`TavernDatabase` 是组合入口，具体职责分布如下：
 
-- 选项、投票、骰点、NPC 操作、时钟和世界事件都有稳定 ID。
-- 检定操作回执在最终叙事前持久化；相同操作 ID 总是复用原骰池。
-- 模型回退链共享同一份请求和权威检定结果。
-- SQLite `BEGIN IMMEDIATE` 包裹剧情、角色运行值、NPC、记忆、账本、时钟、行动权和后续流程。
-- 模型失败、结构无效或 revision 冲突时，不提交剧情事务。
-- Bot 重载后恢复草稿、选项、投票、计时器和检定操作回执。
-- 配置保存后回读校验，并用内容哈希去重记录修订。
-
-## 状态机
-
-| 状态 | 可做 | 不可做 |
-|---|---|---|
-| `closed` | 查看、选择、克隆 | 加入、建卡、剧情 |
-| `preparing` | 加入、建卡、审核、准备、读档 | 剧情行动 |
-| `running` | 四选一、投票、检定、存档 | 修改世界模板 |
-| `paused` | 查看、调整、恢复准备 | 剧情行动、倒计时 |
-| `finished` | 查看、导出、克隆 | 一切原副本写操作 |
-
-`maintenance` 仅为历史兼容。0.5 的 `finished` 会与 `session_archives.readonly=1` 双重校验，不能转回准备或运行状态。
-
-## 永久归档事务
-
-完结或强制终止在同一事务中：
-
-1. 建立最终保护存档。
-2. 写入最终系统事件。
-3. 取消活动选项、投票和计时。
-4. 撤销代控、协助标记、返场流程和副本权限。
-5. 解除当前群选择。
-6. 写入结束类型、原因、操作者和时间。
-7. 把副本改为永久只读。
-
-克隆操作只读取源副本，并为目标副本重新分配 NPC、记忆和存档 ID。
-
-## 权限
-
-- 全局管理员：插件配置中的真实用户 ID。
-- 主持人：创建或开启副本时授予。
-- 秩序管理员：由主持人或管理台授予。
-- 玩家：只控制本人角色；代控必须有持久化授权。
-- 封禁分为副本、群和全局作用域，不能被投票绕过。
-
-安全暂停不要求公开原因，任何活跃玩家都可触发。暂停会冻结个人回合、投票和其他活动计时器。
-
-## 模型可写边界
-
-模型只能提议：
-
-- 受白名单限制的世界状态补丁
-- 下一组 A/B/C/D 与集体决策
-- 记忆候选和治理元数据
-- 副本 NPC 的公开资料、认知与运行状态
-- 伤势/状态、协助、剧情账本和场景时钟操作
-- 返场任务推进
-
-模型不能修改：
-
-- 管理员、权限、封禁和会话阶段
-- 世界模板和角色卡基础属性
-- 已锁定骰点、DC、风险、优劣势和投票资格
-- 存档指针、计时规则和配置修订
-- NPC 的系统级私密提示词
-
-未知字段会被丢弃。模型提出的优劣势必须匹配角色卡、运行状态、协助或已持久化场景事实。
-
-## 检定
-
-1. A—D 选项提前声明检定类型、属性、DC、风险和可见后果。
-2. 模型第一阶段只能申请检定。
-3. 插件读取已审核角色卡加值，并验证优劣势来源。
-4. 插件按常规、优势、劣势、集体或对抗规则生成骰池。
-5. 骰池和请求写入 `operation_receipts`。
-6. 模型第二阶段只能依据权威结果叙事。
-7. 最终事务保存骰点、来源、结果档位和状态操作。
-
-同一原因不能同时提高 DC 和造成劣势。风险只决定失败后果，不改变成功概率。
-
-## 结果档位
-
-| 条件 | 结果 |
+| 仓库 | 职责 |
 |---|---|
-| 超出 DC 10 点以上或保留骰自然 20 | 大成功 |
-| 达到 DC | 成功 |
-| 低于 DC 1—4 点 | 代价成功 |
-| 低于 DC 5—9 点 | 失败 |
-| 低于 DC 10 点以上或保留骰自然 1 | 大失败 |
+| `worlds.py` | 世界包、常驻 NPC、世界归档 |
+| `sessions.py` | 群副本、玩家、回合顺序与会话状态 |
+| `story.py` | 事件、记忆、快照与回合提交 |
+| `rules.py` | 冻结配置、规则状态、Token 与事务回执 |
+| `characters.py` | 参与者、建卡、审核与角色卡版本 |
+| `workflow.py` | 开演、选项、投票、暂离、返场与退场 |
+| `timers.py` | 计时策略、持久计时器与到期动作 |
+| `admin.py` | 权限、审计、清理、备份导入导出 |
+| `current_state.py` | 为当前 Schema 幂等补齐派生运行行 |
 
-失败仍推进剧情。关键主线线索不能因一次失败永久消失。
+仓库 mixin 仅供数据库组合入口使用，不是公共扩展接口。
 
-## NPC 与记忆
+## 公共扩展接口
 
-- 世界常驻角色复制成 `session_characters`。
-- 模型新建 NPC 默认待复核，并受单回合上限与登记原因校验。
-- 同名/别名冲突保存为疑似重复提案。
-- 只有活跃、近期相关且未拒绝的 NPC 进入模型上下文。
-- NPC 陈述、谣言和误解与世界事实分开。
-- 记忆支持锁定、置顶、可见范围、失效、冲突和替代关系。
-- 锁定事实优先于普通上下文预算。
+可信 Python 扩展从 `tavern.api` 使用：
 
-## 投票与多人回合
+```python
+plugin.extensions.register_dice_system("percentile", resolver)
+plugin.extensions.register_narrative_guard("continuity", guard)
+plugin.hooks.subscribe("story_generated", on_story_generated)
 
-- 真实玩家一人一票，多角色不增加票数。
-- 资格名单在投票建立时冻结。
-- 第一轮无多数时前两名进入决选。
-- 第二轮平票或参与不足则维持现状。
-- 投票挂起个人计时，不消耗当前玩家行动。
-- 投票结束后恢复同一行动者。
-- 只有完整多人轮次结束时，才至多触发一次世界脉冲。
-
-## 存档
-
-Schema 6 的回合级快速恢复点除世界状态与剧情事件锚点外，还包含：
-
-- 角色卡引用和角色副本运行状态
-- 参与、准备、候补、暂离和退场状态
-- 多人轮次与行动权
-- 未完成选项、投票、事件和计时器
-- 权限、代控、封禁和返场任务
-- 副本规则状态、动态 NPC、剧情账本、场景时钟和协助标记
-
-读档前建立保护快照；读档后副本进入暂停。旧分支不删除，仍可审计与备份。
-
-## 数据库与升级
-
-- SQLite WAL、外键和 busy timeout。
-- Schema 6 使用 `catalog.sqlite3` 协调全局目录和兼容事务。
-- 每个群拥有稳定目录，每轮故事副本拥有带创建时间和唯一 ID 的独立目录。
-- 每个副本持续物化为自包含 `instance.sqlite3`，并用 `manifest.json` 与 SHA-256 校验。
-- 回合级恢复点保存在副本数据库内部；手动、最终和周期备份生成独立时间戳 ZIP。
-- Schema 6 结构升级前用 SQLite backup API 生成一致备份。
-- 备份失败时停止迁移。
-- 0.4 `finished` 自动迁移为永久归档。
-- Schema 1—5 JSON 备份可导入并补齐 0.5.3 的倒计时与 Token 状态。
-
-目录关系：
-
-```mermaid
-flowchart TD
-    C["catalog.sqlite3"] --> G["群目录 + group.json"]
-    G --> I1["副本实例 A"]
-    G --> I2["副本实例 B"]
-    I1 --> D1["instance.sqlite3"]
-    I1 --> B1["saves / backups"]
-    I2 --> D2["instance.sqlite3"]
-    I2 --> B2["saves / backups"]
+session = await plugin.public_api.get_current_session(platform_id, group_id)
+turn = await plugin.public_api.get_turn_context(session["id"])
 ```
 
-详见 [升级与存档说明](UPGRADE_AND_SAVES.md)。
+可注册类型：
 
-## Web 管理台
+- `dice_system`
+- `check_resolver`
+- `world_validator`
+- `narrative_guard`
+- `summary_provider`
+- `admin_action`
 
-前端只使用 `window.AstrBotPluginPage` bridge；后端每个 API 检查 AstrBot Dashboard 登录态。页面不读取 Dashboard Cookie、LocalStorage 或父页面 DOM。群／副本检索在服务端分页；群备注使用 revision 防止并发覆盖；世界 JSON、角色卡模板和备份导入均有结构、Schema、大小与冲突校验。
+可观察事件：
+
+- `session_created`
+- `character_approved`
+- `turn_started`
+- `option_selected`
+- `check_completed`
+- `vote_completed`
+- `story_generated`
+- `session_finished`
+
+钩子只在权威状态提交后收到脱离 SQL 连接的字典副本。钩子异常被隔离，单个异步回调最多执行 2 秒，不会回滚或长期阻塞主流程。
+
+## 扩展安全边界
+
+- 世界包始终为纯 JSON，不能携带或执行 Python/JavaScript。
+- 扩展不能取得原始数据库连接，也不能绕过权限和操作回执。
+- 写入剧情、创建存档和读取回合必须调用 `TavernPublicAPI`。
+- 同名扩展不可重复注册；扩展名称必须稳定，避免存档中的规则引用漂移。
+- 运行中世界契约仍然冻结；改变属性、职业或数值模式时应新建副本。
+
+## 版本边界
+
+v0.9.0 使用 Schema 8、世界协议 v2 和独立数据库 `catalog_v090.sqlite3`。本版本不包含 Schema 1—7、旧世界协议或旧存档目录迁移代码。

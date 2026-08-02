@@ -42,6 +42,11 @@ from .database import (
 )
 from .events import EventBroker
 from .lifecycle import normalize_time_rules
+from .diagnostics import build_diagnostic_report
+from .emergency import EmergencyService
+from .operations import recovery_summary
+from .world_migration import compare_world_contracts
+from .world_preflight import inspect_world_package
 from .storage import (
     file_sha256,
     next_timestamped_path,
@@ -197,6 +202,8 @@ class TavernWebConsole:
         routes = [
             ("overview", self.overview, ["GET"], "Tavern overview"),
             ("worlds", self.worlds, ["GET"], "List worlds"),
+            ("worlds/preflight", self.world_preflight, ["POST"], "Inspect world package"),
+            ("worlds/migration", self.world_migration, ["POST"], "Compare frozen world contract"),
             ("worlds/save", self.world_save, ["POST"], "Save world"),
             ("worlds/archive", self.world_archive, ["POST"], "Archive world"),
             ("worlds/restore", self.world_restore, ["POST"], "Restore world"),
@@ -232,6 +239,10 @@ class TavernWebConsole:
                 ["GET"],
                 "Session detail",
             ),
+            ("sessions/recovery", self.session_recovery, ["GET"], "Inspect workflow recovery state"),
+            ("sessions/diagnostics", self.session_diagnostics, ["GET"], "Export redacted diagnostics"),
+            ("sessions/rescue", self.session_rescue, ["POST"], "Run precise workflow recovery"),
+            ("sessions/card-revisions", self.session_card_revisions, ["GET", "POST"], "Manage character card revisions"),
             (
                 "sessions/action",
                 self.session_action,
@@ -459,9 +470,56 @@ class TavernWebConsole:
     async def world_save(self):
         try:
             payload = await self._payload()
+            report = inspect_world_package(payload)
+            if not report["compatible"]:
+                messages = [
+                    item["message"]
+                    for item in report["issues"]
+                    if item["level"] == "error"
+                ]
+                raise ValueError("世界包体检未通过：" + "；".join(messages[:5]))
             item = await self.database.save_world(payload, self._actor())
             await self.broker.publish({"type": "world", "action": "save"})
-            return json_response({"item": item})
+            return json_response({"item": item, "preflight": report})
+        except Exception as exc:
+            return self._handle_error(exc)
+
+    async def world_preflight(self):
+        try:
+            self._username()
+            payload = await self._payload()
+            world_ref = str(payload.get("world_ref") or "")
+            world = (
+                await self.database.get_world(world_ref)
+                if world_ref
+                else payload.get("world", payload)
+            )
+            if not isinstance(world, dict):
+                raise ValueError("world 必须是 JSON 对象")
+            return json_response({"report": inspect_world_package(world)})
+        except Exception as exc:
+            return self._handle_error(exc)
+
+    async def world_migration(self):
+        try:
+            payload = await self._payload()
+            session_id = str(payload.get("session_id") or "")
+            instance = await self.database.get_instance_config(session_id)
+            candidate_ref = str(payload.get("candidate_world_ref") or "")
+            candidate = (
+                await self.database.get_world(candidate_ref)
+                if candidate_ref
+                else payload.get("candidate_world")
+            )
+            if not isinstance(candidate, dict):
+                raise ValueError("请提供候选世界包或世界标识")
+            return json_response(
+                {
+                    "report": compare_world_contracts(
+                        instance.get("world_snapshot") or {}, candidate
+                    )
+                }
+            )
         except Exception as exc:
             return self._handle_error(exc)
 
@@ -546,6 +604,14 @@ class TavernWebConsole:
             initial_state = payload.get("initial_state")
             if initial_state is not None and not isinstance(initial_state, dict):
                 raise ValueError("initial_state 必须是 JSON 对象")
+            report = inspect_world_package(payload)
+            if not report["compatible"]:
+                messages = [
+                    item["message"]
+                    for item in report["issues"]
+                    if item["level"] == "error"
+                ]
+                raise ValueError("世界包体检未通过：" + "；".join(messages[:5]))
             import_payload = {
                 "slug": payload["slug"],
                 "name": payload["name"],
@@ -556,6 +622,8 @@ class TavernWebConsole:
                 "initial_state": (
                     initial_state if isinstance(initial_state, dict) else {}
                 ),
+                "world_schema_version": payload.get("world_schema_version", 0),
+                "capabilities": payload.get("capabilities", {}),
             }
             # 按 slug 更新已存在世界，否则新建（save_world 会再次校验字段合法性）
             mode = "created"
@@ -568,7 +636,7 @@ class TavernWebConsole:
                 pass
             item = await self.database.save_world(import_payload, self._actor())
             await self.broker.publish({"type": "world", "action": "save"})
-            return json_response({"item": item, "mode": mode})
+            return json_response({"item": item, "mode": mode, "preflight": report})
         except Exception as exc:
             return self._handle_error(exc)
 
@@ -728,8 +796,117 @@ class TavernWebConsole:
                     "storage": (
                         await self.database.get_storage_info(session_id)
                     ),
+                    "operations": (
+                        await self.database.list_session_operations(session_id, 50)
+                    ),
+                    "card_revisions": (
+                        await self.database.list_card_revisions(session_id)
+                    ),
                 }
             )
+        except Exception as exc:
+            return self._handle_error(exc)
+
+    async def session_recovery(self):
+        try:
+            self._username()
+            session_id = str(request.query.get("id", "") or "")
+            session = await self.database.get_session(session_id)
+            operations = await self.database.list_session_operations(session_id, 100)
+            choice = await self.database.active_choice_set(session_id)
+            vote = await self.database.active_vote(session_id)
+            return json_response(
+                {
+                    "recovery": recovery_summary(
+                        operations,
+                        session_state=str(session.get("state") or ""),
+                        has_active_choices=bool(choice),
+                        has_active_vote=bool(vote),
+                    )
+                }
+            )
+        except Exception as exc:
+            return self._handle_error(exc)
+
+    async def session_diagnostics(self):
+        try:
+            self._username()
+            session_id = str(request.query.get("id", "") or "")
+            report = await build_diagnostic_report(self.database, session_id)
+            export_dir = self.data_dir / "exports"
+            export_dir.mkdir(parents=True, exist_ok=True)
+            path = next_timestamped_path(export_dir, "tavern_diagnostic", ".zip")
+            temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+            payload = (
+                json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True)
+                + "\n"
+            ).encode("utf-8")
+            try:
+                with zipfile.ZipFile(
+                    temporary,
+                    "w",
+                    compression=zipfile.ZIP_DEFLATED,
+                    compresslevel=6,
+                ) as archive:
+                    archive.writestr("diagnostic.json", payload)
+                    archive.writestr(
+                        "README.txt",
+                        "AI 酒馆脱敏故障报告。用户 ID 已哈希，密钥、私聊来源、私人字段与完整系统提示词未导出。\n",
+                    )
+                replace_with_retry(temporary, path)
+            finally:
+                unlink_with_retry(temporary, suppress_errors=True)
+            return file_response(path, filename=path.name, content_type="application/zip")
+        except Exception as exc:
+            return self._handle_error(exc)
+
+    async def session_rescue(self):
+        try:
+            payload = await self._payload()
+            session_id = str(payload.get("session_id") or "")
+            service = EmergencyService(self.database)
+            result = await service.execute(
+                session_id,
+                str(payload.get("action") or ""),
+                payload,
+                self._actor(),
+            )
+            await self.broker.publish(
+                {"type": "session", "action": "rescue", "session_id": session_id}
+            )
+            return json_response({"result": result})
+        except Exception as exc:
+            return self._handle_error(exc)
+
+    async def session_card_revisions(self):
+        try:
+            if request.method == "GET":
+                self._username()
+                session_id = str(request.query.get("id", "") or "")
+                return json_response(
+                    {"items": await self.database.list_card_revisions(session_id)}
+                )
+            payload = await self._payload()
+            action = str(payload.get("action") or "request").lower()
+            if action == "request":
+                item = await self.database.request_card_revision(
+                    str(payload.get("session_id") or ""),
+                    str(payload.get("participant_ref") or ""),
+                    payload.get("profile_patch") or {},
+                    payload.get("stats_patch") or {},
+                    self._actor(),
+                    str(payload.get("note") or ""),
+                )
+            elif action in {"approve", "reject"}:
+                item = await self.database.review_card_revision(
+                    str(payload.get("request_id") or ""),
+                    action == "approve",
+                    self._actor(),
+                    str(payload.get("note") or ""),
+                )
+            else:
+                raise ValueError("不支持的角色卡修订操作")
+            return json_response({"item": item})
         except Exception as exc:
             return self._handle_error(exc)
 
@@ -1667,7 +1844,7 @@ class TavernWebConsole:
                 raise ValueError("缺少备份文件")
             filename = str(upload.filename or "").lower()
             if not filename.endswith((".json", ".zip")):
-                raise ValueError("只接受 v0.5.1 及以后 ZIP 或旧版 JSON 备份")
+                raise ValueError("只接受 v0.9.0 Schema 8 的 JSON 或 ZIP 备份")
             temp_dir = self.data_dir / "imports"
             temp_dir.mkdir(parents=True, exist_ok=True)
             suffix = ".zip" if filename.endswith(".zip") else ".json"

@@ -155,11 +155,10 @@ def next_timestamped_path(
 class InstanceStorage:
     """Materialize a recoverable database and manifest for each story run.
 
-    The catalog remains the transaction coordinator during the 0.5.1 Alpha
-    migration window. Every successful session mutation refreshes a
-    self-contained, single-session SQLite database. A missing catalog can
-    therefore be reconstructed from the manifests and instance databases
-    without relying on one monolithic story file.
+    The Schema 8 catalog is the transaction coordinator. Every successful
+    session mutation refreshes a self-contained, single-session SQLite
+    database, so a damaged catalog can be reconstructed from manifests and
+    instance databases without relying on one monolithic story file.
     """
 
     def __init__(
@@ -926,7 +925,7 @@ class InstanceStorage:
                 reason=reason,
             )
 
-    def bootstrap(self, *, migration: bool = False) -> list[dict[str, Any]]:
+    def bootstrap(self) -> list[dict[str, Any]]:
         with self.connect_catalog() as connection:
             session_ids = [
                 str(row[0])
@@ -947,8 +946,7 @@ class InstanceStorage:
                 indexed["storage"].get("last_checksum") or ""
             )
             if (
-                not migration
-                and indexed["storage"].get("sync_status") == "ready"
+                indexed["storage"].get("sync_status") == "ready"
                 and expected
                 and database_path.exists()
                 and manifest_path.exists()
@@ -968,14 +966,6 @@ class InstanceStorage:
                 )
                 continue
             result = self.sync_session(session_id)
-            if migration:
-                result["migration_backup"] = str(
-                    self._archive_synced(
-                        session_id,
-                        kind="backup",
-                        reason="v0.5.1 Alpha 存储布局迁移",
-                    )
-                )
             results.append(result)
         return results
 

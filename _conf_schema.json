@@ -204,67 +204,62 @@
           "card_completion_timeout_seconds": {
             "description": "等待完成建卡秒数（-1 不限时）",
             "type": "int",
-            "default": 86400
+            "default": -1
           },
           "preparation_timeout_seconds": {
             "description": "准备大厅最长秒数（-1 不限时）",
             "type": "int",
-            "default": 86400
+            "default": -1
           },
           "ready_timeout_seconds": {
             "description": "玩家准备确认秒数（-1 不限时）",
             "type": "int",
-            "default": 1800
+            "default": -1
           },
           "turn_timeout_seconds": {
             "description": "个人回合秒数",
             "type": "int",
-            "default": 600
+            "default": -1
           },
           "turn_reminder_seconds": {
             "description": "回合提前提醒秒数",
             "type": "int",
-            "default": 180
+            "default": -1
           },
           "max_consecutive_timeouts": {
             "description": "连续超时转候补次数",
             "type": "int",
-            "default": 2
+            "default": -1
           },
           "standby_timeout_seconds": {
             "description": "候补自动退场秒数（-1 不限时）",
             "type": "int",
-            "default": 604800
+            "default": -1
           },
           "delegation_ttl_seconds": {
             "description": "代控授权有效秒数（-1 不限时）",
             "type": "int",
-            "default": 86400
-          },
-          "check_timeout_seconds": {
-            "description": "检定或补充选择等待秒数",
-            "type": "int",
-            "default": 300
+            "default": -1
           },
           "vote_round_one_seconds": {
             "description": "第一轮集体投票秒数",
             "type": "int",
-            "default": 600
+            "default": -1
           },
           "vote_round_two_seconds": {
             "description": "第二轮集体投票秒数",
             "type": "int",
-            "default": 300
+            "default": -1
           },
           "vote_reminder_seconds": {
             "description": "投票提前提醒秒数",
             "type": "int",
-            "default": 120
+            "default": -1
           },
           "all_idle_pause_seconds": {
             "description": "全员无互动后自动暂停秒数（留空关闭）",
             "type": "int",
-            "default": 600
+            "default": -1
           },
           "pause_stops_clock": {
             "description": "暂停期间停止计时",
@@ -274,7 +269,7 @@
           "announce_timeouts": {
             "description": "在群内公布超时与提醒",
             "type": "bool",
-            "default": true
+            "default": false
           },
           "turn_timeout_action": {
             "description": "个人回合超时处理",
@@ -287,7 +282,7 @@
               "跳过并累计超时",
               "保留行动权"
             ],
-            "default": "skip"
+            "default": "hold"
           },
           "card_timeout_action": {
             "description": "建卡超时处理",
@@ -302,7 +297,7 @@
               "释放席位",
               "仅提醒"
             ],
-            "default": "standby"
+            "default": "remind"
           },
           "ready_timeout_action": {
             "description": "准备超时处理",
@@ -315,7 +310,7 @@
               "转候补",
               "仅提醒"
             ],
-            "default": "standby"
+            "default": "remind"
           }
         }
       }

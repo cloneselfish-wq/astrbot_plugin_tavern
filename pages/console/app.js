@@ -1,34 +1,16 @@
-const bridge = window.AstrBotPluginPage;
-
-const $ = (selector, root = document) => root.querySelector(selector);
-const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
-
-const app = {
-  context: null,
-  view: "dashboard",
-  overview: null,
-  worlds: [],
-  sessions: [],
-  sessionOptions: [],
-  sessionGroups: [],
-  sessionQuery: "",
-  sessionScope: "all",
-  sessionPage: 1,
-  sessionPageSize: 20,
-  sessionTotal: 0,
-  sessionPages: 1,
-  providers: [],
-  settings: null,
-  configState: null,
-  providerHealth: [],
-  currentSession: null,
-  memories: [],
-  audit: [],
-  editorSave: null,
-  sseId: null,
-  refreshTimer: null,
-  contextOff: null,
-};
+import { bridge } from "./core/bridge.js";
+import {
+  $,
+  $$,
+  escapeHTML,
+  formatBytes,
+  formatDate,
+  prettyJSON,
+  snapshotKindLabel,
+  statusBadge,
+  statusLabel,
+} from "./core/dom.js";
+import { app, viewMeta } from "./core/state.js";
 
 const DEFAULT_CHARACTER_CARD_TEMPLATE = {
   version: 1,
@@ -90,10 +72,17 @@ function validateCharacterCardTemplate(template) {
   for (const required of ["name", "code"]) {
     if (!keys.includes(required)) throw new Error(`角色卡缺少必需字段 ${required}`);
   }
-  const attributes = template.stats?.attributes;
-  if (!Array.isArray(attributes) || !attributes.length) {
-    throw new Error("角色卡模板必须包含 stats.attributes");
+  const mode = String(template.stats?.mode || "manual").toLowerCase();
+  if (!["none", "manual", "preset"].includes(mode)) {
+    throw new Error("数值模式必须是 none、manual 或 preset");
   }
+  const attributes = Array.isArray(template.stats?.attributes)
+    ? template.stats.attributes
+    : [];
+  if (mode !== "none" && !attributes.length) {
+    throw new Error("启用数值系统时必须包含 stats.attributes");
+  }
+  if (mode === "none") return template;
   const minimumBudget = attributes.reduce(
     (sum, item) => sum + Number(item.minimum || 0),
     0,
@@ -109,28 +98,6 @@ function validateCharacterCardTemplate(template) {
   return template;
 }
 
-const viewMeta = {
-  dashboard: ["COMMAND CENTER", "运行总览"],
-  worlds: ["WORLD LIBRARY", "世界与角色"],
-  sessions: ["SESSION CONTROL", "群会话"],
-  memories: ["LONG-TERM MEMORY", "长期记忆"],
-  audit: ["AUDIT TRAIL", "审计记录"],
-  settings: ["SECURITY BOUNDARY", "安全与设置"],
-};
-
-function escapeHTML(value) {
-  return String(value ?? "")
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&#039;");
-}
-
-function prettyJSON(value) {
-  return JSON.stringify(value ?? {}, null, 2);
-}
-
 function parseJSONField(id, label) {
   const raw = $(id).value.trim();
   try {
@@ -142,55 +109,6 @@ function parseJSONField(id, label) {
   } catch (error) {
     throw new Error(`${label} 不是有效的 JSON 对象：${error.message}`);
   }
-}
-
-function formatDate(value) {
-  if (!value) return "—";
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return String(value);
-  return new Intl.DateTimeFormat("zh-CN", {
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-  }).format(date);
-}
-
-function formatBytes(bytes) {
-  const value = Number(bytes || 0);
-  if (value < 1024) return `${value} B`;
-  if (value < 1024 ** 2) return `${(value / 1024).toFixed(1)} KiB`;
-  return `${(value / 1024 ** 2).toFixed(1)} MiB`;
-}
-
-function statusLabel(status) {
-  return (
-    {
-      running: "运行中",
-      preparing: "准备中",
-      paused: "已暂停",
-      finished: "已完结",
-      maintenance: "维护中",
-      closed: "已关闭",
-    }[status] || status
-  );
-}
-
-function statusBadge(status) {
-  return `<span class="status-badge status-${escapeHTML(status)}">${escapeHTML(
-    statusLabel(status),
-  )}</span>`;
-}
-
-function snapshotKindLabel(kind) {
-  return (
-    {
-      manual: "手动存档",
-      auto: "自动检查点",
-      safety: "操作前保护",
-      undo: "单回合回滚点",
-    }[kind] || kind
-  );
 }
 
 function turnPlayerStatus(player, turn) {
@@ -483,6 +401,13 @@ function renderRosterCharacterCard(item, template, session, readonly, index) {
   const disabled = readonly ? "disabled" : "";
   const actionButtons = `
     ${
+      item.card_status === "approved"
+        ? `<button class="action-button"
+            data-session-detail-action="request-card-revision"
+            data-ref="${escapeHTML(item.id)}" ${disabled}>新建修改版本</button>`
+        : ""
+    }
+    ${
       item.card_status === "pending_review"
         ? `<button class="action-button"
             data-session-detail-action="card-approve"
@@ -678,7 +603,6 @@ const GLOBAL_TIME_FIELDS = {
   "#gtime-turn-reminder": "turn_reminder_seconds",
   "#gtime-standby": "standby_timeout_seconds",
   "#gtime-delegation": "delegation_ttl_seconds",
-  "#gtime-check": "check_timeout_seconds",
   "#gtime-all-idle": "all_idle_pause_seconds",
   "#gtime-vote-one": "vote_round_one_seconds",
   "#gtime-vote-two": "vote_round_two_seconds",
@@ -695,7 +619,6 @@ const SESSION_TIME_FIELDS = {
   "#t-turn-reminder": "turn_reminder_seconds",
   "#t-standby": "standby_timeout_seconds",
   "#t-delegation": "delegation_ttl_seconds",
-  "#t-check": "check_timeout_seconds",
   "#t-all-idle": "all_idle_pause_seconds",
   "#t-vote-one": "vote_round_one_seconds",
   "#t-vote-two": "vote_round_two_seconds",
@@ -797,7 +720,6 @@ function applyTimePreset(name) {
       turn_reminder_seconds: 60,
       standby_timeout_seconds: 86400,
       delegation_ttl_seconds: 7200,
-      check_timeout_seconds: 120,
       all_idle_pause_seconds: 600,
       vote_round_one_seconds: 180,
       vote_round_two_seconds: 120,
@@ -814,7 +736,6 @@ function applyTimePreset(name) {
       turn_reminder_seconds: 180,
       standby_timeout_seconds: 604800,
       delegation_ttl_seconds: 86400,
-      check_timeout_seconds: 300,
       all_idle_pause_seconds: 600,
       vote_round_one_seconds: 600,
       vote_round_two_seconds: 300,
@@ -1098,7 +1019,7 @@ function renderOverview() {
           ? "仅允许列表中的群进入酒馆"
           : "授权管理员发送 /酒馆 开启 后自动绑定并选择副本",
     ],
-    [counts.worlds > 0, "准备至少一个世界包", "默认已附带边境无名酒馆"],
+    [counts.worlds > 0, "准备至少一个世界包", "默认已附带阿尔维恩：灰烬王冠"],
     [
       true,
       "设置叙事模型链",
@@ -1183,6 +1104,9 @@ function renderWorlds() {
             <button class="action-button" data-world-action="card-template" data-id="${escapeHTML(
               world.id,
             )}">角色卡模板</button>
+            <button class="action-button" data-world-action="preflight" data-id="${escapeHTML(
+              world.id,
+            )}">兼容性体检</button>
             ${
               world.archived
                 ? `<button class="action-button" data-world-action="restore" data-id="${escapeHTML(
@@ -1557,6 +1481,23 @@ function openWorldEditor(world = null) {
           <span><strong>严格 A/B/C/D 回合</strong>
             <small>关键集体决定自动转为多数表决</small></span>
         </label>
+        <div class="field">
+          <label for="world-stats-mode">角色数值模式</label>
+          <select id="world-stats-mode">
+            ${[["none", "无数值"], ["manual", "手动分配"], ["preset", "职业预设"]].map(([value, label]) => `<option value="${value}" ${String(characterCardTemplate.stats?.mode || "manual") === value ? "selected" : ""}>${label}</option>`).join("")}
+          </select>
+        </div>
+        <div class="field">
+          <label for="world-resolution-mode">裁定模式</label>
+          <select id="world-resolution-mode">
+            ${[["none", "不裁定"], ["narrative", "叙事裁定"], ["dice_only", "纯骰检定"], ["attribute", "属性检定"]].map(([value, label]) => `<option value="${value}" ${String(item.rules?.resolution?.mode || (typeof item.rules?.resolution === "string" ? "attribute" : "none")) === value ? "selected" : ""}>${label}</option>`).join("")}
+          </select>
+        </div>
+        <div class="field field-span-2">
+          <label for="world-dice-system">骰制</label>
+          <select id="world-dice-system"><option value="d20" ${String(item.rules?.resolution?.dice_system || "d20") === "d20" ? "selected" : ""}>D20</option><option value="none" ${String(item.rules?.resolution?.dice_system || "") === "none" ? "selected" : ""}>无骰制</option></select>
+          <small>可视化字段会写回纯 JSON；复杂属性、职业和事件仍可在下方源码区精确调整。</small>
+        </div>
         <div class="field field-span-2">
           <label for="world-system-prompt">核心世界设定</label>
           <textarea id="world-system-prompt" rows="9">${escapeHTML(
@@ -1604,9 +1545,21 @@ function openWorldEditor(world = null) {
     `,
     onSave: async () => {
       const rules = parseJSONField("#world-rules", "裁定规则");
-      rules.character_card = validateCharacterCardTemplate(
-        parseJSONField("#world-character-card", "玩家角色卡模板"),
-      );
+      const characterCard = parseJSONField("#world-character-card", "玩家角色卡模板");
+      characterCard.stats = characterCard.stats || {};
+      characterCard.stats.mode = $("#world-stats-mode").value;
+      if (characterCard.stats.mode === "none") {
+        characterCard.stats.attributes = [];
+        characterCard.stats.modifier_table = {};
+        characterCard.stats.budget = 0;
+      }
+      rules.character_card = validateCharacterCardTemplate(characterCard);
+      rules.resolution = {
+        ...(typeof rules.resolution === "object" ? rules.resolution : {}),
+        mode: $("#world-resolution-mode").value,
+        dice_system: $("#world-dice-system").value,
+        unknown_attribute: "reject",
+      };
       rules.strict_choices = $("#world-strict-choices").checked;
       rules.player_limits = {
         recommended_min: Number($("#world-recommended-min").value),
@@ -1625,6 +1578,12 @@ function openWorldEditor(world = null) {
         rules,
         initial_state: parseJSONField("#world-state", "初始世界状态"),
         archived: Boolean(item.archived),
+        world_schema_version: 2,
+        capabilities: {
+          character_stats: characterCard.stats.mode !== "none",
+          attribute_checks: rules.resolution.mode === "attribute",
+          dice_resolution: ["dice_only", "attribute"].includes(rules.resolution.mode),
+        },
       };
       await bridge.apiPost("worlds/save", payload);
       toast(world ? "世界包已更新" : "世界包已创建", "success");
@@ -2222,8 +2181,10 @@ async function openSessionDetail(sessionId) {
   const ledger = detail.story_ledger || [];
   const clocks = detail.scene_clocks || [];
   const storage = detail.storage || {};
+  const operations = detail.operations || [];
+  const cardRevisions = detail.card_revisions || [];
   const timerPolicy = detail.timer_policy || {
-    global_enabled: true,
+    global_enabled: false,
     switches: {},
     effective: {},
   };
@@ -2317,6 +2278,9 @@ async function openSessionDetail(sessionId) {
           .length,
       )}</button>
       <button class="tab-button" data-session-tab="workflow">选项与投票</button>
+      <button class="tab-button" data-session-tab="rescue">急救与诊断 ${escapeHTML(
+        operations.filter((item) => item.status === "pending").length,
+      )}</button>
       <button class="tab-button" data-session-tab="access">权限与封禁 ${escapeHTML(
         (detail.bans || []).length,
       )}</button>
@@ -2503,7 +2467,7 @@ async function openSessionDetail(sessionId) {
           <button class="button button-primary" data-timer-policy="all"
             data-enabled="${timerPolicy.global_enabled ? "false" : "true"}" ${
               readonly ? "disabled" : ""
-            }>${timerPolicy.global_enabled ? "关闭全部倒计时" : "恢复全部倒计时"}</button>
+            }>${timerPolicy.global_enabled ? "关闭全部倒计时" : "启用全部倒计时"}</button>
         </div>
         <div class="tag-row">
           ${[
@@ -2514,6 +2478,7 @@ async function openSessionDetail(sessionId) {
             ["turn", "行动回合"],
             ["vote", "集体投票"],
             ["standby", "候补等待"],
+            ["all_idle", "全员无互动"],
           ]
             .map(
               ([key, label]) => `<button class="action-button ${
@@ -2606,10 +2571,6 @@ async function openSessionDetail(sessionId) {
         <div class="field"><label for="t-delegation">代控授权有效期</label>
           <input id="t-delegation" type="number" min="1" value="${escapeHTML(
             nullable(timing.delegation_ttl_seconds),
-          )}" /></div>
-        <div class="field"><label for="t-check">检定／补充选择</label>
-          <input id="t-check" type="number" min="1" value="${escapeHTML(
-            nullable(timing.check_timeout_seconds),
           )}" /></div>
         <div class="field"><label for="t-all-idle">全员无互动暂停</label>
           <input id="t-all-idle" type="number" min="1" value="${escapeHTML(
@@ -2776,6 +2737,40 @@ async function openSessionDetail(sessionId) {
               ${escapeHTML(item.expires_at || "永久")}</div></div>`,
           )
           .join("") || '<div class="empty-state compact"><span>当前没有有效封禁</span></div>'}
+      </div>
+    </div>
+    <div class="tab-panel" data-session-tab-panel="rescue">
+      <div class="section-toolbar">
+        <p>只修复当前损坏的组件；所有操作都会写入审计记录。运行中的世界契约不会被热替换。</p>
+        <button class="button button-primary" data-session-detail-action="download-diagnostics">导出脱敏诊断包</button>
+      </div>
+      <div class="detail-grid">
+        <div class="detail-card"><span>未完成事务</span><strong>${escapeHTML(operations.filter((item) => item.status === "pending").length)}</strong></div>
+        <div class="detail-card"><span>失败事务</span><strong>${escapeHTML(operations.filter((item) => item.status === "failed").length)}</strong></div>
+        <div class="detail-card"><span>角色卡修订</span><strong>${escapeHTML(cardRevisions.filter((item) => item.status === "pending").length)}</strong></div>
+      </div>
+      <h3 style="margin-top:22px">事务恢复</h3>
+      <div class="session-stack">
+        ${operations.slice(0, 12).map((item) => `<div class="session-row"><div><div class="session-name">${escapeHTML(item.operation_type)} · ${escapeHTML(item.status)}</div><div class="session-meta">${escapeHTML(item.operation_id)} · ${escapeHTML(item.result?.phase || "reserved")}</div></div>${item.status === "pending" ? `<button class="action-button is-danger" data-session-detail-action="cancel-operation" data-operation-id="${escapeHTML(item.operation_id)}">放弃任务</button>` : ""}</div>`).join("") || '<div class="empty-state compact"><span>暂无事务记录</span></div>'}
+      </div>
+      <div class="field" style="margin-top:22px">
+        <label for="rescue-choices-json">当前 A—D 选项 JSON</label>
+        <textarea id="rescue-choices-json" class="code-field" rows="14">${escapeHTML(prettyJSON(detail.choice?.choices || []))}</textarea>
+        <small>危险度与检定仍会按照冻结的世界契约严格校验。</small>
+      </div>
+      <button class="button button-primary" data-session-detail-action="replace-choices" ${!detail.choice || readonly ? "disabled" : ""}>保存当前选项</button>
+      <div class="field" style="margin-top:22px">
+        <label for="rescue-narrative">故事正文／过渡剧情</label>
+        <textarea id="rescue-narrative" rows="8" placeholder="仅填写需要修订或插入的故事正文"></textarea>
+      </div>
+      <div class="toolbar-actions">
+        <button class="button" data-session-detail-action="edit-last-narrative" ${readonly ? "disabled" : ""}>修订上一段正文</button>
+        <button class="button" data-session-detail-action="bridge-narrative" ${readonly ? "disabled" : ""}>插入过渡剧情</button>
+        <button class="button button-danger" data-session-detail-action="rollback-before-turn" ${readonly ? "disabled" : ""}>回到本轮之前</button>
+      </div>
+      <h3 style="margin-top:22px">角色卡修改申请</h3>
+      <div class="session-stack">
+        ${cardRevisions.map((item) => `<div class="session-row"><div><div class="session-name">${escapeHTML(item.character_name || item.display_name)} · v${escapeHTML(item.base_version)} → v${escapeHTML(item.candidate_version)}</div><div class="session-meta">${escapeHTML(item.request_note || "未填写修改说明")} · ${escapeHTML(item.status)}</div></div>${item.status === "pending" ? `<div class="table-actions"><button class="action-button" data-session-detail-action="revision-approve" data-request-id="${escapeHTML(item.id)}">通过</button><button class="action-button is-danger" data-session-detail-action="revision-reject" data-request-id="${escapeHTML(item.id)}">拒绝</button></div>` : ""}</div>`).join("") || '<div class="empty-state compact"><span>暂无角色卡修改申请</span></div>'}
       </div>
     </div>
     <div class="tab-panel" data-session-tab-panel="saves">
@@ -3557,7 +3552,6 @@ function collectSettings() {
         max_consecutive_timeouts: Number($("#gtime-timeout-count").value),
         standby_timeout_seconds: readTimeValue("#gtime-standby"),
         delegation_ttl_seconds: readTimeValue("#gtime-delegation"),
-        check_timeout_seconds: readTimeValue("#gtime-check"),
         all_idle_pause_seconds: readTimeValue("#gtime-all-idle"),
         vote_round_one_seconds: readTimeValue("#gtime-vote-one"),
         vote_round_two_seconds: readTimeValue("#gtime-vote-two"),
@@ -3599,6 +3593,28 @@ async function handleWorldAction(button) {
   if (action === "edit") openWorldEditor(world);
   if (action === "characters") await openCharacterManager(world.id);
   if (action === "card-template") openCharacterCardTemplateManager(world);
+  if (action === "preflight") {
+    const response = await bridge.apiPost("worlds/preflight", { world_ref: world.id });
+    const report = response.report || {};
+    const summary = report.summary || {};
+    openEditor({
+      title: `${world.name} · 世界包体检`,
+      kicker: report.compatible ? "COMPATIBLE" : "BLOCKED",
+      body: `
+        <div class="detail-grid">
+          <div class="detail-card"><span>协议</span><strong>v${escapeHTML(summary.schema_version || "?")}</strong></div>
+          <div class="detail-card"><span>数值</span><strong>${escapeHTML(summary.stats_mode || "unknown")}</strong></div>
+          <div class="detail-card"><span>裁定</span><strong>${escapeHTML(summary.resolution_mode || "unknown")}</strong></div>
+          <div class="detail-card"><span>结果</span><strong>${report.compatible ? "可导入" : "需修复"}</strong></div>
+        </div>
+        <div class="session-stack" style="margin-top:18px">
+          ${(report.issues || []).map((item) => `<div class="session-row"><div><div class="session-name">${escapeHTML(item.level.toUpperCase())} · ${escapeHTML(item.message)}</div><div class="session-meta">${escapeHTML(item.path)} · ${escapeHTML(item.code)}</div></div></div>`).join("") || '<div class="empty-state compact"><span>未发现兼容性问题</span></div>'}
+        </div>
+        <h3 style="margin-top:22px">试运行</h3>
+        <div class="command-list">${(report.tests || []).map((item) => `<code>${item.status === "passed" ? "✓" : "×"} ${escapeHTML(item.name)}</code>`).join("")}</div>
+      `,
+    });
+  }
   if (action === "archive") {
     const ok = await confirmAction(
       `归档「${world.name}」？`,
@@ -3751,7 +3767,98 @@ async function handleSessionDetailAction(button) {
   if (!detail) return;
   const sessionId = detail.session.id;
   const action = button.dataset.sessionDetailAction;
-  if (action === "force-ready") {
+  if (action === "download-diagnostics") {
+    await withBusy(button, async () => {
+      await bridge.download(
+        "sessions/diagnostics",
+        { id: sessionId },
+        `tavern_diagnostic_${sessionId}.zip`,
+      );
+    });
+    toast("脱敏诊断包已生成", "success");
+  } else if (action === "request-card-revision") {
+    const participant = (detail.roster || []).find((item) => item.id === button.dataset.ref);
+    if (!participant) throw new Error("没有找到对应角色");
+    $("#session-modal").close();
+    openEditor({
+      title: `${participant.character_name || participant.display_name} · 新建角色卡版本`,
+      kicker: "CARD REVISION",
+      body: `
+        <p class="field-hint">修改会生成新版本并进入审核；审核通过前，当前副本继续使用旧版本。</p>
+        <div class="field"><label for="card-revision-profile">完整角色资料 JSON</label>
+          <textarea id="card-revision-profile" class="code-field" rows="18">${escapeHTML(prettyJSON(participant.card_profile || {}))}</textarea></div>
+        <div class="field"><label for="card-revision-note">修改说明</label>
+          <input id="card-revision-note" maxlength="500" placeholder="例如：修正背景错字与专长描述" /></div>
+      `,
+      saveLabel: "提交修改申请",
+      onSave: async () => {
+        const profile = parseJSONField("#card-revision-profile", "角色资料");
+        await bridge.apiPost("sessions/card-revisions", {
+          action: "request",
+          session_id: sessionId,
+          participant_ref: participant.id,
+          profile_patch: profile,
+          stats_patch: {},
+          note: $("#card-revision-note").value.trim(),
+        });
+        toast("角色卡新版本已提交审核", "success");
+        await openSessionDetail(sessionId);
+      },
+    });
+  } else if (action === "cancel-operation") {
+    const ok = await confirmAction("放弃未完成任务？", "该操作不会回滚已经提交的剧情，只会解除卡死的事务锁。", "放弃任务");
+    if (!ok) return;
+    await bridge.apiPost("sessions/rescue", {
+      session_id: sessionId,
+      action: "cancel_operation",
+      operation_id: button.dataset.operationId,
+      reason: "WebUI 管理员主动终止",
+    });
+    toast("未完成任务已标记为失败，可重新提交", "success");
+    await openSessionDetail(sessionId);
+  } else if (action === "replace-choices") {
+    let choices;
+    try {
+      choices = JSON.parse($("#rescue-choices-json").value || "[]");
+    } catch (error) {
+      throw new Error(`选项不是有效 JSON：${error.message}`);
+    }
+    if (!Array.isArray(choices)) throw new Error("选项必须是 A—D 数组");
+    await bridge.apiPost("sessions/rescue", {
+      session_id: sessionId,
+      action: "replace_choices",
+      choices,
+    });
+    toast("当前 A—D 选项已替换", "success");
+    await openSessionDetail(sessionId);
+  } else if (["edit-last-narrative", "bridge-narrative"].includes(action)) {
+    const narrative = $("#rescue-narrative").value.trim();
+    if (!narrative) throw new Error("请先填写故事正文");
+    await bridge.apiPost("sessions/rescue", {
+      session_id: sessionId,
+      action: action === "edit-last-narrative" ? "edit_last_narrative" : "bridge_narrative",
+      narrative,
+    });
+    toast(action === "edit-last-narrative" ? "上一段故事正文已修订" : "过渡剧情已插入", "success");
+    await openSessionDetail(sessionId);
+  } else if (action === "rollback-before-turn") {
+    const ok = await confirmAction("回到本轮之前？", "将恢复最近一个自动、安全或单回合保护点，并暂停副本。", "确认回滚");
+    if (!ok) return;
+    await bridge.apiPost("sessions/rescue", {
+      session_id: sessionId,
+      action: "rollback_before_turn",
+    });
+    toast("已恢复到最近保护点", "success");
+    await openSessionDetail(sessionId);
+  } else if (["revision-approve", "revision-reject"].includes(action)) {
+    await bridge.apiPost("sessions/card-revisions", {
+      action: action === "revision-approve" ? "approve" : "reject",
+      request_id: button.dataset.requestId,
+      note: action === "revision-approve" ? "WebUI 审核通过" : "WebUI 审核拒绝",
+    });
+    toast(action === "revision-approve" ? "角色卡新版本已启用" : "角色卡修改已拒绝", "success");
+    await openSessionDetail(sessionId);
+  } else if (action === "force-ready") {
     const ok = await confirmAction(
       "强制所有合格角色准备？",
       "只处理角色卡已审核通过且当前出场的玩家；不会绕过建卡或审核，也不会自动开演。",
@@ -3874,7 +3981,6 @@ async function handleSessionDetailAction(button) {
           max_consecutive_timeouts: Number($("#t-timeout-count").value),
           standby_timeout_seconds: readTimeValue("#t-standby"),
           delegation_ttl_seconds: readTimeValue("#t-delegation"),
-          check_timeout_seconds: readTimeValue("#t-check"),
           all_idle_pause_seconds: readTimeValue("#t-all-idle"),
           vote_round_one_seconds: readTimeValue("#t-vote-one"),
           vote_round_two_seconds: readTimeValue("#t-vote-two"),
@@ -4428,7 +4534,7 @@ $("#export-backup-button").addEventListener("click", async (event) => {
       await bridge.download(
         "backup/export",
         {},
-        "backup_tavern_v0.6.0.zip",
+        "backup_tavern_v0.9.0.zip",
       );
     });
     toast("备份已生成", "success");

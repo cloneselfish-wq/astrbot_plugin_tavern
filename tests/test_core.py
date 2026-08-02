@@ -20,10 +20,10 @@ from tavern.turns import advance_turn, join_turn, leave_turn
 
 class CoreRulesTests(unittest.TestCase):
     def test_command_parser_accepts_only_real_command_prefix(self) -> None:
-        command = parse_tavern_command("／酒馆 开启 border-tavern")
+        command = parse_tavern_command("／酒馆 开启 test-world")
         self.assertTrue(command.matched)
         self.assertEqual(command.action, "start")
-        self.assertEqual(command.argument, "border-tavern")
+        self.assertEqual(command.argument, "test-world")
         self.assertEqual(
             parse_tavern_command("/酒馆\t存档\t旧塔之前").argument,
             "旧塔之前",

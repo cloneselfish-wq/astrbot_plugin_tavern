@@ -8,15 +8,19 @@ from typing import Any
 class EventBroker:
     """Small in-process fan-out used by the WebUI activity stream."""
 
-    def __init__(self) -> None:
+    def __init__(self, hooks: Any = None) -> None:
         self._subscribers: set[asyncio.Queue[dict[str, Any]]] = set()
         self._lock = asyncio.Lock()
         self._closed = False
+        self._hooks = hooks
 
     async def publish(self, event: Mapping[str, Any]) -> None:
         if self._closed:
             return
         payload = dict(event)
+        hook_name = str(payload.get("hook") or "")
+        if hook_name and self._hooks is not None:
+            await self._hooks.dispatch(hook_name, payload)
         async with self._lock:
             subscribers = tuple(self._subscribers)
         for queue in subscribers:
@@ -51,4 +55,3 @@ class EventBroker:
         self._closed = True
         async with self._lock:
             self._subscribers.clear()
-

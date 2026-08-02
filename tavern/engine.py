@@ -39,6 +39,8 @@ from .resolution import (
 )
 from .security import RateLimiter, clean_text
 from .world_contract import world_contract
+from .operations import operation_key, transport_event_id
+from .narrative_quality import inspect_narrative
 
 
 logger = logging.getLogger(__name__)
@@ -1157,6 +1159,55 @@ class TavernEngine:
             session["recovery"] = rule_state.get("recovery", {})
             provider_ids = await self._story_providers(event, config)
 
+            transport_id = transport_event_id(event)
+            operation_turn = (
+                0 if transport_id else int(session.get("turn_no", 0)) + 1
+            )
+            turn_operation_id = operation_key(
+                session_id,
+                "turn",
+                turn_no=operation_turn,
+                actor_id=sender_id,
+                source_id=str(
+                    transport_id
+                    or (workflow or {}).get("choice_set_id")
+                    or session.get("revision")
+                    or ""
+                ),
+                payload=(
+                    {"transport_event_id": transport_id}
+                    if transport_id
+                    else {
+                        "input": player_input,
+                        "selected_key": str((workflow or {}).get("selected_key") or ""),
+                    }
+                ),
+            )
+            operation = await self.database.reserve_operation(
+                turn_operation_id,
+                session_id,
+                "turn",
+                {
+                    "turn_no": operation_turn,
+                    "transport_event_id": transport_id,
+                    "actor_id": sender_id,
+                    "choice_set_id": str((workflow or {}).get("choice_set_id") or ""),
+                    "selected_key": str((workflow or {}).get("selected_key") or ""),
+                },
+            )
+            if not operation.get("created"):
+                if operation.get("status") == "completed":
+                    raise TavernBusyError("该行动已经处理完成，重复事件未再次消费")
+                if operation.get("status") == "pending":
+                    phase = str((operation.get("result") or {}).get("phase") or "生成中")
+                    raise TavernBusyError(f"该行动正在处理中（{phase}），请勿重复提交")
+                await self.database.update_operation(
+                    turn_operation_id,
+                    status="pending",
+                    phase="retrying",
+                    result={"retry": True},
+                )
+
             system = system_prompt(world)
             first_prompt = planning_prompt(
                 session=session,
@@ -1167,19 +1218,36 @@ class TavernEngine:
                 allow_checks=(config.two_phase_checks and world_contract(world)["resolution"]["mode"] in {"dice_only", "attribute"}),
                 workflow=workflow,
             )
-            resolution, used_provider_id = await self._generate_resolution(
-                session_id=session_id,
-                request_type="story_plan",
-                world=world,
-                provider_ids=provider_ids,
-                system=system,
-                prompt=first_prompt,
-                config=config,
-                expected_actor=session["next_actor"],
-                roster=roster,
-                enforce_mobile_limits=bool(
-                    workflow and config.enforce_mobile_output
-                ),
+            try:
+                resolution, used_provider_id = await self._generate_resolution(
+                    session_id=session_id,
+                    request_type="story_plan",
+                    world=world,
+                    provider_ids=provider_ids,
+                    system=system,
+                    prompt=first_prompt,
+                    config=config,
+                    expected_actor=session["next_actor"],
+                    roster=roster,
+                    enforce_mobile_limits=bool(
+                        workflow and config.enforce_mobile_output
+                    ),
+                )
+            except Exception as exc:
+                await self.database.update_operation(
+                    turn_operation_id,
+                    status="failed",
+                    phase="story_plan_failed",
+                    result={
+                        "error_type": type(exc).__name__,
+                        "error": clean_text(str(exc), max_chars=500),
+                    },
+                )
+                raise
+            await self.database.update_operation(
+                turn_operation_id,
+                phase="story_plan_generated",
+                status="pending",
             )
 
             dice: DiceResult | None = None
@@ -1530,6 +1598,31 @@ class TavernEngine:
             if len(narrative) > config.max_output_chars:
                 narrative = narrative[: config.max_output_chars].rstrip() + "…"
 
+            quality = inspect_narrative(
+                narrative,
+                [dict(item) for item in resolution.next_choices],
+                acting_name=str(sender_id),
+                previous_narrative=str(
+                    next(
+                        (
+                            item.get("content")
+                            for item in reversed(events)
+                            if item.get("role") == "narrator"
+                        ),
+                        "",
+                    )
+                    or ""
+                ),
+            )
+            if not quality["passed"]:
+                await self.database.update_operation(
+                    turn_operation_id,
+                    status="failed",
+                    phase="quality_rejected",
+                    result={"quality": quality},
+                )
+                raise TavernEngineError("叙事质量检查未通过，本轮没有提交")
+
             check_payload = asdict(dice) if dice else None
             if dice and check_request:
                 check_payload = {
@@ -1589,7 +1682,7 @@ class TavernEngine:
                     world_state=new_state,
                     memories=normalized_memories,
                     check_payload=check_payload,
-                    model_payload=resolution.raw,
+                    model_payload={**dict(resolution.raw), "_quality": quality},
                     director_note=resolution.director_note,
                     auto_snapshot_interval=config.auto_snapshot_interval,
                     store_model_payload=config.store_model_payloads,
@@ -1599,10 +1692,21 @@ class TavernEngine:
                 raise TavernBusyError(
                     "本轮状态刚被其他操作更新，请重新提交行动"
                 ) from exc
+            await self.database.update_operation(
+                turn_operation_id,
+                status="completed",
+                phase="committed",
+                result={
+                    "turn_no": updated_session["turn_no"],
+                    "session_revision": updated_session["revision"],
+                    "quality": quality,
+                },
+            )
 
             await self.broker.publish(
                 {
                     "type": "turn",
+                    "hook": "story_generated",
                     "session_id": session_id,
                     "group_id": updated_session["group_id"],
                     "turn_no": updated_session["turn_no"],

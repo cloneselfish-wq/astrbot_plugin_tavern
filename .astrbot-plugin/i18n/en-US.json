@@ -1,10 +1,10 @@
 {
   "display_name": "AI Tavern · Multiplayer RPG Engine",
-  "desc": "An AI-hosted group-chat RPG with character sheets, advantage D20 checks, group decisions, dynamic NPCs, isolated group and story saves, search, and permanent archives.",
+  "desc": "An AI-hosted group-chat RPG with world preflight, versioned character sheets, idempotent turns, targeted recovery, redacted diagnostics, and isolated saves.",
   "pages": {
     "console": {
       "title": "Tavern Console",
-      "description": "Manage worlds, searchable group notes, isolated story runs, character templates, NPCs, memories, clocks, saves, access, and model chains."
+      "description": "Manage world preflight, isolated story runs, character revisions, NPCs, memories, recovery, diagnostics, saves, access, and model chains."
     }
   }
 }

@@ -37,7 +37,7 @@ def stats_mode(stats: Mapping[str, Any] | None) -> str:
 
 
 def world_contract(world: Mapping[str, Any] | None) -> dict[str, Any]:
-    """Normalize old and schema-v2 worlds into one runtime contract."""
+    """Build the runtime contract for the current world protocol."""
 
     source = world if isinstance(world, Mapping) else {}
     rules = source.get("rules")
@@ -50,11 +50,11 @@ def world_contract(world: Mapping[str, Any] | None) -> dict[str, Any]:
         version = int(
             source.get(
                 "world_schema_version",
-                rules.get("world_schema_version", 1),
+                rules.get("world_schema_version", 0),
             )
         )
     except (TypeError, ValueError):
-        version = 1
+        version = 0
 
     resolution = rules.get("resolution")
     if isinstance(resolution, Mapping):
@@ -133,10 +133,10 @@ def world_contract(world: Mapping[str, Any] | None) -> dict[str, Any]:
 
 def validate_world_contract(world: Mapping[str, Any]) -> dict[str, Any]:
     contract = world_contract(world)
-    if contract["version"] > WORLD_SCHEMA_VERSION:
+    if contract["version"] != WORLD_SCHEMA_VERSION:
         raise ValueError(
-            f"世界包协议 v{contract['version']} 高于插件支持的 "
-            f"v{WORLD_SCHEMA_VERSION}"
+            f"v0.9.0 仅接受世界包协议 v{WORLD_SCHEMA_VERSION}；"
+            f"当前为 v{contract['version']}，不再执行旧协议自动转换"
         )
     stats = contract["stats"]
     mode = stats["mode"]
@@ -151,10 +151,9 @@ def validate_world_contract(world: Mapping[str, Any]) -> dict[str, Any]:
         "attribute_checks": resolution_mode == "attribute",
         "dice_resolution": resolution_mode in {"dice_only", "attribute"},
     }
-    if contract["version"] >= 2:
-        for key, value in expected.items():
-            if key in capabilities and bool(capabilities[key]) != value:
-                raise ValueError(f"capabilities.{key} 与实际规则冲突")
+    for key, value in expected.items():
+        if key in capabilities and bool(capabilities[key]) != value:
+            raise ValueError(f"capabilities.{key} 与实际规则冲突")
     return contract
 
 

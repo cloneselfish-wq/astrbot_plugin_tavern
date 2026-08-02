@@ -8,7 +8,7 @@
       content="AI 酒馆专业叙事引擎管理控制台"
     />
     <title>酒馆控制台</title>
-    <link rel="stylesheet" href="./style.css" />
+    <link rel="stylesheet" href="./style.css?v=0.9.0" />
   </head>
   <body>
     <div class="ambient ambient-a"></div>
@@ -174,10 +174,10 @@
                 <input type="checkbox" id="show-archived-worlds" />
                 <span>显示已归档</span>
               </label>
-              <button class="button" id="import-world-package-button" type="button">
+              <button class="button button-secondary" id="import-world-package-button" type="button">
                 导入世界包
               </button>
-              <button class="button" id="import-npc-button" type="button">
+              <button class="button button-secondary" id="import-npc-button" type="button">
                 导入常驻NPC
               </button>
               <button class="button button-primary" id="new-world-button">
@@ -396,10 +396,6 @@
                 <div class="field">
                   <label for="gtime-delegation">代控授权有效期</label>
                   <input id="gtime-delegation" type="number" min="1" />
-                </div>
-                <div class="field">
-                  <label for="gtime-check">检定／补充选择</label>
-                  <input id="gtime-check" type="number" min="1" />
                 </div>
                 <div class="field">
                   <label for="gtime-all-idle">全员无互动暂停</label>
@@ -822,6 +818,6 @@
     </dialog>
 
     <div class="toast-region" id="toast-region" aria-live="polite"></div>
-    <script type="module" src="./app.js"></script>
+    <script type="module" src="./app.js?v=0.9.0"></script>
   </body>
 </html>
