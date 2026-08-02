@@ -165,6 +165,23 @@ class StaticUiTests(unittest.TestCase):
         ):
             self.assertIn(selector, self.style)
 
+    def test_v053_runtime_controls_are_visible(self) -> None:
+        for marker in (
+            'data-session-detail-action="force-ready"',
+            'data-timer-policy="all"',
+            'data-group-action="token-quota"',
+            'id="group-quota-enabled"',
+            'id="quota-session-enabled"',
+            'data-session-detail-action="save-session-token-quota"',
+            'data-session-detail-action="delete-independent-save"',
+            'data-session-detail-action="delete-session"',
+            '"groups/token-quota"',
+            '"sessions/token-quota"',
+            '"sessions/timer-policy"',
+            '"archives/delete"',
+        ):
+            self.assertIn(marker, self.script)
+
     def test_manifest_schema_and_i18n_are_consistent(self) -> None:
         metadata = yaml.safe_load(
             (ROOT / "metadata.yaml").read_text(encoding="utf-8")
@@ -183,7 +200,7 @@ class StaticUiTests(unittest.TestCase):
             schema["runtime"]["items"]["trigger_prefix"]["default"],
             "jg",
         )
-        self.assertEqual(metadata["version"], "v0.5.2-alpha")
+        self.assertEqual(metadata["version"], "v0.6.0")
         self.assertEqual(
             schema["model"]["items"]["provider_id"]["_special"],
             "select_provider",

@@ -42,6 +42,10 @@ from .lifecycle import (
     card_stat_allocation,
     card_template,
     deadline_after,
+    next_fillable_card_step,
+    repair_profession_preset_draft,
+    resolve_profession_stats,
+    uses_profession_preset_stats,
     fallback_choices,
     normalize_choices,
     normalize_progress,
@@ -57,6 +61,7 @@ from .lifecycle import (
     world_time_rules,
 )
 from .resolution import memory_fingerprint
+from .world_contract import validate_world_contract
 from .security import clean_text, validate_platform_id, validate_slug
 from .storage import (
     InstanceStorage,
@@ -76,7 +81,43 @@ from .turns import (
 )
 
 T = TypeVar("T")
-TIMER_REMINDER_INTERVAL_SECONDS = 300
+TIMER_REMINDER_INTERVAL_SECONDS = 30
+CARD_COMPLETION_REMINDER_INTERVAL_SECONDS = 2 * 60
+COUNTDOWN_TYPES = (
+    "card_code",
+    "card_completion",
+    "preparation",
+    "ready",
+    "turn",
+    "vote",
+    "standby",
+)
+# 同一副本内只允许存在一个在跑的实例；换人/换回合时旧计时器必须作废。
+# 否则 继续/读档/回合推进 会不断叠加 turn 计时器，
+# 每一轮轮询都按行数重复推送提醒，形成刷屏。
+SESSION_SINGLETON_TIMER_TYPES = frozenset(
+    {
+        "turn",
+        "vote",
+        "preparation",
+        "all_idle",
+    }
+)
+
+
+def timer_reminder_interval(timer_type: object) -> int:
+    if str(timer_type or "") == "card_completion":
+        return CARD_COMPLETION_REMINDER_INTERVAL_SECONDS
+    return TIMER_REMINDER_INTERVAL_SECONDS
+
+
+def timer_reminder_enabled(
+    timer_type: object,
+    action: Mapping[str, Any],
+) -> bool:
+    if str(timer_type or "") != "card_completion":
+        return True
+    return bool(action.get("reminder_enabled", True))
 
 
 def utc_now() -> str:
@@ -188,6 +229,7 @@ class TavernDatabase:
         "_cancel_card_draft",
         "_review_character_card",
         "_set_participant_ready",
+        "_force_all_ready",
         "_activate_story",
         "_replace_active_choices",
         "_cast_vote",
@@ -198,6 +240,7 @@ class TavernDatabase:
         "_revoke_ban",
         "_request_return",
         "_control_timer",
+        "_set_timer_policy",
         "_extend_active_timer",
         "_pause_session_timers",
         "_resume_session_timers",
@@ -205,6 +248,9 @@ class TavernDatabase:
         "_grant_delegation",
         "_revoke_delegation",
         "_grant_permission",
+        "_set_token_quota",
+        "_set_group_token_quota",
+        "_delete_session",
         "_write_audit",
         "_cleanup",
         "_import_bundle",
@@ -1120,11 +1166,63 @@ class TavernDatabase:
 
                     CREATE INDEX IF NOT EXISTS idx_story_storage_group
                     ON story_storage(group_registry_id, created_at DESC);
+
+                    CREATE TABLE IF NOT EXISTS timer_policies (
+                        session_id TEXT PRIMARY KEY REFERENCES sessions(id)
+                            ON DELETE CASCADE,
+                        global_enabled INTEGER NOT NULL DEFAULT 1,
+                        switches_json TEXT NOT NULL DEFAULT '{}',
+                        revision INTEGER NOT NULL DEFAULT 1,
+                        updated_by TEXT NOT NULL DEFAULT 'system',
+                        updated_at TEXT NOT NULL
+                    );
+
+                    CREATE TABLE IF NOT EXISTS token_usage (
+                        id TEXT PRIMARY KEY,
+                        session_id TEXT NOT NULL REFERENCES sessions(id)
+                            ON DELETE CASCADE,
+                        group_id TEXT NOT NULL,
+                        request_type TEXT NOT NULL,
+                        provider_id TEXT NOT NULL DEFAULT '',
+                        input_tokens INTEGER NOT NULL DEFAULT 0,
+                        cached_input_tokens INTEGER NOT NULL DEFAULT 0,
+                        output_tokens INTEGER NOT NULL DEFAULT 0,
+                        total_tokens INTEGER NOT NULL DEFAULT 0,
+                        reserved_tokens INTEGER NOT NULL DEFAULT 0,
+                        usage_source TEXT NOT NULL DEFAULT 'estimated',
+                        status TEXT NOT NULL DEFAULT 'reserved'
+                            CHECK(status IN (
+                                'reserved', 'completed', 'failed'
+                            )),
+                        created_at TEXT NOT NULL,
+                        settled_at TEXT NOT NULL DEFAULT ''
+                    );
+
+                    CREATE INDEX IF NOT EXISTS idx_token_usage_session_time
+                    ON token_usage(session_id, created_at DESC);
+
+                    CREATE INDEX IF NOT EXISTS idx_token_usage_group_time
+                    ON token_usage(group_id, created_at DESC);
+
+                    CREATE TABLE IF NOT EXISTS token_quota_policies (
+                        id TEXT PRIMARY KEY,
+                        scope_type TEXT NOT NULL
+                            CHECK(scope_type IN ('group', 'session')),
+                        scope_id TEXT NOT NULL,
+                        window_seconds INTEGER NOT NULL,
+                        token_limit INTEGER NOT NULL,
+                        enabled INTEGER NOT NULL DEFAULT 1,
+                        revision INTEGER NOT NULL DEFAULT 1,
+                        updated_by TEXT NOT NULL,
+                        updated_at TEXT NOT NULL,
+                        UNIQUE(scope_type, scope_id)
+                    );
                     """
                 )
                 self._initialize_vnext_rows(connection)
                 self._initialize_v05_rows(connection)
                 self._initialize_v051_rows(connection)
+                self._initialize_v053_rows(connection)
                 connection.execute(
                     """
                     INSERT INTO tavern_meta(key, value)
@@ -1393,6 +1491,24 @@ class TavernDatabase:
                     now,
                 ),
             )
+
+    def _initialize_v053_rows(
+        self,
+        connection: sqlite3.Connection,
+    ) -> None:
+        now = utc_now()
+        connection.execute(
+            """
+            INSERT INTO timer_policies(
+                session_id, global_enabled, switches_json,
+                revision, updated_by, updated_at
+            )
+            SELECT id, 1, '{}', 1, 'migration', ?
+            FROM sessions
+            WHERE id NOT IN (SELECT session_id FROM timer_policies)
+            """,
+            (now,),
+        )
 
     @staticmethod
     def _migrate_sessions_v2(connection: sqlite3.Connection) -> None:
@@ -1818,6 +1934,18 @@ class TavernDatabase:
         if method_name in self._ALL_SESSION_MUTATIONS:
             return self._all_session_ids()
         candidates: set[str] = set()
+        if method_name == "_set_group_token_quota" and len(args) >= 2:
+            with self._connect() as connection:
+                candidates.update(
+                    str(row[0])
+                    for row in connection.execute(
+                        """
+                        SELECT id FROM sessions
+                        WHERE platform_id = ? AND group_id = ?
+                        """,
+                        (str(args[0]), str(args[1])),
+                    ).fetchall()
+                )
         for value in (*args, result):
             candidates.update(self._candidate_session_values(value))
         if args and isinstance(args[0], str):
@@ -1982,6 +2110,8 @@ class TavernDatabase:
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
         }
+        result["world_schema_version"] = int(result["rules"].get("world_schema_version", 1))
+        result["capabilities"] = dict(result["rules"].get("capabilities") or {})
         result["player_limits"] = player_limits(result)
         result["card_template"] = card_template(result)
         result["time_rules"] = world_time_rules(result)
@@ -2371,19 +2501,19 @@ class TavernDatabase:
     ) -> dict[str, Any]:
         world_id = str(payload.get("id") or "").strip()
         slug = validate_slug(payload.get("slug"))
-        name = clean_text(payload.get("name"), max_chars=100)
+        name = clean_text(payload.get("name"), max_chars=400)
         if not name:
             raise ValueError("世界名称不能为空")
-        description = clean_text(payload.get("description"), max_chars=1000)
+        description = clean_text(payload.get("description"), max_chars=20000)
         system_prompt = clean_text(
             payload.get("system_prompt"),
-            max_chars=30000,
+            max_chars=200000,
         )
         if not system_prompt:
             raise ValueError("世界设定不能为空")
         opening_scene = clean_text(
             payload.get("opening_scene"),
-            max_chars=6000,
+            max_chars=50000,
         )
         rules = payload.get("rules")
         initial_state = payload.get("initial_state")
@@ -2392,6 +2522,11 @@ class TavernDatabase:
         if not isinstance(initial_state, Mapping):
             raise ValueError("初始状态必须是 JSON 对象")
         rules = dict(rules)
+        if "world_schema_version" in payload:
+            rules["world_schema_version"] = payload["world_schema_version"]
+        if "capabilities" in payload:
+            rules["capabilities"] = payload["capabilities"]
+        validate_world_contract({**payload, "rules": rules})
         if "character_card" in rules:
             raw_card = rules["character_card"]
             if isinstance(raw_card, Mapping) and "fields" not in raw_card:
@@ -5846,6 +5981,116 @@ class TavernDatabase:
             reason,
         )
 
+    async def delete_session(
+        self,
+        session_id: str,
+        actor_id: str,
+        confirm_name: str,
+    ) -> dict[str, Any]:
+        result = await self._run(
+            self._delete_session,
+            session_id,
+            actor_id,
+            confirm_name,
+        )
+        try:
+            trashed = await asyncio.to_thread(
+                self.storage.trash_relative_path,
+                str(result.get("relative_path") or ""),
+                label=str(result.get("instance_slug") or "story"),
+            )
+            result["trash_path"] = str(trashed or "")
+        except Exception as exc:
+            result["trash_error"] = str(exc)[:500]
+        return result
+
+    def _delete_session(
+        self,
+        session_id: str,
+        actor_id: str,
+        confirm_name: str,
+    ) -> dict[str, Any]:
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                row = connection.execute(
+                    """
+                    SELECT s.*, ss.relative_path
+                    FROM sessions s
+                    LEFT JOIN story_storage ss ON ss.session_id = s.id
+                    WHERE s.id = ?
+                    """,
+                    (session_id,),
+                ).fetchone()
+                if not row:
+                    raise DatabaseNotFoundError("副本不存在")
+                if row["state"] not in {
+                    SESSION_CLOSED,
+                    SESSION_FINISHED,
+                }:
+                    raise InvalidTransitionError(
+                        "只能删除已关闭或已归档的副本"
+                    )
+                if str(confirm_name or "").strip() != str(
+                    row["instance_name"]
+                ):
+                    raise ValueError("确认名称与副本名称不一致")
+                detail = {
+                    "instance_name": row["instance_name"],
+                    "instance_slug": row["instance_slug"],
+                    "relative_path": str(row["relative_path"] or ""),
+                    "state": row["state"],
+                }
+                self._insert_audit(
+                    connection,
+                    session_id,
+                    actor_id,
+                    "session.delete",
+                    session_id,
+                    detail,
+                )
+                connection.execute(
+                    """
+                    DELETE FROM token_quota_policies
+                    WHERE scope_type = 'session' AND scope_id = ?
+                    """,
+                    (session_id,),
+                )
+                connection.execute(
+                    "DELETE FROM sessions WHERE id = ?",
+                    (session_id,),
+                )
+                replacement = connection.execute(
+                    """
+                    SELECT id FROM sessions
+                    WHERE platform_id = ? AND group_id = ?
+                      AND state <> 'finished'
+                    ORDER BY updated_at DESC LIMIT 1
+                    """,
+                    (row["platform_id"], row["group_id"]),
+                ).fetchone()
+                if replacement:
+                    connection.execute(
+                        """
+                        UPDATE sessions SET selected = CASE WHEN id = ? THEN 1 ELSE 0 END
+                        WHERE platform_id = ? AND group_id = ?
+                        """,
+                        (
+                            replacement["id"],
+                            row["platform_id"],
+                            row["group_id"],
+                        ),
+                    )
+                connection.execute("COMMIT")
+                return {
+                    "deleted": True,
+                    "session_id": session_id,
+                    **detail,
+                }
+            except Exception:
+                connection.execute("ROLLBACK")
+                raise
+
     def _finalize_session(
         self,
         session_id: str,
@@ -7013,20 +7258,46 @@ class TavernDatabase:
         with self._connect() as connection:
             session = connection.execute(
                 """
-                SELECT history_floor_seq FROM sessions WHERE id = ?
+                SELECT s.history_floor_seq, sr.recovery_json
+                FROM sessions s
+                LEFT JOIN session_rule_states sr ON sr.session_id = s.id
+                WHERE s.id = ?
                 """,
                 (session_id,),
             ).fetchone()
             if not session:
                 raise DatabaseNotFoundError("会话不存在")
-            self._assert_session_writable(connection, session_id)
+            recovery = json_load(session["recovery_json"], {})
+            excluded_ranges: list[tuple[int, int]] = []
+            if isinstance(recovery, Mapping):
+                for item in recovery.get("excluded_event_ranges", []):
+                    if not isinstance(item, (list, tuple)) or len(item) != 2:
+                        continue
+                    try:
+                        start, end = int(item[0]), int(item[1])
+                    except (TypeError, ValueError, OverflowError):
+                        continue
+                    if start <= end:
+                        excluded_ranges.append((start, end))
+            exclusions = "".join(
+                " AND NOT (seq BETWEEN ? AND ?)"
+                for _ in excluded_ranges
+            )
+            parameters: list[Any] = [
+                session_id,
+                session["history_floor_seq"],
+            ]
+            for start, end in excluded_ranges:
+                parameters.extend((start, end))
+            parameters.append(limit)
             rows = connection.execute(
-                """
+                f"""
                 SELECT * FROM events
                 WHERE session_id = ? AND seq >= ?
+                {exclusions}
                 ORDER BY seq DESC LIMIT ?
                 """,
-                (session_id, session["history_floor_seq"], limit),
+                tuple(parameters),
             ).fetchall()
             return [self._event(row) for row in reversed(rows)]
 
@@ -7190,7 +7461,14 @@ class TavernDatabase:
                 for memory in memories
                 if memory not in protected
             ][: max(0, limit - len(protected))]
-            if selected:
+            archived = connection.execute(
+                """
+                SELECT readonly FROM session_archives
+                WHERE session_id = ?
+                """,
+                (session_id,),
+            ).fetchone()
+            if selected and not archived:
                 now = utc_now()
                 connection.executemany(
                     """
@@ -7539,6 +7817,16 @@ class TavernDatabase:
                 """,
                 (session["id"], name),
             )
+        elif connection.execute(
+            """
+            SELECT 1 FROM snapshots
+            WHERE session_id = ? AND name = ?
+            """,
+            (session["id"], name),
+        ).fetchone():
+            raise ValueError(
+                "已存在同名存档；请确认后使用覆盖模式"
+            )
         sql = """
             INSERT INTO snapshots(
                 id, session_id, name, kind, turn_no, session_revision,
@@ -7588,6 +7876,21 @@ class TavernDatabase:
         connection: sqlite3.Connection,
         session_id: str,
     ) -> dict[str, Any]:
+        session = connection.execute(
+            """
+            SELECT history_floor_seq FROM sessions WHERE id = ?
+            """,
+            (session_id,),
+        ).fetchone()
+        event_anchor_seq = int(
+            connection.execute(
+                """
+                SELECT COALESCE(MAX(seq), 0) FROM events
+                WHERE session_id = ?
+                """,
+                (session_id,),
+            ).fetchone()[0]
+        )
         tables = {
             "participants": (
                 "SELECT * FROM participants WHERE session_id = ?"
@@ -7640,7 +7943,11 @@ class TavernDatabase:
         }
         result: dict[str, Any] = {
             "format": "astrbot-tavern-workflow",
-            "version": 2,
+            "version": 3,
+            "history_floor_seq": int(
+                session["history_floor_seq"] if session else 0
+            ),
+            "event_anchor_seq": event_anchor_seq,
         }
         vote_ids: list[str] = []
         participant_ids: list[str] = []
@@ -7830,7 +8137,39 @@ class TavernDatabase:
                     """,
                     (session_id,),
                 ).fetchone()[0]
-                floor = max_seq + 1
+                workflow_row = connection.execute(
+                    """
+                    SELECT workflow_json FROM snapshot_workflows
+                    WHERE snapshot_id = ?
+                    """,
+                    (snapshot["id"],),
+                ).fetchone()
+                workflow = json_load(
+                    workflow_row["workflow_json"] if workflow_row else "",
+                    {},
+                )
+                if not isinstance(workflow, Mapping):
+                    workflow = {}
+                floor = bounded_int(
+                    workflow.get("history_floor_seq"),
+                    int(session["history_floor_seq"] or 0),
+                    0,
+                    int(max_seq) + 1,
+                )
+                anchor = bounded_int(
+                    workflow.get("event_anchor_seq"),
+                    int(
+                        connection.execute(
+                            """
+                            SELECT COALESCE(MAX(seq), 0) FROM events
+                            WHERE session_id = ? AND created_at <= ?
+                            """,
+                            (session_id, snapshot["created_at"]),
+                        ).fetchone()[0]
+                    ),
+                    0,
+                    int(max_seq),
+                )
                 now = utc_now()
                 connection.execute(
                     """
@@ -7853,6 +8192,52 @@ class TavernDatabase:
                     connection,
                     snapshot["id"],
                     session_id,
+                )
+                rule_row = connection.execute(
+                    """
+                    SELECT recovery_json FROM session_rule_states
+                    WHERE session_id = ?
+                    """,
+                    (session_id,),
+                ).fetchone()
+                recovery = json_load(
+                    rule_row["recovery_json"] if rule_row else "",
+                    {},
+                )
+                recovery = (
+                    dict(recovery)
+                    if isinstance(recovery, Mapping)
+                    else {}
+                )
+                excluded: list[list[int]] = []
+                for item in recovery.get("excluded_event_ranges", []):
+                    if not isinstance(item, (list, tuple)) or len(item) != 2:
+                        continue
+                    try:
+                        start, end = int(item[0]), int(item[1])
+                    except (TypeError, ValueError, OverflowError):
+                        continue
+                    if start <= end:
+                        excluded.append([start, end])
+                if anchor + 1 <= int(max_seq):
+                    excluded.append([anchor + 1, int(max_seq)])
+                recovery.update(
+                    {
+                        "state": "restored",
+                        "snapshot_id": str(snapshot["id"]),
+                        "event_anchor_seq": anchor,
+                        "excluded_event_ranges": excluded[-64:],
+                        "updated_at": now,
+                    }
+                )
+                connection.execute(
+                    """
+                    UPDATE session_rule_states
+                    SET recovery_json = ?, revision = revision + 1,
+                        updated_at = ?
+                    WHERE session_id = ?
+                    """,
+                    (json_dump(recovery), now, session_id),
                 )
                 connection.execute(
                     """
@@ -9696,6 +10081,620 @@ class TavernDatabase:
                 ),
             }
 
+    async def reserve_token_usage(
+        self,
+        session_id: str,
+        request_type: str,
+        provider_id: str,
+        expected_tokens: int,
+    ) -> dict[str, Any]:
+        return await self._run(
+            self._reserve_token_usage,
+            session_id,
+            request_type,
+            provider_id,
+            expected_tokens,
+        )
+
+    def _reserve_token_usage(
+        self,
+        session_id: str,
+        request_type: str,
+        provider_id: str,
+        expected_tokens: int,
+    ) -> dict[str, Any]:
+        expected_tokens = bounded_int(
+            expected_tokens,
+            1,
+            1,
+            10_000_000,
+        )
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                session = connection.execute(
+                    """
+                    SELECT id, group_id FROM sessions WHERE id = ?
+                    """,
+                    (session_id,),
+                ).fetchone()
+                if not session:
+                    raise DatabaseNotFoundError("副本不存在")
+                now_dt = datetime.now(timezone.utc)
+                now = now_dt.isoformat(timespec="seconds")
+                stale = (
+                    now_dt - timedelta(minutes=15)
+                ).isoformat(timespec="seconds")
+                connection.execute(
+                    """
+                    UPDATE token_usage SET status = 'failed',
+                        settled_at = ?
+                    WHERE status = 'reserved' AND created_at < ?
+                    """,
+                    (now, stale),
+                )
+                policies = connection.execute(
+                    """
+                    SELECT * FROM token_quota_policies
+                    WHERE enabled = 1 AND (
+                        (scope_type = 'group' AND scope_id = ?)
+                        OR (scope_type = 'session' AND scope_id = ?)
+                    )
+                    """,
+                    (session["group_id"], session_id),
+                ).fetchall()
+                quota_status: list[dict[str, Any]] = []
+                for policy in policies:
+                    cutoff = (
+                        now_dt - timedelta(
+                            seconds=int(policy["window_seconds"])
+                        )
+                    ).isoformat(timespec="seconds")
+                    if policy["scope_type"] == "group":
+                        used = int(
+                            connection.execute(
+                                """
+                                SELECT COALESCE(SUM(
+                                    CASE
+                                      WHEN status = 'completed'
+                                      THEN total_tokens
+                                      WHEN status = 'reserved'
+                                      THEN reserved_tokens
+                                      ELSE 0
+                                    END
+                                ), 0)
+                                FROM token_usage
+                                WHERE group_id = ? AND created_at >= ?
+                                """,
+                                (session["group_id"], cutoff),
+                            ).fetchone()[0]
+                        )
+                    else:
+                        used = int(
+                            connection.execute(
+                                """
+                                SELECT COALESCE(SUM(
+                                    CASE
+                                      WHEN status = 'completed'
+                                      THEN total_tokens
+                                      WHEN status = 'reserved'
+                                      THEN reserved_tokens
+                                      ELSE 0
+                                    END
+                                ), 0)
+                                FROM token_usage
+                                WHERE session_id = ? AND created_at >= ?
+                                """,
+                                (session_id, cutoff),
+                            ).fetchone()[0]
+                        )
+                    remaining = max(0, int(policy["token_limit"]) - used)
+                    quota_status.append(
+                        {
+                            "scope_type": policy["scope_type"],
+                            "used": used,
+                            "limit": int(policy["token_limit"]),
+                            "remaining": remaining,
+                            "window_seconds": int(
+                                policy["window_seconds"]
+                            ),
+                        }
+                    )
+                    if expected_tokens > remaining:
+                        label = (
+                            "群"
+                            if policy["scope_type"] == "group"
+                            else "副本"
+                        )
+                        raise ValueError(
+                            f"{label} Token 限额不足：当前窗口剩余 "
+                            f"{remaining}，本次最多需要 {expected_tokens}"
+                        )
+                usage_id = new_id("usage")
+                connection.execute(
+                    """
+                    INSERT INTO token_usage(
+                        id, session_id, group_id, request_type, provider_id,
+                        reserved_tokens, status, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, 'reserved', ?)
+                    """,
+                    (
+                        usage_id,
+                        session_id,
+                        session["group_id"],
+                        clean_text(request_type, max_chars=64),
+                        clean_text(provider_id, max_chars=200),
+                        expected_tokens,
+                        now,
+                    ),
+                )
+                connection.execute("COMMIT")
+                return {
+                    "id": usage_id,
+                    "session_id": session_id,
+                    "group_id": session["group_id"],
+                    "reserved_tokens": expected_tokens,
+                    "quotas": quota_status,
+                }
+            except Exception:
+                connection.execute("ROLLBACK")
+                raise
+
+    async def settle_token_usage(
+        self,
+        usage_id: str,
+        *,
+        input_tokens: int,
+        cached_input_tokens: int,
+        output_tokens: int,
+        usage_source: str,
+    ) -> None:
+        await self._run(
+            self._settle_token_usage,
+            usage_id,
+            input_tokens,
+            cached_input_tokens,
+            output_tokens,
+            usage_source,
+        )
+
+    def _settle_token_usage(
+        self,
+        usage_id: str,
+        input_tokens: int,
+        cached_input_tokens: int,
+        output_tokens: int,
+        usage_source: str,
+    ) -> None:
+        input_tokens = max(0, int(input_tokens or 0))
+        cached_input_tokens = max(
+            0,
+            min(input_tokens, int(cached_input_tokens or 0)),
+        )
+        output_tokens = max(0, int(output_tokens or 0))
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE token_usage SET
+                    input_tokens = ?, cached_input_tokens = ?,
+                    output_tokens = ?, total_tokens = ?,
+                    usage_source = ?, status = 'completed',
+                    settled_at = ?
+                WHERE id = ? AND status = 'reserved'
+                """,
+                (
+                    input_tokens,
+                    cached_input_tokens,
+                    output_tokens,
+                    input_tokens + output_tokens,
+                    clean_text(usage_source, max_chars=32) or "estimated",
+                    utc_now(),
+                    usage_id,
+                ),
+            )
+
+    async def fail_token_usage(self, usage_id: str) -> None:
+        await self._run(self._fail_token_usage, usage_id)
+
+    def _fail_token_usage(self, usage_id: str) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE token_usage
+                SET status = 'failed', settled_at = ?
+                WHERE id = ? AND status = 'reserved'
+                """,
+                (utc_now(), usage_id),
+            )
+
+    async def token_usage_summary(
+        self,
+        session_id: str,
+    ) -> dict[str, Any]:
+        return await self._run(self._token_usage_summary, session_id)
+
+    def _token_usage_summary(self, session_id: str) -> dict[str, Any]:
+        with self._connect() as connection:
+            session = connection.execute(
+                """
+                SELECT id, group_id FROM sessions WHERE id = ?
+                """,
+                (session_id,),
+            ).fetchone()
+            if not session:
+                raise DatabaseNotFoundError("副本不存在")
+            now_dt = datetime.now(timezone.utc)
+
+            def total(where: str, value: str, seconds: int | None) -> int:
+                parameters: list[Any] = [value]
+                cutoff_sql = ""
+                if seconds is not None:
+                    cutoff_sql = " AND created_at >= ?"
+                    parameters.append(
+                        (
+                            now_dt - timedelta(seconds=seconds)
+                        ).isoformat(timespec="seconds")
+                    )
+                return int(
+                    connection.execute(
+                        f"""
+                        SELECT COALESCE(SUM(total_tokens), 0)
+                        FROM token_usage
+                        WHERE {where} = ? AND status = 'completed'
+                        {cutoff_sql}
+                        """,
+                        tuple(parameters),
+                    ).fetchone()[0]
+                )
+
+            policies = connection.execute(
+                """
+                SELECT * FROM token_quota_policies
+                WHERE (scope_type = 'group' AND scope_id = ?)
+                   OR (scope_type = 'session' AND scope_id = ?)
+                ORDER BY scope_type
+                """,
+                (session["group_id"], session_id),
+            ).fetchall()
+            quota_items: list[dict[str, Any]] = []
+            for row in policies:
+                scope_column = (
+                    "group_id"
+                    if row["scope_type"] == "group"
+                    else "session_id"
+                )
+                scope_value = (
+                    session["group_id"]
+                    if row["scope_type"] == "group"
+                    else session_id
+                )
+                used = total(
+                    scope_column,
+                    str(scope_value),
+                    int(row["window_seconds"]),
+                )
+                quota_items.append(
+                    {
+                        "id": row["id"],
+                        "scope_type": row["scope_type"],
+                        "scope_id": row["scope_id"],
+                        "window_seconds": int(row["window_seconds"]),
+                        "token_limit": int(row["token_limit"]),
+                        "enabled": bool(row["enabled"]),
+                        "used": used,
+                        "remaining": max(
+                            0,
+                            int(row["token_limit"]) - used,
+                        ),
+                        "revision": int(row["revision"]),
+                    }
+                )
+            by_type = [
+                {
+                    "request_type": row["request_type"],
+                    "tokens": int(row["tokens"]),
+                    "requests": int(row["requests"]),
+                }
+                for row in connection.execute(
+                    """
+                    SELECT request_type, SUM(total_tokens) AS tokens,
+                           COUNT(*) AS requests
+                    FROM token_usage
+                    WHERE session_id = ? AND status = 'completed'
+                    GROUP BY request_type
+                    ORDER BY tokens DESC
+                    """,
+                    (session_id,),
+                ).fetchall()
+            ]
+            return {
+                "session_id": session_id,
+                "group_id": session["group_id"],
+                "session": {
+                    "hour": total("session_id", session_id, 3600),
+                    "day": total("session_id", session_id, 86400),
+                    "all": total("session_id", session_id, None),
+                },
+                "group": {
+                    "hour": total(
+                        "group_id",
+                        str(session["group_id"]),
+                        3600,
+                    ),
+                    "day": total(
+                        "group_id",
+                        str(session["group_id"]),
+                        86400,
+                    ),
+                    "all": total(
+                        "group_id",
+                        str(session["group_id"]),
+                        None,
+                    ),
+                },
+                "quotas": quota_items,
+                "by_type": by_type,
+            }
+
+    async def group_token_usage_summary(
+        self,
+        platform_id: str,
+        group_id: str,
+    ) -> dict[str, Any]:
+        return await self._run(
+            self._group_token_usage_summary,
+            platform_id,
+            group_id,
+        )
+
+    def _group_token_usage_summary(
+        self,
+        platform_id: str,
+        group_id: str,
+    ) -> dict[str, Any]:
+        platform_id = validate_platform_id(
+            platform_id,
+            label="平台实例 ID",
+        )
+        group_id = validate_platform_id(group_id, label="群 ID")
+        with self._connect() as connection:
+            session = connection.execute(
+                """
+                SELECT id FROM sessions
+                WHERE platform_id = ? AND group_id = ?
+                ORDER BY selected DESC, updated_at DESC
+                LIMIT 1
+                """,
+                (platform_id, group_id),
+            ).fetchone()
+        if not session:
+            raise DatabaseNotFoundError("群会话不存在")
+        usage = self._token_usage_summary(str(session["id"]))
+        group_quota = next(
+            (
+                item
+                for item in usage["quotas"]
+                if item["scope_type"] == "group"
+            ),
+            None,
+        )
+        return {
+            "platform_id": platform_id,
+            "group_id": group_id,
+            "session_id": str(session["id"]),
+            "group": usage["group"],
+            "quota": group_quota,
+        }
+
+    async def set_token_quota(
+        self,
+        session_id: str,
+        scope_type: str,
+        *,
+        window_seconds: int,
+        token_limit: int,
+        enabled: bool,
+        actor_id: str,
+    ) -> dict[str, Any]:
+        return await self._run(
+            self._set_token_quota,
+            session_id,
+            scope_type,
+            window_seconds,
+            token_limit,
+            enabled,
+            actor_id,
+        )
+
+    def _set_token_quota(
+        self,
+        session_id: str,
+        scope_type: str,
+        window_seconds: int,
+        token_limit: int,
+        enabled: bool,
+        actor_id: str,
+    ) -> dict[str, Any]:
+        scope_type = str(scope_type or "").strip().lower()
+        if scope_type not in {"group", "session"}:
+            raise ValueError("限额范围必须为群或副本")
+        window_seconds = bounded_int(
+            window_seconds,
+            3600,
+            60,
+            365 * 24 * 60 * 60,
+        )
+        token_limit = bounded_int(
+            token_limit,
+            100_000,
+            1,
+            1_000_000_000,
+        )
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                self._assert_session_writable(connection, session_id)
+                session = connection.execute(
+                    "SELECT group_id FROM sessions WHERE id = ?",
+                    (session_id,),
+                ).fetchone()
+                if not session:
+                    raise DatabaseNotFoundError("副本不存在")
+                scope_id = (
+                    str(session["group_id"])
+                    if scope_type == "group"
+                    else session_id
+                )
+                now = utc_now()
+                connection.execute(
+                    """
+                    INSERT INTO token_quota_policies(
+                        id, scope_type, scope_id, window_seconds,
+                        token_limit, enabled, revision, updated_by, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)
+                    ON CONFLICT(scope_type, scope_id) DO UPDATE SET
+                        window_seconds = excluded.window_seconds,
+                        token_limit = excluded.token_limit,
+                        enabled = excluded.enabled,
+                        revision = token_quota_policies.revision + 1,
+                        updated_by = excluded.updated_by,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        new_id("quota"),
+                        scope_type,
+                        scope_id,
+                        window_seconds,
+                        token_limit,
+                        int(bool(enabled)),
+                        actor_id,
+                        now,
+                    ),
+                )
+                self._insert_audit(
+                    connection,
+                    session_id,
+                    actor_id,
+                    "token.quota",
+                    scope_type,
+                    {
+                        "window_seconds": window_seconds,
+                        "token_limit": token_limit,
+                        "enabled": bool(enabled),
+                    },
+                )
+                connection.execute("COMMIT")
+            except Exception:
+                connection.execute("ROLLBACK")
+                raise
+        return self._token_usage_summary(session_id)
+
+    async def set_group_token_quota(
+        self,
+        platform_id: str,
+        group_id: str,
+        *,
+        window_seconds: int,
+        token_limit: int,
+        enabled: bool,
+        actor_id: str,
+    ) -> dict[str, Any]:
+        return await self._run(
+            self._set_group_token_quota,
+            platform_id,
+            group_id,
+            window_seconds,
+            token_limit,
+            enabled,
+            actor_id,
+        )
+
+    def _set_group_token_quota(
+        self,
+        platform_id: str,
+        group_id: str,
+        window_seconds: int,
+        token_limit: int,
+        enabled: bool,
+        actor_id: str,
+    ) -> dict[str, Any]:
+        platform_id = validate_platform_id(
+            platform_id,
+            label="平台实例 ID",
+        )
+        group_id = validate_platform_id(group_id, label="群 ID")
+        window_seconds = bounded_int(
+            window_seconds,
+            86_400,
+            60,
+            365 * 24 * 60 * 60,
+        )
+        token_limit = bounded_int(
+            token_limit,
+            500_000,
+            1,
+            1_000_000_000,
+        )
+        session_id = ""
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                session = connection.execute(
+                    """
+                    SELECT id FROM sessions
+                    WHERE platform_id = ? AND group_id = ?
+                    ORDER BY selected DESC, updated_at DESC
+                    LIMIT 1
+                    """,
+                    (platform_id, group_id),
+                ).fetchone()
+                if not session:
+                    raise DatabaseNotFoundError("群会话不存在")
+                session_id = str(session["id"])
+                now = utc_now()
+                connection.execute(
+                    """
+                    INSERT INTO token_quota_policies(
+                        id, scope_type, scope_id, window_seconds,
+                        token_limit, enabled, revision, updated_by, updated_at
+                    ) VALUES (?, 'group', ?, ?, ?, ?, 1, ?, ?)
+                    ON CONFLICT(scope_type, scope_id) DO UPDATE SET
+                        window_seconds = excluded.window_seconds,
+                        token_limit = excluded.token_limit,
+                        enabled = excluded.enabled,
+                        revision = token_quota_policies.revision + 1,
+                        updated_by = excluded.updated_by,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        new_id("quota"),
+                        group_id,
+                        window_seconds,
+                        token_limit,
+                        int(bool(enabled)),
+                        actor_id,
+                        now,
+                    ),
+                )
+                self._insert_audit(
+                    connection,
+                    session_id,
+                    actor_id,
+                    "token.group_quota",
+                    group_id,
+                    {
+                        "platform_id": platform_id,
+                        "window_seconds": window_seconds,
+                        "token_limit": token_limit,
+                        "enabled": bool(enabled),
+                    },
+                )
+                connection.execute("COMMIT")
+            except Exception:
+                connection.execute("ROLLBACK")
+                raise
+        return self._group_token_usage_summary(platform_id, group_id)
+
     async def record_provider_result(
         self,
         provider_id: str,
@@ -10535,20 +11534,66 @@ class TavernDatabase:
     ) -> str:
         timer_id = new_id("timer")
         now_dt = datetime.now(timezone.utc)
+        action_payload = dict(action)
+        reminder_interval = timer_reminder_interval(timer_type)
+        # 先作废同范围内仍存活的旧计时器，保证「一个范围一个计时器」。
+        # 缺少这一步时，重复的 继续 / 读档 / 回合推进 会让 timer_instances
+        # 里堆积多条 active 行，process_due_timers 便会一次性吐出多条提醒。
+        supersede_sql = """
+            UPDATE timer_instances
+            SET status = 'cancelled', deadline_at = '',
+                reminder_at = '', reminder_sent = 0, updated_at = ?
+            WHERE session_id = ? AND timer_type = ?
+              AND status IN ('active', 'paused')
+        """
+        supersede_args: tuple[Any, ...] = (
+            now_dt.isoformat(timespec="seconds"),
+            session_id,
+            timer_type,
+        )
+        if timer_type not in SESSION_SINGLETON_TIMER_TYPES:
+            supersede_sql += " AND participant_id = ?"
+            supersede_args += (participant_id,)
+        connection.execute(supersede_sql, supersede_args)
+        policy = connection.execute(
+            """
+            SELECT global_enabled, switches_json FROM timer_policies
+            WHERE session_id = ?
+            """,
+            (session_id,),
+        ).fetchone()
+        switches = json_load(
+            policy["switches_json"] if policy else "",
+            {},
+        )
+        switches = switches if isinstance(switches, Mapping) else {}
+        countdown_enabled = bool(
+            (policy["global_enabled"] if policy else 1)
+            and switches.get(timer_type, True)
+        )
+        if not countdown_enabled:
+            action_payload["paused_by_policy"] = True
+        if timer_type == "card_completion":
+            action_payload.setdefault("reminder_enabled", True)
+            action_payload["reminder_interval_seconds"] = (
+                CARD_COMPLETION_REMINDER_INTERVAL_SECONDS
+            )
         deadline = (
             now_dt + timedelta(seconds=timeout_seconds)
             if timeout_seconds is not None
             else None
         )
         # Keep ``reminder_seconds`` in the call signature for compatibility
-        # with existing time-rule payloads. Player-facing countdowns now share
-        # one predictable cadence: every 30 seconds while the timer is active.
+        # with existing time-rule payloads. Role-card creation has its own
+        # private two-minute cadence; other player timers remain at 30 seconds.
         reminder = (
-            now_dt + timedelta(seconds=TIMER_REMINDER_INTERVAL_SECONDS)
+            now_dt + timedelta(seconds=reminder_interval)
             if deadline is not None
-            and timeout_seconds > TIMER_REMINDER_INTERVAL_SECONDS
+            and timeout_seconds > reminder_interval
+            and timer_reminder_enabled(timer_type, action_payload)
             else None
         )
+        status = "active" if countdown_enabled else "paused"
         now = now_dt.isoformat(timespec="seconds")
         connection.execute(
             """
@@ -10556,25 +11601,26 @@ class TavernDatabase:
                 id, session_id, participant_id, timer_type, status,
                 deadline_at, remaining_seconds, reminder_at,
                 reminder_sent, action_json, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, 'active', ?, ?, ?, 0, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
             """,
             (
                 timer_id,
                 session_id,
                 participant_id,
                 timer_type,
+                status,
                 (
                     deadline.isoformat(timespec="seconds")
-                    if deadline is not None
+                    if deadline is not None and countdown_enabled
                     else ""
                 ),
                 timeout_seconds,
                 (
                     reminder.isoformat(timespec="seconds")
-                    if reminder is not None
+                    if reminder is not None and countdown_enabled
                     else ""
                 ),
-                json_dump(dict(action)),
+                json_dump(action_payload),
                 now,
                 now,
             ),
@@ -10768,6 +11814,9 @@ class TavernDatabase:
                 result["template"] = card_template(
                     json_load(config["world_snapshot_json"], {})
                 )
+                result["world"] = json_load(
+                    config["world_snapshot_json"], {}
+                )
                 return result
             except Exception:
                 connection.execute("ROLLBACK")
@@ -10813,7 +11862,151 @@ class TavernDatabase:
             result["template"] = card_template(
                 json_load(row["world_snapshot_json"], {})
             )
+            result["world"] = json_load(row["world_snapshot_json"], {})
             return result
+
+    async def set_card_completion_reminder(
+        self,
+        private_origin: str,
+        enabled: bool | None,
+    ) -> dict[str, Any]:
+        return await self._run(
+            self._set_card_completion_reminder,
+            private_origin,
+            enabled,
+        )
+
+    def _set_card_completion_reminder(
+        self,
+        private_origin: str,
+        enabled: bool | None,
+    ) -> dict[str, Any]:
+        private_origin = clean_text(private_origin, max_chars=500)
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                row = connection.execute(
+                    """
+                    SELECT t.*, pt.private_user_id
+                    FROM timer_instances t
+                    JOIN participants pt ON pt.id = t.participant_id
+                    JOIN character_card_drafts d
+                      ON d.participant_id = pt.id
+                    JOIN sessions s ON s.id = pt.session_id
+                    WHERE pt.private_origin = ?
+                      AND t.timer_type = 'card_completion'
+                      AND t.status IN ('active', 'paused')
+                      AND d.status = 'active'
+                      AND s.state <> 'finished'
+                    ORDER BY t.created_at DESC LIMIT 1
+                    """,
+                    (private_origin,),
+                ).fetchone()
+                if not row:
+                    raise DatabaseNotFoundError(
+                        "当前私聊没有进行中的角色卡创建倒计时"
+                    )
+
+                now_dt = datetime.now(timezone.utc)
+                now = now_dt.isoformat(timespec="seconds")
+                payload = json_load(row["action_json"], {})
+                if not isinstance(payload, dict):
+                    payload = {}
+                current_enabled = timer_reminder_enabled(
+                    row["timer_type"],
+                    payload,
+                )
+                desired = (
+                    current_enabled if enabled is None else bool(enabled)
+                )
+                reminder_at = str(row["reminder_at"] or "")
+                deadline_text = str(row["deadline_at"] or "")
+                if enabled is not None:
+                    payload["reminder_enabled"] = desired
+                    payload["reminder_interval_seconds"] = (
+                        CARD_COMPLETION_REMINDER_INTERVAL_SECONDS
+                    )
+                    if row["status"] == "active" and deadline_text:
+                        deadline = datetime.fromisoformat(deadline_text)
+                        if desired:
+                            next_reminder = now_dt + timedelta(
+                                seconds=(
+                                    CARD_COMPLETION_REMINDER_INTERVAL_SECONDS
+                                )
+                            )
+                            reminder_at = (
+                                next_reminder.isoformat(timespec="seconds")
+                                if next_reminder < deadline
+                                else ""
+                            )
+                        else:
+                            # Keep the expiry event active while preventing
+                            # periodic reminder scans before the deadline.
+                            reminder_at = deadline_text
+                    else:
+                        reminder_at = ""
+                    connection.execute(
+                        """
+                        UPDATE timer_instances
+                        SET action_json = ?, reminder_at = ?,
+                            reminder_sent = 0, updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (
+                            json_dump(payload),
+                            reminder_at,
+                            now,
+                            row["id"],
+                        ),
+                    )
+                    self._insert_audit(
+                        connection,
+                        row["session_id"],
+                        str(row["private_user_id"] or ""),
+                        "card.reminder_toggle",
+                        row["participant_id"],
+                        {"enabled": desired},
+                    )
+
+                remaining_seconds: int | None
+                if row["status"] == "active" and deadline_text:
+                    remaining_seconds = max(
+                        0,
+                        int(
+                            (
+                                datetime.fromisoformat(deadline_text)
+                                - now_dt
+                            ).total_seconds()
+                        ),
+                    )
+                elif row["status"] == "paused":
+                    remaining_seconds = max(
+                        0,
+                        int(row["remaining_seconds"] or 0),
+                    )
+                else:
+                    remaining_seconds = None
+                connection.execute("COMMIT")
+                return {
+                    "timer_id": row["id"],
+                    "session_id": row["session_id"],
+                    "participant_id": row["participant_id"],
+                    "enabled": desired,
+                    "status": row["status"],
+                    "remaining_seconds": remaining_seconds,
+                    "has_deadline": bool(
+                        deadline_text
+                        or (
+                            row["status"] == "paused"
+                            and row["remaining_seconds"] is not None
+                        )
+                    ),
+                    "next_reminder_at": reminder_at,
+                }
+            except Exception:
+                connection.execute("ROLLBACK")
+                raise
+
 
     async def fill_card_draft(
         self,
@@ -10825,6 +12018,20 @@ class TavernDatabase:
             private_origin,
             value,
         )
+
+    def _allowed_option_values(
+        self, definition: Mapping[str, Any]
+    ) -> set[str]:
+        result: set[str] = set()
+        for option in definition.get("options") or []:
+            if isinstance(option, Mapping):
+                value = option.get("value")
+            else:
+                value = option
+            text = str(value or "")
+            if text:
+                result.add(text)
+        return result
 
     def _fill_card_draft(
         self,
@@ -10870,12 +12077,18 @@ class TavernDatabase:
                 )
                 fields_def = template["fields"]
                 step = min(max(0, int(row["current_step"])), len(fields_def))
-                if step >= len(fields_def):
-                    raise ValueError("所有字段已填写，请发送 /酒馆 确认建卡")
-                definition = fields_def[step]
                 fields = json_load(row["fields_json"], {})
                 if not isinstance(fields, dict):
                     fields = {}
+                # Repair legacy drafts that still carry hand-filled stat_* fields
+                # (doc §7): recompute from profession + primary/secondary and fix
+                # the cursor to the first non-attribute field.
+                fields, step = repair_profession_preset_draft(
+                    template, fields, step
+                )
+                if step >= len(fields_def):
+                    raise ValueError("所有字段已填写，请发送 /酒馆 确认建卡")
+                definition = fields_def[step]
                 text = clean_card_field(
                     value,
                     label=str(definition["label"]),
@@ -10921,22 +12134,71 @@ class TavernDatabase:
                             f"{definition['label']}当前必须在 "
                             f"{minimum}—{maximum} 之间{suffix}"
                         )
-                fields[definition["key"]] = stored_value
-                stat_values = [
-                    int(fields[f"stat_{item['key']}"])
-                    for item in template["stats"]["attributes"]
-                    if f"stat_{item['key']}" in fields
-                ]
-                if (
-                    len(stat_values)
-                    == len(template["stats"]["attributes"])
-                    and sum(stat_values) > int(template["stats"]["budget"])
-                ):
+                _allowed = self._allowed_option_values(definition)
+                if _allowed and str(stored_value) not in _allowed:
                     raise ValueError(
-                        f"属性总值 {sum(stat_values)} 超过预算 "
-                        f"{template['stats']['budget']}，请重新建卡或调整模板"
+                        f"{definition['label']}必须从提示中的预设项选择"
                     )
-                next_step = step + 1
+                profession_mode = uses_profession_preset_stats(template)
+                field_key = str(definition["key"])
+                if profession_mode and field_key.startswith("stat_"):
+                    raise ValueError(
+                        "本世界不使用大项/小项自由分配，"
+                        "请选择主属性+7与副属性+3。"
+                    )
+                fields[definition["key"]] = stored_value
+                if profession_mode and field_key == "profession":
+                    resolved = resolve_profession_stats(
+                        template, fields, require_complete=False
+                    )
+                    fields["profession_base_stats"] = resolved["base"]
+                    for _k, _v in resolved["base"].items():
+                        fields[f"stat_{_k}"] = _v
+                    fields.pop("primary_attribute", None)
+                    fields.pop("secondary_attribute", None)
+                elif profession_mode and field_key == "primary_attribute":
+                    if fields.get("secondary_attribute") == fields.get(
+                        "primary_attribute"
+                    ):
+                        fields.pop("secondary_attribute", None)
+                    resolved = resolve_profession_stats(
+                        template, fields, require_complete=False
+                    )
+                    for _k, _v in resolved["raw"].items():
+                        fields[f"stat_{_k}"] = _v
+                elif profession_mode and field_key == "secondary_attribute":
+                    if fields.get("primary_attribute") == fields.get(
+                        "secondary_attribute"
+                    ):
+                        raise ValueError("副属性不能与主属性相同")
+                    resolved = resolve_profession_stats(
+                        template, fields, require_complete=True
+                    )
+                    for _k, _v in resolved["raw"].items():
+                        fields[f"stat_{_k}"] = _v
+                    fields["resolved_stat_total"] = int(resolved["effective_total"])
+                if profession_mode:
+                    next_step = next_fillable_card_step(
+                        template, fields_def, step + 1
+                    )
+                else:
+                    stat_values = [
+                        int(fields[f"stat_{item['key']}"])
+                        for item in template["stats"]["attributes"]
+                        if f"stat_{item['key']}" in fields
+                    ]
+                    if (
+                        len(stat_values)
+                        == len(template["stats"]["attributes"])
+                        and sum(stat_values)
+                        > int(template["stats"]["budget"])
+                    ):
+                        raise ValueError(
+                            f"属性总值 {sum(stat_values)} 超过预算 "
+                            f"{template['stats']['budget']}，"
+                            "请重新建卡或调整模板"
+                        )
+                    next_step = step + 1
                 connection.execute(
                     """
                     UPDATE character_card_drafts SET
@@ -10977,6 +12239,7 @@ class TavernDatabase:
                     "template": template,
                     "current_step": next_step,
                     "complete": next_step >= len(fields_def),
+                    "world": json_load(row["world_snapshot_json"], {}),
                 }
             except Exception:
                 connection.execute("ROLLBACK")
@@ -11040,6 +12303,71 @@ class TavernDatabase:
                 fields = json_load(row["fields_json"], {})
                 if not isinstance(fields, dict):
                     fields = {}
+                world_obj = json_load(row["world_snapshot_json"], {})
+                if uses_profession_preset_stats(template):
+                    profession_name = str(fields.get("profession") or "")
+                    if not profession_name:
+                        raise ValueError("当前角色还没有选择职业")
+                    # Keep profession, base stats and all text fields; only clear
+                    # the primary/secondary choices and the derived total.
+                    fields.pop("primary_attribute", None)
+                    fields.pop("secondary_attribute", None)
+                    fields.pop("resolved_stat_total", None)
+                    resolved = resolve_profession_stats(
+                        template, fields, require_complete=False
+                    )
+                    fields["profession_base_stats"] = resolved["base"]
+                    for _k, _v in resolved["base"].items():
+                        fields[f"stat_{_k}"] = _v
+                    primary_step = next(
+                        index
+                        for index, _d in enumerate(
+                            template.get("fields") or []
+                        )
+                        if isinstance(_d, Mapping)
+                        and str(_d.get("key") or "") == "primary_attribute"
+                    )
+                    target_step = primary_step
+                    connection.execute(
+                        """
+                        UPDATE character_card_drafts SET
+                            fields_json = ?, current_step = ?, updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (json_dump(fields), target_step, now, row["draft_id"]),
+                    )
+                    connection.execute(
+                        """
+                        UPDATE participants
+                        SET card_status = 'draft', ready = 0, updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (now, row["id"]),
+                    )
+                    self._insert_audit(
+                        connection,
+                        row["session_id"],
+                        row["private_user_id"],
+                        "card.stats_reset",
+                        row["id"],
+                        {
+                            "profession_reset": True,
+                            "profession": profession_name,
+                        },
+                    )
+                    connection.execute("COMMIT")
+                    return {
+                        "participant_id": row["id"],
+                        "session_id": row["session_id"],
+                        "fields": fields,
+                        "template": template,
+                        "current_step": target_step,
+                        "complete": False,
+                        "profession_reset": True,
+                        "profession": profession_name,
+                        "base_stats": dict(resolved["base"]),
+                        "world": world_obj,
+                    }
                 allocation = card_stat_allocation(template, fields)
                 stat_fields = allocation["stat_fields"]
                 if not stat_fields:
@@ -11056,9 +12384,10 @@ class TavernDatabase:
                     raise ValueError("尚未开始填写角色数值")
                 removed = []
                 for item in stat_fields:
-                    if item["field_key"] in fields:
-                        fields.pop(item["field_key"], None)
-                        removed.append(item["field_key"])
+                    field_key = str(item.get("field_key") or "")
+                    if field_key in fields:
+                        removed.append(field_key)
+                        fields.pop(field_key, None)
                 connection.execute(
                     """
                     UPDATE character_card_drafts SET
@@ -11096,6 +12425,7 @@ class TavernDatabase:
                     "template": template,
                     "current_step": first_step,
                     "complete": False,
+                    "world": json_load(row["world_snapshot_json"], {}),
                 }
             except Exception:
                 connection.execute("ROLLBACK")
@@ -11151,6 +12481,7 @@ class TavernDatabase:
                 fields = json_load(row["fields_json"], {})
                 if not isinstance(fields, dict):
                     fields = {}
+                fields.pop("_alloc", None)
                 for definition in template["fields"]:
                     key = str(definition["key"])
                     if key not in fields:
@@ -11206,44 +12537,75 @@ class TavernDatabase:
                 if duplicate:
                     raise ValueError("角色姓名或副本代号已被使用")
                 stat_definition = template["stats"]
-                raw_stats: dict[str, int] = {}
-                labels: dict[str, str] = {}
-                modifiers: dict[str, int] = {}
-                for attribute in stat_definition["attributes"]:
-                    key = str(attribute["key"])
-                    value = int(
-                        fields.get(
-                            f"stat_{key}",
-                            attribute.get("default", 0),
-                        )
+                if uses_profession_preset_stats(template):
+                    resolved_stats = resolve_profession_stats(
+                        template,
+                        fields,
+                        require_complete=True,
                     )
-                    if not int(attribute["minimum"]) <= value <= int(
-                        attribute["maximum"]
-                    ):
-                        raise ValueError(
-                            f"{attribute['label']}超出模板允许范围"
+                    for key, expected_value in resolved_stats[
+                        "raw"
+                    ].items():
+                        actual_value = int(
+                            fields.get(f"stat_{key}", -999)
                         )
-                    raw_stats[key] = value
-                    labels[key] = str(attribute["label"])
-                    modifiers[key] = int(
-                        stat_definition["modifier_table"].get(
-                            str(value),
-                            0,
-                        )
+                        if actual_value != expected_value:
+                            raise ValueError(
+                                f"{resolved_stats['labels'][key]}"
+                                "数值与职业基础属性及主副属性加成不一致，"
+                                "请使用「重填数值」重新生成"
+                            )
+                    final_total = int((stat_definition.get("total_validation") or {}).get("final_total", stat_definition.get("budget", 0)))
+                    if int(resolved_stats["effective_total"]) != final_total:
+                        raise ValueError(f"角色最终属性总和必须为{final_total}")
+                    resolved_stats["budget"] = final_total
+                    fields["profession_base_stats"] = dict(
+                        resolved_stats["base"]
                     )
-                if sum(raw_stats.values()) > int(
-                    stat_definition["budget"]
-                ):
-                    raise ValueError("角色属性总值超过世界模板预算")
-                resolved_stats = {
-                    "raw": raw_stats,
-                    "labels": labels,
-                    "modifiers": modifiers,
-                    "budget": int(stat_definition["budget"]),
-                    "modifier_table": dict(
-                        stat_definition["modifier_table"]
-                    ),
-                }
+                    fields["resolved_stat_total"] = int(
+                        resolved_stats["effective_total"]
+                    )
+                else:
+                    raw_stats: dict[str, int] = {}
+                    labels: dict[str, str] = {}
+                    modifiers: dict[str, int] = {}
+                    for attribute in stat_definition["attributes"]:
+                        key = str(attribute["key"])
+                        value = int(
+                            fields.get(
+                                f"stat_{key}",
+                                attribute.get("default", 0),
+                            )
+                        )
+                        if not int(attribute["minimum"]) <= value <= int(
+                            attribute["maximum"]
+                        ):
+                            raise ValueError(
+                                f"{attribute['label']}超出模板允许范围"
+                            )
+                        raw_stats[key] = value
+                        labels[key] = str(attribute["label"])
+                        modifiers[key] = int(
+                            stat_definition["modifier_table"].get(
+                                str(value),
+                                0,
+                            )
+                        )
+                    allocation = card_stat_allocation(template, fields)
+                    if not allocation.get("total_ok", True):
+                        rule = allocation.get("allocation_rule", "maximum")
+                        if rule == "exact": raise ValueError("角色属性总值必须刚好等于世界模板预算")
+                        if rule == "range": raise ValueError("角色属性总值不在允许区间")
+                        raise ValueError("角色属性总值超过世界模板预算")
+                    resolved_stats = {
+                        "raw": raw_stats,
+                        "labels": labels,
+                        "modifiers": modifiers,
+                        "budget": int(stat_definition["budget"]),
+                        "modifier_table": dict(
+                            stat_definition["modifier_table"]
+                        ),
+                    }
                 now = utc_now()
                 card_id = row["character_card_id"] or new_id("pcard")
                 existing_card = connection.execute(
@@ -11630,6 +12992,110 @@ class TavernDatabase:
             ready,
         )
 
+    async def force_all_ready(
+        self,
+        session_id: str,
+        actor_id: str,
+    ) -> dict[str, Any]:
+        return await self._run(
+            self._force_all_ready,
+            session_id,
+            actor_id,
+        )
+
+    def _force_all_ready(
+        self,
+        session_id: str,
+        actor_id: str,
+    ) -> dict[str, Any]:
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                self._assert_session_writable(connection, session_id)
+                session = connection.execute(
+                    "SELECT * FROM sessions WHERE id = ?",
+                    (session_id,),
+                ).fetchone()
+                if not session or session["state"] != SESSION_PREPARING:
+                    raise InvalidTransitionError(
+                        "只有准备大厅可以强制全员准备"
+                    )
+                now = utc_now()
+                eligible = connection.execute(
+                    """
+                    SELECT id FROM participants
+                    WHERE session_id = ? AND card_status = 'approved'
+                      AND participation_status = 'active'
+                    """,
+                    (session_id,),
+                ).fetchall()
+                ids = [str(row["id"]) for row in eligible]
+                if ids:
+                    placeholders = ",".join("?" for _ in ids)
+                    connection.execute(
+                        f"""
+                        UPDATE participants SET ready = 1, updated_at = ?
+                        WHERE id IN ({placeholders})
+                        """,
+                        (now, *ids),
+                    )
+                    connection.execute(
+                        f"""
+                        UPDATE timer_instances
+                        SET status = 'completed', deadline_at = '',
+                            reminder_at = '', updated_at = ?
+                        WHERE participant_id IN ({placeholders})
+                          AND timer_type = 'ready'
+                          AND status IN ('active', 'paused')
+                        """,
+                        (now, *ids),
+                    )
+                skipped = connection.execute(
+                    """
+                    SELECT display_name, character_name, card_status,
+                           participation_status
+                    FROM participants
+                    WHERE session_id = ?
+                      AND NOT (
+                        card_status = 'approved'
+                        AND participation_status = 'active'
+                      )
+                      AND participation_status NOT IN ('retired', 'archived')
+                    ORDER BY created_at
+                    """,
+                    (session_id,),
+                ).fetchall()
+                self._insert_audit(
+                    connection,
+                    session_id,
+                    actor_id,
+                    "participant.force_ready_all",
+                    session_id,
+                    {
+                        "ready_count": len(ids),
+                        "skipped_count": len(skipped),
+                    },
+                )
+                connection.execute("COMMIT")
+                return {
+                    "session_id": session_id,
+                    "ready_count": len(ids),
+                    "skipped": [
+                        {
+                            "name": row["character_name"]
+                            or row["display_name"],
+                            "card_status": row["card_status"],
+                            "participation_status": row[
+                                "participation_status"
+                            ],
+                        }
+                        for row in skipped
+                    ],
+                }
+            except Exception:
+                connection.execute("ROLLBACK")
+                raise
+
     def _set_participant_ready(
         self,
         session_id: str,
@@ -11797,6 +13263,11 @@ class TavernDatabase:
         resume: bool = False,
         choices: Sequence[Mapping[str, Any]] | None = None,
     ) -> dict[str, Any]:
+        session = await self.get_session(session_id)
+        if not resume and int(session.get("turn_no") or 0) > 0:
+            raise InvalidTransitionError(
+                "该副本已有剧情进度，不能再次开演；请使用 /酒馆 继续"
+            )
         preflight = await self.opening_preflight(session_id)
         if not preflight["ok"]:
             return {"started": False, **preflight}
@@ -11826,6 +13297,10 @@ class TavernDatabase:
                     raise DatabaseNotFoundError("会话不存在")
                 if session["state"] != SESSION_PREPARING:
                     raise InvalidTransitionError("副本当前不在准备阶段")
+                if not resume and int(session["turn_no"] or 0) > 0:
+                    raise InvalidTransitionError(
+                        "该副本已有剧情进度，不能再次开演；请使用 /酒馆 继续"
+                    )
                 config = connection.execute(
                     """
                     SELECT * FROM instance_configs WHERE session_id = ?
@@ -11884,11 +13359,6 @@ class TavernDatabase:
                     public_world_state(stored_state),
                     turn_state,
                 )
-                selected_choices = (
-                    normalize_choices(supplied_choices)
-                    if supplied_choices
-                    else opening_choices(world)
-                )
                 current_user_id = turn_state["current_user_id"]
                 current = next(
                     row
@@ -11920,7 +13390,27 @@ class TavernDatabase:
                     if resume
                     else None
                 )
+                selected_choices: list[dict[str, Any]] = []
+                if not preserved_choice and not preserved_vote:
+                    selected_choices = (
+                        normalize_choices(supplied_choices)
+                        if supplied_choices
+                        else (
+                            fallback_choices(stored_state)
+                            if resume
+                            else opening_choices(world)
+                        )
+                    )
                 now = utc_now()
+                connection.execute(
+                    """
+                    UPDATE timer_instances
+                    SET status = 'cancelled', updated_at = ?
+                    WHERE session_id = ? AND timer_type = 'preparation'
+                      AND status IN ('active', 'paused')
+                    """,
+                    (now, session_id),
+                )
                 connection.execute(
                     """
                     UPDATE sessions SET
@@ -13685,6 +15175,257 @@ class TavernDatabase:
             except Exception:
                 connection.execute("ROLLBACK")
                 raise
+    async def get_timer_policy(
+        self,
+        session_id: str,
+    ) -> dict[str, Any]:
+        return await self._run(self._get_timer_policy, session_id)
+
+    def _get_timer_policy(self, session_id: str) -> dict[str, Any]:
+        with self._connect() as connection:
+            session = connection.execute(
+                "SELECT id FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+            if not session:
+                raise DatabaseNotFoundError("副本不存在")
+            row = connection.execute(
+                """
+                SELECT * FROM timer_policies WHERE session_id = ?
+                """,
+                (session_id,),
+            ).fetchone()
+            switches = json_load(
+                row["switches_json"] if row else "",
+                {},
+            )
+            switches = switches if isinstance(switches, Mapping) else {}
+            global_enabled = bool(row["global_enabled"] if row else True)
+            return {
+                "session_id": session_id,
+                "global_enabled": global_enabled,
+                "switches": {
+                    timer_type: bool(switches.get(timer_type, True))
+                    for timer_type in COUNTDOWN_TYPES
+                },
+                "effective": {
+                    timer_type: bool(
+                        global_enabled and switches.get(timer_type, True)
+                    )
+                    for timer_type in COUNTDOWN_TYPES
+                },
+                "revision": int(row["revision"] if row else 0),
+                "updated_at": str(row["updated_at"] if row else ""),
+            }
+
+    async def set_timer_policy(
+        self,
+        session_id: str,
+        timer_type: str,
+        enabled: bool,
+        actor_id: str,
+    ) -> dict[str, Any]:
+        return await self._run(
+            self._set_timer_policy,
+            session_id,
+            timer_type,
+            enabled,
+            actor_id,
+        )
+
+    def _set_timer_policy(
+        self,
+        session_id: str,
+        timer_type: str,
+        enabled: bool,
+        actor_id: str,
+    ) -> dict[str, Any]:
+        timer_type = str(timer_type or "").strip().lower()
+        if timer_type not in {"all", *COUNTDOWN_TYPES}:
+            raise ValueError("不支持的倒计时分类")
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                self._assert_session_writable(connection, session_id)
+                now_dt = datetime.now(timezone.utc)
+                now = now_dt.isoformat(timespec="seconds")
+                row = connection.execute(
+                    """
+                    SELECT * FROM timer_policies WHERE session_id = ?
+                    """,
+                    (session_id,),
+                ).fetchone()
+                global_enabled = bool(
+                    row["global_enabled"] if row else True
+                )
+                switches = json_load(
+                    row["switches_json"] if row else "",
+                    {},
+                )
+                switches = (
+                    dict(switches)
+                    if isinstance(switches, Mapping)
+                    else {}
+                )
+                before = {
+                    item: bool(
+                        global_enabled and switches.get(item, True)
+                    )
+                    for item in COUNTDOWN_TYPES
+                }
+                if timer_type == "all":
+                    global_enabled = bool(enabled)
+                else:
+                    switches[timer_type] = bool(enabled)
+                after = {
+                    item: bool(
+                        global_enabled and switches.get(item, True)
+                    )
+                    for item in COUNTDOWN_TYPES
+                }
+                connection.execute(
+                    """
+                    INSERT INTO timer_policies(
+                        session_id, global_enabled, switches_json,
+                        revision, updated_by, updated_at
+                    ) VALUES (?, ?, ?, 1, ?, ?)
+                    ON CONFLICT(session_id) DO UPDATE SET
+                        global_enabled = excluded.global_enabled,
+                        switches_json = excluded.switches_json,
+                        revision = timer_policies.revision + 1,
+                        updated_by = excluded.updated_by,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        session_id,
+                        int(global_enabled),
+                        json_dump(switches),
+                        actor_id,
+                        now,
+                    ),
+                )
+                changed = [
+                    item for item in COUNTDOWN_TYPES
+                    if before[item] != after[item]
+                ]
+                if changed:
+                    placeholders = ",".join("?" for _ in changed)
+                    rows = connection.execute(
+                        f"""
+                        SELECT * FROM timer_instances
+                        WHERE session_id = ?
+                          AND timer_type IN ({placeholders})
+                          AND status IN ('active', 'paused')
+                        """,
+                        (session_id, *changed),
+                    ).fetchall()
+                    for timer in rows:
+                        payload = json_load(timer["action_json"], {})
+                        payload = (
+                            dict(payload)
+                            if isinstance(payload, Mapping)
+                            else {}
+                        )
+                        current_type = str(timer["timer_type"])
+                        if not after[current_type]:
+                            if timer["status"] != "active":
+                                continue
+                            remaining = timer["remaining_seconds"]
+                            deadline = str(timer["deadline_at"] or "")
+                            if deadline:
+                                try:
+                                    remaining = max(
+                                        0,
+                                        int(
+                                            (
+                                                datetime.fromisoformat(deadline)
+                                                - now_dt
+                                            ).total_seconds()
+                                        ),
+                                    )
+                                except ValueError:
+                                    pass
+                            payload["paused_by_policy"] = True
+                            connection.execute(
+                                """
+                                UPDATE timer_instances SET
+                                    status = 'paused', deadline_at = '',
+                                    remaining_seconds = ?, reminder_at = '',
+                                    reminder_sent = 0, action_json = ?,
+                                    updated_at = ?
+                                WHERE id = ?
+                                """,
+                                (
+                                    remaining,
+                                    json_dump(payload),
+                                    now,
+                                    timer["id"],
+                                ),
+                            )
+                        elif (
+                            timer["status"] == "paused"
+                            and payload.get("paused_by_policy")
+                        ):
+                            seconds_left = max(
+                                1,
+                                int(timer["remaining_seconds"] or 1),
+                            )
+                            deadline_dt = now_dt + timedelta(
+                                seconds=seconds_left
+                            )
+                            interval = timer_reminder_interval(
+                                current_type
+                            )
+                            next_reminder = now_dt + timedelta(
+                                seconds=interval
+                            )
+                            payload.pop("paused_by_policy", None)
+                            reminder_at = ""
+                            if (
+                                timer_reminder_enabled(
+                                    current_type,
+                                    payload,
+                                )
+                                and next_reminder < deadline_dt
+                            ):
+                                reminder_at = next_reminder.isoformat(
+                                    timespec="seconds"
+                                )
+                            connection.execute(
+                                """
+                                UPDATE timer_instances SET
+                                    status = 'active', deadline_at = ?,
+                                    reminder_at = ?, reminder_sent = 0,
+                                    action_json = ?, updated_at = ?
+                                WHERE id = ?
+                                """,
+                                (
+                                    deadline_dt.isoformat(
+                                        timespec="seconds"
+                                    ),
+                                    reminder_at,
+                                    json_dump(payload),
+                                    now,
+                                    timer["id"],
+                                ),
+                            )
+                self._insert_audit(
+                    connection,
+                    session_id,
+                    actor_id,
+                    "timer.policy",
+                    timer_type,
+                    {
+                        "enabled": bool(enabled),
+                        "changed_types": changed,
+                    },
+                )
+                connection.execute("COMMIT")
+            except Exception:
+                connection.execute("ROLLBACK")
+                raise
+        return self._get_timer_policy(session_id)
+
     async def list_timers(
         self,
         session_id: str,
@@ -13757,6 +15498,16 @@ class TavernDatabase:
                 ).fetchone()
                 if not row:
                     raise DatabaseNotFoundError("计时器不存在")
+                payload = json_load(row["action_json"], {})
+                if not isinstance(payload, Mapping):
+                    payload = {}
+                reminder_interval = timer_reminder_interval(
+                    row["timer_type"]
+                )
+                reminders_enabled = timer_reminder_enabled(
+                    row["timer_type"],
+                    payload,
+                )
                 now_dt = datetime.now(timezone.utc)
                 now = now_dt.isoformat(timespec="seconds")
                 status = row["status"]
@@ -13785,13 +15536,16 @@ class TavernDatabase:
                     deadline_dt = now_dt + timedelta(seconds=seconds_left)
                     deadline = deadline_dt.isoformat(timespec="seconds")
                     next_reminder = now_dt + timedelta(
-                        seconds=TIMER_REMINDER_INTERVAL_SECONDS
+                        seconds=reminder_interval
                     )
-                    reminder_at = (
-                        next_reminder.isoformat(timespec="seconds")
-                        if next_reminder < deadline_dt
-                        else ""
-                    )
+                    if reminders_enabled:
+                        reminder_at = (
+                            next_reminder.isoformat(timespec="seconds")
+                            if next_reminder < deadline_dt
+                            else ""
+                        )
+                    else:
+                        reminder_at = deadline
                     reminder_sent = 0
                 elif action == "extend":
                     if seconds <= 0:
@@ -13801,9 +15555,12 @@ class TavernDatabase:
                         deadline_dt += timedelta(seconds=seconds)
                         deadline = deadline_dt.isoformat(timespec="seconds")
                         next_reminder = now_dt + timedelta(
-                            seconds=TIMER_REMINDER_INTERVAL_SECONDS
+                            seconds=reminder_interval
                         )
-                        if not reminder_at and next_reminder < deadline_dt:
+                        if not reminders_enabled:
+                            reminder_at = deadline
+                            reminder_sent = 0
+                        elif not reminder_at and next_reminder < deadline_dt:
                             reminder_at = next_reminder.isoformat(
                                 timespec="seconds"
                             )
@@ -13838,7 +15595,6 @@ class TavernDatabase:
                     ),
                 )
                 if action == "expire":
-                    payload = json_load(row["action_json"], {})
                     if row["timer_type"] == "card_code":
                         connection.execute(
                             """
@@ -14061,6 +15817,20 @@ class TavernDatabase:
                         """,
                         (remaining, now, row["id"]),
                     )
+                    payload = json_load(row["action_json"], {})
+                    if (
+                        row["timer_type"] == "vote"
+                        and isinstance(payload, Mapping)
+                        and payload.get("vote_id")
+                    ):
+                        connection.execute(
+                            """
+                            UPDATE group_votes
+                            SET deadline_at = '', updated_at = ?
+                            WHERE id = ? AND status = 'open'
+                            """,
+                            (now, str(payload["vote_id"])),
+                        )
                 self._insert_audit(
                     connection,
                     session_id,
@@ -14103,18 +15873,72 @@ class TavernDatabase:
                     """,
                     (session_id,),
                 ).fetchall()
+                # 后台关掉的倒计时不能被「恢复/继续/读档」重新唤醒。
+                # 旧实现无条件恢复全部 paused 行，导致管理员关掉倒计时后
+                # 只要有人发 /酒馆 继续，提醒就会重新开始刷屏。
+                policy = connection.execute(
+                    """
+                    SELECT global_enabled, switches_json FROM timer_policies
+                    WHERE session_id = ?
+                    """,
+                    (session_id,),
+                ).fetchone()
+                switches = json_load(
+                    policy["switches_json"] if policy else "",
+                    {},
+                )
+                switches = switches if isinstance(switches, Mapping) else {}
+                global_enabled = bool(
+                    policy["global_enabled"] if policy else 1
+                )
+                resumed = 0
                 for row in rows:
+                    payload = json_load(row["action_json"], {})
+                    if not isinstance(payload, Mapping):
+                        payload = {}
+                    timer_type = str(row["timer_type"])
+                    countdown_enabled = bool(
+                        global_enabled and switches.get(timer_type, True)
+                    )
+                    if not countdown_enabled:
+                        # 策略仍为关闭：保持暂停，并补齐标记，
+                        # 便于之后重新打开时由 _set_timer_policy 正确复活。
+                        if not payload.get("paused_by_policy"):
+                            payload = dict(payload)
+                            payload["paused_by_policy"] = True
+                            connection.execute(
+                                """
+                                UPDATE timer_instances
+                                SET action_json = ?, updated_at = ?
+                                WHERE id = ?
+                                """,
+                                (json_dump(payload), now, row["id"]),
+                            )
+                        continue
+                    if payload.get("paused_by_policy"):
+                        # 策略已重新打开的场景由 _set_timer_policy 负责恢复，
+                        # 这里不越权唤醒，避免与策略状态打架。
+                        continue
+                    resumed += 1
                     remaining = max(1, int(row["remaining_seconds"] or 1))
                     deadline_dt = now_dt + timedelta(seconds=remaining)
                     deadline = deadline_dt.isoformat(timespec="seconds")
                     next_reminder = now_dt + timedelta(
-                        seconds=TIMER_REMINDER_INTERVAL_SECONDS
+                        seconds=timer_reminder_interval(
+                            row["timer_type"]
+                        )
                     )
-                    reminder_at = (
-                        next_reminder.isoformat(timespec="seconds")
-                        if next_reminder < deadline_dt
-                        else ""
-                    )
+                    if timer_reminder_enabled(
+                        row["timer_type"],
+                        payload,
+                    ):
+                        reminder_at = (
+                            next_reminder.isoformat(timespec="seconds")
+                            if next_reminder < deadline_dt
+                            else ""
+                        )
+                    else:
+                        reminder_at = deadline
                     connection.execute(
                         """
                         UPDATE timer_instances SET
@@ -14125,16 +15949,31 @@ class TavernDatabase:
                         """,
                         (deadline, reminder_at, now, row["id"]),
                     )
+                    if (
+                        row["timer_type"] == "vote"
+                        and payload.get("vote_id")
+                    ):
+                        connection.execute(
+                            """
+                            UPDATE group_votes
+                            SET deadline_at = ?, updated_at = ?
+                            WHERE id = ? AND status = 'open'
+                            """,
+                            (deadline, now, str(payload["vote_id"])),
+                        )
                 self._insert_audit(
                     connection,
                     session_id,
                     actor_id,
                     "timer.resume_all",
                     session_id,
-                    {"count": len(rows)},
+                    {
+                        "count": resumed,
+                        "skipped_by_policy": len(rows) - resumed,
+                    },
                 )
                 connection.execute("COMMIT")
-                return len(rows)
+                return resumed
             except Exception:
                 connection.execute("ROLLBACK")
                 raise
@@ -14223,7 +16062,9 @@ class TavernDatabase:
             seen.add(user_id)
             participant = connection.execute(
                 """
-                SELECT display_name, character_name FROM participants
+                SELECT display_name, character_name,
+                       private_user_id, private_origin
+                FROM participants
                 WHERE session_id = ? AND group_user_id = ?
                 ORDER BY
                     CASE participation_status
@@ -14239,16 +16080,26 @@ class TavernDatabase:
                 (session_id, user_id),
             ).fetchone()
             display_name = user_id
+            private_user_id = ""
+            private_origin = ""
             if participant:
                 display_name = str(
                     participant["character_name"]
                     or participant["display_name"]
                     or user_id
                 )
+                private_user_id = str(
+                    participant["private_user_id"] or ""
+                )
+                private_origin = str(
+                    participant["private_origin"] or ""
+                )
             targets.append(
                 {
                     "user_id": user_id,
                     "display_name": display_name,
+                    "private_user_id": private_user_id,
+                    "private_origin": private_origin,
                 }
             )
         return targets
@@ -14260,21 +16111,115 @@ class TavernDatabase:
             try:
                 now = utc_now()
                 now_dt = datetime.fromisoformat(now)
-                first_reminder = (
-                    now_dt
-                    + timedelta(seconds=TIMER_REMINDER_INTERVAL_SECONDS)
-                ).isoformat(timespec="seconds")
-                # Timers created by an older release may not have a periodic
-                # reminder timestamp. Adopt them without changing deadlines.
-                connection.execute(
+                # Adopt role-card timers created by the previous 30-second
+                # release exactly once. Reset their next notice to two minutes
+                # from now so upgrading cannot leak one stale group reminder.
+                legacy_card_rows = connection.execute(
                     """
-                    UPDATE timer_instances
-                    SET reminder_at = ?, reminder_sent = 0, updated_at = ?
+                    SELECT * FROM timer_instances
+                    WHERE timer_type = 'card_completion'
+                      AND status IN ('active', 'paused')
+                    """
+                ).fetchall()
+                for row in legacy_card_rows:
+                    payload = json_load(row["action_json"], {})
+                    if not isinstance(payload, dict):
+                        payload = {}
+                    try:
+                        stored_interval = int(
+                            payload.get(
+                                "reminder_interval_seconds",
+                                0,
+                            )
+                            or 0
+                        )
+                    except (TypeError, ValueError):
+                        stored_interval = 0
+                    if (
+                        stored_interval
+                        == CARD_COMPLETION_REMINDER_INTERVAL_SECONDS
+                        and "reminder_enabled" in payload
+                    ):
+                        continue
+                    payload.setdefault("reminder_enabled", True)
+                    payload["reminder_interval_seconds"] = (
+                        CARD_COMPLETION_REMINDER_INTERVAL_SECONDS
+                    )
+                    migrated_reminder = ""
+                    deadline_text = str(row["deadline_at"] or "")
+                    if row["status"] == "active" and deadline_text:
+                        deadline = datetime.fromisoformat(deadline_text)
+                        if timer_reminder_enabled(
+                            row["timer_type"],
+                            payload,
+                        ):
+                            candidate = now_dt + timedelta(
+                                seconds=(
+                                    CARD_COMPLETION_REMINDER_INTERVAL_SECONDS
+                                )
+                            )
+                            if candidate < deadline:
+                                migrated_reminder = candidate.isoformat(
+                                    timespec="seconds"
+                                )
+                        else:
+                            migrated_reminder = deadline_text
+                    connection.execute(
+                        """
+                        UPDATE timer_instances
+                        SET action_json = ?, reminder_at = ?,
+                            reminder_sent = 0, updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (
+                            json_dump(payload),
+                            migrated_reminder,
+                            now,
+                            row["id"],
+                        ),
+                    )
+
+                # Timers created by an older release may have no reminder
+                # timestamp. Adopt them without changing their deadlines.
+                missing_reminder_rows = connection.execute(
+                    """
+                    SELECT * FROM timer_instances
                     WHERE status = 'active' AND reminder_at = ''
-                      AND deadline_at > ?
+                      AND deadline_at <> '' AND deadline_at > ?
                     """,
-                    (first_reminder, now, first_reminder),
-                )
+                    (now,),
+                ).fetchall()
+                for row in missing_reminder_rows:
+                    payload = json_load(row["action_json"], {})
+                    if not isinstance(payload, Mapping):
+                        payload = {}
+                    deadline = datetime.fromisoformat(row["deadline_at"])
+                    if not timer_reminder_enabled(
+                        row["timer_type"],
+                        payload,
+                    ):
+                        adopted_reminder = str(row["deadline_at"])
+                    else:
+                        candidate = now_dt + timedelta(
+                            seconds=timer_reminder_interval(
+                                row["timer_type"]
+                            )
+                        )
+                        adopted_reminder = (
+                            candidate.isoformat(timespec="seconds")
+                            if candidate < deadline
+                            else ""
+                        )
+                    if adopted_reminder:
+                        connection.execute(
+                            """
+                            UPDATE timer_instances
+                            SET reminder_at = ?, reminder_sent = 0,
+                                updated_at = ?
+                            WHERE id = ?
+                            """,
+                            (adopted_reminder, now, row["id"]),
+                        )
                 reminder_rows = connection.execute(
                     """
                     SELECT * FROM timer_instances
@@ -14284,8 +16229,95 @@ class TavernDatabase:
                     """,
                     (now, now),
                 ).fetchall()
+                # 分发前再查一次策略：即便有历史脏数据或并发写入
+                # 让被关闭的计时器仍处于 active，也不会再推送提醒。
+                policy_cache: dict[str, tuple[bool, Mapping[str, Any]]] = {}
+
+                def _countdown_allowed(
+                    session_key: str,
+                    timer_type_key: str,
+                ) -> bool:
+                    cached = policy_cache.get(session_key)
+                    if cached is None:
+                        policy_row = connection.execute(
+                            """
+                            SELECT global_enabled, switches_json
+                            FROM timer_policies WHERE session_id = ?
+                            """,
+                            (session_key,),
+                        ).fetchone()
+                        policy_switches = json_load(
+                            policy_row["switches_json"]
+                            if policy_row
+                            else "",
+                            {},
+                        )
+                        if not isinstance(policy_switches, Mapping):
+                            policy_switches = {}
+                        cached = (
+                            bool(
+                                policy_row["global_enabled"]
+                                if policy_row
+                                else 1
+                            ),
+                            policy_switches,
+                        )
+                        policy_cache[session_key] = cached
+                    enabled, switch_map = cached
+                    return bool(
+                        enabled and switch_map.get(timer_type_key, True)
+                    )
+
                 for row in reminder_rows:
                     deadline = datetime.fromisoformat(row["deadline_at"])
+                    payload = json_load(row["action_json"], {})
+                    if not isinstance(payload, Mapping):
+                        payload = {}
+                    reminder_interval = timer_reminder_interval(
+                        row["timer_type"]
+                    )
+                    if not _countdown_allowed(
+                        str(row["session_id"]),
+                        str(row["timer_type"]),
+                    ):
+                        stale_payload = dict(payload)
+                        stale_payload["paused_by_policy"] = True
+                        connection.execute(
+                            """
+                            UPDATE timer_instances
+                            SET status = 'paused', deadline_at = '',
+                                remaining_seconds = ?, reminder_at = '',
+                                reminder_sent = 0, action_json = ?,
+                                updated_at = ?
+                            WHERE id = ?
+                            """,
+                            (
+                                max(
+                                    0,
+                                    int(
+                                        (deadline - now_dt).total_seconds()
+                                    ),
+                                ),
+                                json_dump(stale_payload),
+                                now,
+                                row["id"],
+                            ),
+                        )
+                        continue
+                    if not timer_reminder_enabled(
+                        row["timer_type"],
+                        payload,
+                    ):
+                        connection.execute(
+                            """
+                            UPDATE timer_instances
+                            SET reminder_at = ?, reminder_sent = 0,
+                                updated_at = ?
+                            WHERE id = ?
+                            """,
+                            (row["deadline_at"], now, row["id"]),
+                        )
+                        continue
                     remaining = max(
                         1,
                         int((deadline - now_dt).total_seconds()),
@@ -14293,7 +16325,7 @@ class TavernDatabase:
                     next_reminder = (
                         now_dt
                         + timedelta(
-                            seconds=TIMER_REMINDER_INTERVAL_SECONDS
+                            seconds=reminder_interval
                         )
                     )
                     next_reminder_at = (
@@ -14318,6 +16350,9 @@ class TavernDatabase:
                             "timer_type": row["timer_type"],
                             "participant_id": row["participant_id"],
                             "remaining_seconds": remaining,
+                            "reminder_interval_seconds": (
+                                reminder_interval
+                            ),
                             "targets": self._timer_notice_targets(
                                 connection,
                                 row,
@@ -15596,6 +17631,15 @@ class TavernDatabase:
                 "story_storage": (
                     "SELECT * FROM story_storage ORDER BY created_at"
                 ),
+                "timer_policies": (
+                    "SELECT * FROM timer_policies ORDER BY updated_at"
+                ),
+                "token_usage": (
+                    "SELECT * FROM token_usage ORDER BY created_at"
+                ),
+                "token_quota_policies": (
+                    "SELECT * FROM token_quota_policies ORDER BY updated_at"
+                ),
             }
             data: dict[str, list[dict[str, Any]]] = {}
             for name, query in tables.items():
@@ -15702,6 +17746,17 @@ class TavernDatabase:
             for table in v051_required:
                 if not isinstance(data[table], list):
                     raise ValueError(f"备份表 {table} 格式错误")
+        if schema_version >= 6:
+            v053_required = {
+                "timer_policies",
+                "token_usage",
+                "token_quota_policies",
+            }
+            if not v053_required.issubset(data.keys()):
+                raise ValueError("Schema 6 备份数据表不完整")
+            for table in v053_required:
+                if not isinstance(data[table], list):
+                    raise ValueError(f"备份表 {table} 格式错误")
 
     async def import_bundle(
         self,
@@ -15782,6 +17837,11 @@ class TavernDatabase:
             "group_registry",
             "story_storage",
         )
+        v053_tables = (
+            "timer_policies",
+            "token_usage",
+            "token_quota_policies",
+        )
         if int(bundle.get("schema_version", 1)) < 3:
             for row in data["sessions"]:
                 if row.get("state") in {"running", "maintenance"}:
@@ -15794,6 +17854,9 @@ class TavernDatabase:
         if int(bundle.get("schema_version", 1)) < 5:
             for table in v051_tables:
                 data.setdefault(table, [])
+        if int(bundle.get("schema_version", 1)) < 6:
+            for table in v053_tables:
+                data.setdefault(table, [])
         counts: dict[str, int] = {}
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -15803,6 +17866,9 @@ class TavernDatabase:
                 if mode == "replace":
                     for table in (
                         "audit_logs",
+                        "token_usage",
+                        "token_quota_policies",
+                        "timer_policies",
                         "story_storage",
                         "group_registry",
                         "operation_receipts",
@@ -16223,6 +18289,35 @@ class TavernDatabase:
                     # backup from writing outside the plugin data directory.
                     data["story_storage"] = []
                 self._initialize_v051_rows(connection)
+                if int(bundle.get("schema_version", 1)) >= 6:
+                    v053_columns: dict[str, tuple[str, ...]] = {
+                        "timer_policies": (
+                            "session_id", "global_enabled", "switches_json",
+                            "revision", "updated_by", "updated_at",
+                        ),
+                        "token_usage": (
+                            "id", "session_id", "group_id", "request_type",
+                            "provider_id", "input_tokens",
+                            "cached_input_tokens", "output_tokens",
+                            "total_tokens", "reserved_tokens",
+                            "usage_source", "status", "created_at",
+                            "settled_at",
+                        ),
+                        "token_quota_policies": (
+                            "id", "scope_type", "scope_id",
+                            "window_seconds", "token_limit", "enabled",
+                            "revision", "updated_by", "updated_at",
+                        ),
+                    }
+                    for table in v053_tables:
+                        self._import_rows(
+                            connection,
+                            table,
+                            data[table],
+                            v053_columns[table],
+                            merge=mode == "merge",
+                        )
+                self._initialize_v053_rows(connection)
                 if mode == "replace":
                     self._import_rows(
                         connection,
@@ -16248,6 +18343,7 @@ class TavernDatabase:
                 self._initialize_vnext_rows(connection)
                 self._initialize_v05_rows(connection)
                 self._initialize_v051_rows(connection)
+                self._initialize_v053_rows(connection)
                 self._insert_audit(
                     connection,
                     "",
@@ -16376,6 +18472,7 @@ class TavernDatabase:
                     "operation_receipts": "operation_id",
                     "group_registry": "id",
                     "story_storage": "session_id",
+                    "timer_policies": "session_id",
                 }.get(table, "id")
                 if identity_column not in row:
                     raise ValueError(

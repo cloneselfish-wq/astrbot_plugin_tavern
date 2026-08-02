@@ -1,8 +1,8 @@
-# v0.5.1 Alpha 升级与存档说明
+# v0.6.0 升级与存档说明
 
 ## 结论
 
-v0.1—v0.5.0 Beta 的 SQLite 数据可以直接升级到 v0.5.1 Alpha，不需要清空旧存档。插件会先建立一致迁移备份，再升级到 Schema 5，并为每个群、每轮故事副本建立独立目录与数据库。
+v0.1—v0.5.3 Alpha.1 的 SQLite 数据可以直接升级到 v0.6.0，不需要清空旧存档。插件会先建立一致迁移备份，再升级或保持在 Schema 6，并为每个群、每轮故事副本保留独立目录与数据库。
 
 以下数据继续保留：
 
@@ -13,9 +13,9 @@ v0.1—v0.5.0 Beta 的 SQLite 数据可以直接升级到 v0.5.1 Alpha，不需�
 - 命名存档、自动快照和单回合回滚点
 - 0.4 的准备阵容、选项、投票、计时、代控、封禁与返场流程
 
-0.5.1 新增的群备注、目录索引和副本文件同步状态会以安全默认值补齐；0.5.0 的副本规则状态、动态 NPC、账本、时钟、记忆治理、灵感及操作回执全部保留。
+0.5.3 新增的倒计时策略、Token 流水和 Token 配额会以安全默认值补齐；0.5.2 及更早版本的群备注、目录索引、副本文件、规则状态、动态 NPC、账本、时钟、记忆治理、灵感及操作回执全部保留。
 
-## Schema 5 存储布局
+## Schema 6 存储布局
 
 ```text
 astrbot_plugin_tavern/
@@ -88,7 +88,7 @@ backup_legacy_tavern_YYYYMMDDHHMMSS.sqlite3
 2. 停止 AstrBot。
 3. 复制整个 `AstrBot/data/plugin_data/astrbot_plugin_tavern/`。
 4. 保存旧版插件 ZIP 或代码目录。
-5. 安装 v0.5.1 Alpha ZIP。
+5. 安装 v0.6.0 ZIP。
 6. 启动 AstrBot，确认日志中的迁移备份路径。
 7. 打开酒馆控制台，检查配置修订、模型选择器和模型链健康。
 8. 逐一检查世界、角色卡模板、群会话卡片、阵容、NPC、记忆和存档。
@@ -110,20 +110,20 @@ backup_legacy_tavern_YYYYMMDDHHMMSS.sqlite3
 
 ## 回退到旧版
 
-旧版插件不能读取 Schema 5。要完整回退，必须同时恢复：
+旧版插件不能读取 Schema 6。要完整回退，必须同时恢复：
 
 1. 旧版插件代码；以及
 2. 升级前复制的整个数据目录，或 `backup_catalog_*.sqlite3` / `backup_legacy_tavern_*.sqlite3`。
 
-不要只降级代码并继续使用 Schema 5 数据库。
+不要只降级代码并继续使用 Schema 6 数据库。
 
 推荐停机恢复。替换单个 `.sqlite3` 前，应一并移走同名 `-wal` 和 `-shm`，避免把另一份数据库的 WAL 错配到恢复文件。
 
 ## ZIP 与 JSON 备份兼容
 
-- Schema 1—4 JSON 备份仍可导入，并自动补齐 Schema 5 的目录索引。
-- Schema 5 完整 ZIP 内含 `bundle.json`，继续使用既有安全合并与覆盖恢复规则。
-- Schema 5 导出额外包含群备注、目录清单和副本同步状态。
+- Schema 1—5 JSON 备份仍可导入，并自动补齐 Schema 6 的目录索引、倒计时策略与 Token 表。
+- Schema 6 完整 ZIP 内含 `bundle.json`，继续使用既有安全合并与覆盖恢复规则。
+- Schema 6 导出额外包含群备注、目录清单、副本同步状态、倒计时策略、Token 流水与配额。
 - 导入 ZIP 时会先校验全部 SHA-256、拒绝路径穿越、符号链接、重复成员和异常解压体积，再提交数据库恢复。
 - 活动副本数据库与清单由 `bundle.json` 重新物化；`saves/` 和 `backups/` 中的独立恢复文件也会一并还原。
 - 备份内记录的 `relative_path` 不会被直接采用；物理目录始终由受校验的群与副本身份重新计算。
@@ -139,7 +139,7 @@ backup_legacy_tavern_YYYYMMDDHHMMSS.sqlite3
 - 备份来自更新 Schema
 - 手工改库造成唯一键或外键冲突
 - JSON 备份的同一稳定 ID 指向不同对象
-- 声称为 Schema 5 的备份缺少群目录或副本存储索引表
+- 声称为 Schema 6 的备份缺少群目录、副本存储索引、倒计时或 Token 表
 
 迁移备份失败后，插件不会继续修改旧数据库。
 

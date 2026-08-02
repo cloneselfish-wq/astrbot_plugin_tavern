@@ -80,6 +80,7 @@ class TavernConfig:
     two_phase_checks: bool = True
     max_input_chars: int = 2000
     max_output_chars: int = 5000
+    enforce_mobile_output: bool = False
     recent_turns: int = 12
     memory_limit: int = 10
     user_cooldown_seconds: float = 1.5
@@ -93,6 +94,11 @@ class TavernConfig:
     store_model_payloads: bool = False
     debug: bool = False
 
+    rich_cards_enabled: bool = True
+    rich_card_mode: str = "auto"  # auto | markdown | ark | text
+    # 留空 = 自动取当前正在游玩的副本 / 世界名作为卡片标题。
+    rich_card_title: str = ""
+
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any] | None) -> "TavernConfig":
         root = _mapping(raw)
@@ -100,6 +106,7 @@ class TavernConfig:
         model = _mapping(root.get("model"))
         runtime = _mapping(root.get("runtime"))
         advanced = _mapping(root.get("advanced"))
+        rich = _mapping(root.get("rich"))
 
         behavior = str(
             security.get("unauthorized_command_behavior", "silent")
@@ -194,6 +201,9 @@ class TavernConfig:
             max_output_chars=_bounded_int(
                 runtime.get("max_output_chars"), 5000, 500, 20000
             ),
+            enforce_mobile_output=bool(
+                runtime.get("enforce_mobile_output", True)
+            ),
             recent_turns=_bounded_int(
                 runtime.get("recent_turns"), 12, 2, 50
             ),
@@ -215,6 +225,15 @@ class TavernConfig:
                 advanced.get("store_model_payloads", False)
             ),
             debug=bool(advanced.get("debug", False)),
+            rich_cards_enabled=bool(rich.get("enabled", True)),
+            rich_card_mode=(
+                str(rich.get("mode", "auto")).strip().lower()
+                if str(rich.get("mode", "auto")).strip().lower()
+                in {"auto", "markdown", "ark", "text"}
+                else "auto"
+            ),
+            # 留空即自动跟随当前副本 / 世界名，不再回填固定文案。
+            rich_card_title=str(rich.get("title", "") or "").strip(),
         )
 
     def is_admin(self, sender_id: str) -> bool:
@@ -268,6 +287,7 @@ class TavernConfig:
                 "two_phase_checks": self.two_phase_checks,
                 "max_input_chars": self.max_input_chars,
                 "max_output_chars": self.max_output_chars,
+                "enforce_mobile_output": self.enforce_mobile_output,
                 "recent_turns": self.recent_turns,
                 "memory_limit": self.memory_limit,
                 "user_cooldown_seconds": self.user_cooldown_seconds,

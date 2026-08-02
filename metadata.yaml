@@ -1,12 +1,14 @@
 name: astrbot_plugin_tavern
 display_name: "AI 酒馆 · 多人跑团叙事引擎"
-desc: "AI 主持的多人群聊跑团与互动叙事插件：角色卡、四选一、优劣势 D20、团队决策、动态 NPC、群与副本独立存档、检索及永久归档。"
-short_desc: "多人跑团、独立副本存档、群检索与角色卡模板管理。"
-help: "配置管理员 ID 后使用 /酒馆 开启 <副本> 进入准备大厅；玩家完成私聊建卡并准备后，由主持人 /酒馆 开演。回合使用 /酒馆 选择 A/B/C/D，可用 /酒馆 灵感 A 或 /酒馆 灵感重投 A。"
+desc: "AI 主持的多人群聊跑团与互动叙事插件：角色卡、四选一、优劣势 D20、剧情分支恢复、Token 配额、独立存档与只读归档。"
+short_desc: "多人跑团、剧情恢复、Token 配额与独立副本存档管理。"
+help: "配置管理员 ID 后使用 /酒馆 开启 <副本> 进入准备大厅；新副本使用 /酒馆 开演，已有进度使用 /酒馆 继续。回合使用 /酒馆 选择 A/B/C/D。"
 author: "AI Tavern Project"
-version: v0.5.2-alpha
+version: v0.7.0
 astrbot_version: ">=4.26,<5"
 support_platforms:
   - aiocqhttp
   - qq_official
   - qq_official_webhook
+  - qq_restapi
+  - qq_restapi_webhook

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import logging
+import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, replace
 from typing import Any
@@ -16,7 +18,7 @@ from .events import EventBroker
 from .lifecycle import (
     fallback_choices,
     format_choices,
-    normalize_choices,
+    normalize_choices_compat,
 )
 from .prompts import (
     checked_resolution_prompt,
@@ -36,6 +38,10 @@ from .resolution import (
     validate_resolution,
 )
 from .security import RateLimiter, clean_text
+from .world_contract import world_contract
+
+
+logger = logging.getLogger(__name__)
 
 
 class TavernEngineError(RuntimeError):
@@ -70,6 +76,8 @@ class EngineReply:
     dice: DiceResult | None = None
     ooc: bool = False
     turn: dict[str, Any] | None = None
+    story_text: str = ""
+    turn_text: str = ""
 
 
 class TavernEngine:
@@ -96,6 +104,246 @@ class TavernEngine:
                 lock = asyncio.Lock()
                 self._locks[session_id] = lock
             return lock
+
+    @staticmethod
+    def _usage_value(source: Any, *names: str) -> int:
+        for name in names:
+            if isinstance(source, Mapping):
+                value = source.get(name)
+            else:
+                value = getattr(source, name, None)
+            try:
+                if value is not None:
+                    return max(0, int(value))
+            except (TypeError, ValueError, OverflowError):
+                continue
+        return 0
+
+    @classmethod
+    def _response_usage(
+        cls,
+        response: Any,
+        *,
+        prompt: str,
+        system: str,
+    ) -> tuple[int, int, int, str]:
+        usage = (
+            getattr(response, "usage", None)
+            or getattr(response, "token_usage", None)
+            or getattr(response, "usage_metadata", None)
+        )
+        input_tokens = cls._usage_value(
+            usage,
+            "input_tokens",
+            "prompt_tokens",
+            "input",
+            "input_other",
+        )
+        cached = cls._usage_value(
+            usage,
+            "cached_input_tokens",
+            "input_cached_tokens",
+            "cache_read_input_tokens",
+            "input_cached",
+        )
+        output_tokens = cls._usage_value(
+            usage,
+            "output_tokens",
+            "completion_tokens",
+            "output",
+        )
+        if input_tokens or output_tokens:
+            return input_tokens, cached, output_tokens, "provider"
+        completion = str(
+            getattr(response, "completion_text", "") or ""
+        )
+        estimated_input = max(
+            1,
+            (len(str(prompt or "")) + len(str(system or "")) + 1) // 2,
+        )
+        estimated_output = max(1, (len(completion) + 1) // 2)
+        return estimated_input, 0, estimated_output, "estimated"
+
+    async def _llm_generate_metered(
+        self,
+        *,
+        session_id: str,
+        request_type: str,
+        provider_id: str,
+        prompt: str,
+        system_prompt_value: str = "",
+        max_tokens: int,
+        **kwargs: Any,
+    ) -> Any:
+        expected_input = max(
+            1,
+            len(str(prompt or ""))
+            + len(str(system_prompt_value or "")),
+        )
+        reservation = await self.database.reserve_token_usage(
+            session_id,
+            request_type,
+            provider_id,
+            expected_input + max(1, int(max_tokens)),
+        )
+        try:
+            response = await self.context.llm_generate(
+                chat_provider_id=provider_id,
+                prompt=prompt,
+                system_prompt=system_prompt_value or None,
+                max_tokens=max_tokens,
+                **kwargs,
+            )
+        except Exception:
+            await self.database.fail_token_usage(reservation["id"])
+            raise
+        input_tokens, cached, output_tokens, source = self._response_usage(
+            response,
+            prompt=prompt,
+            system=system_prompt_value,
+        )
+        await self.database.settle_token_usage(
+            reservation["id"],
+            input_tokens=input_tokens,
+            cached_input_tokens=cached,
+            output_tokens=output_tokens,
+            usage_source=source,
+        )
+        return response
+
+    @staticmethod
+    def _visible_length(value: str) -> int:
+        return len(re.sub(r"\s+", "", str(value or "")))
+
+    @classmethod
+    def _validate_mobile_resolution(
+        cls,
+        resolution: Resolution,
+        *,
+        expected_actor: Mapping[str, Any] | None,
+        roster: Sequence[Mapping[str, Any]],
+    ) -> Resolution:
+        if resolution.mode == "resolve":
+            length = cls._visible_length(resolution.narrative)
+            if length < 100 or length > 300:
+                raise ValueError(
+                    f"故事正文必须为 100—300 字，当前为 {length} 字"
+                )
+        if not resolution.next_choices:
+            return resolution
+        normalized = cls._validate_choices_for_actor(
+            resolution.next_choices,
+            expected_actor=expected_actor,
+            roster=roster,
+        )
+        return replace(resolution, next_choices=tuple(normalized))
+
+    @classmethod
+    def _validate_choices_for_actor(
+        cls,
+        choices: Sequence[Mapping[str, Any]],
+        *,
+        expected_actor: Mapping[str, Any] | None,
+        roster: Sequence[Mapping[str, Any]],
+    ) -> list[dict[str, Any]]:
+        expected_id = str(
+            (expected_actor or {}).get("id")
+            or (expected_actor or {}).get("participant_id")
+            or ""
+        )
+        expected_name = str(
+            (expected_actor or {}).get("character_name")
+            or (expected_actor or {}).get("display_name")
+            or ""
+        )
+        if not expected_id:
+            return [dict(item) for item in choices]
+        other_names = {
+            str(
+                item.get("character_name")
+                or item.get("display_name")
+                or ""
+            ).strip()
+            for item in roster
+            if isinstance(item, Mapping)
+            and str(item.get("id") or "") != expected_id
+        }
+        other_names.discard("")
+        control_words = ("让", "命令", "迫使", "替", "控制", "要求")
+        normalized: list[dict[str, Any]] = []
+        for item in choices:
+            option = dict(item)
+            actor_id = str(option.get("actor_id") or "").strip()
+            if actor_id and actor_id != expected_id:
+                raise ValueError(
+                    "行动选项 actor_id 与下一位行动角色不一致"
+                )
+            option["actor_id"] = expected_id
+            text = str(option.get("text") or "")
+            if cls._visible_length(text) > 50:
+                raise ValueError("行动选项不得超过 50 字")
+            for name in other_names:
+                if any(
+                    marker + name in text
+                    for marker in control_words
+                ) or text.startswith(name + "决定"):
+                    raise ValueError(
+                        f"选项越权操控了其他玩家角色 {name}"
+                    )
+            if expected_name and text.startswith(expected_name + "让"):
+                # “自己让别人执行”仍然是替他人决定行动。
+                raise ValueError("选项不能借当前角色回合操控他人")
+            normalized.append(option)
+        return normalized
+
+    @staticmethod
+    def _next_actor(
+        turn: Mapping[str, Any],
+        roster: Sequence[Mapping[str, Any]],
+    ) -> dict[str, Any]:
+        raw_order = turn.get("order")
+        order = [
+            str(item.get("user_id") or "")
+            for item in raw_order
+            if isinstance(item, Mapping) and item.get("user_id")
+        ] if isinstance(raw_order, list) else []
+        current = str(turn.get("current_user_id") or "")
+        if not order:
+            return {}
+        if current in order and len(order) > 1:
+            next_user = order[(order.index(current) + 1) % len(order)]
+        else:
+            next_user = current or order[0]
+        item = next(
+            (
+                dict(entry)
+                for entry in roster
+                if str(entry.get("group_user_id") or "") == next_user
+            ),
+            {},
+        )
+        if not item:
+            return {"group_user_id": next_user}
+        return {
+            "participant_id": item.get("id"),
+            "id": item.get("id"),
+            "group_user_id": item.get("group_user_id"),
+            "character_name": item.get("character_name"),
+            "character_code": item.get("character_code"),
+            "display_name": item.get("display_name"),
+            "profile": item.get("card_profile", {}),
+            "stats": item.get("card_stats", {}),
+            "runtime_state": item.get("runtime_state", {}),
+        }
+
+    @staticmethod
+    def _format_story_paragraphs(value: str) -> str:
+        paragraphs = [
+            part.strip()
+            for part in re.split(r"(?:\r?\n){1,}", str(value or ""))
+            if part.strip() and part.strip("-") != ""
+        ]
+        return "\n\n-----------\n\n".join(paragraphs)
 
     @staticmethod
     def _provider_order(
@@ -259,7 +507,7 @@ class TavernEngine:
                 for item in dice.members
             ]
             header = (
-                f"【{stat}·{mode_labels.get(dice.dice_mode, dice.dice_mode)}"
+                f"🎲【{stat}·{mode_labels.get(dice.dice_mode, dice.dice_mode)}"
                 f"检定】{dice.total}/{dice.difficulty} 人达标 · "
                 f"{result_label}"
             )
@@ -272,7 +520,7 @@ class TavernEngine:
         )
         modifier = f"{dice.modifier:+d}"
         header = (
-            f"【{stat}检定】"
+            f"🎲【{stat}检定】"
             f"［{mode_labels.get(dice.dice_mode, dice.dice_mode)}］"
             f"{pool} {modifier} → {dice.total}"
         )
@@ -410,6 +658,7 @@ class TavernEngine:
         self,
         *,
         event: Any,
+        session_id: str,
         config: TavernConfig,
     ) -> str:
         image_urls = await self._image_references(
@@ -425,8 +674,10 @@ class TavernEngine:
             )
         try:
             response = await asyncio.wait_for(
-                self.context.llm_generate(
-                    chat_provider_id=config.image_caption_provider_id,
+                self._llm_generate_metered(
+                    session_id=session_id,
+                    request_type="image_caption",
+                    provider_id=config.image_caption_provider_id,
                     prompt=(
                         f"{config.image_caption_prompt}\n\n"
                         f"共 {len(image_urls)} 张图片，请按“图1、图2……”"
@@ -628,6 +879,8 @@ class TavernEngine:
             raise TavernEngineError("本回合的免费重整次数已经用完")
         config = self.config_provider()
         session = await self.database.get_session(session_id)
+        if session["state"] != "running":
+            raise TavernEngineError("酒馆当前不在运行状态，无法重整选项")
         roster = await self.database.list_roster(session_id)
         rich_participant = next(
             (
@@ -657,6 +910,7 @@ class TavernEngine:
             events=events,
             config=config,
             avoid=choice_set["choices"],
+            roster=roster,
         )
         result = await self.database.replace_active_choices(
             session_id,
@@ -777,6 +1031,7 @@ class TavernEngine:
 
             image_caption = await self._caption_images(
                 event=event,
+                session_id=session_id,
                 config=config,
             )
             player_input = text
@@ -838,6 +1093,7 @@ class TavernEngine:
             session["players"] = players
             session["roster"] = roster
             session["turn_status"] = turn
+            session["next_actor"] = self._next_actor(turn, roster)
             session["return_requests"] = await self.database.list_return_requests(
                 session_id
             )
@@ -908,14 +1164,22 @@ class TavernEngine:
                 player_input=player_input,
                 events=events,
                 memories=memories,
-                allow_checks=config.two_phase_checks,
+                allow_checks=(config.two_phase_checks and world_contract(world)["resolution"]["mode"] in {"dice_only", "attribute"}),
                 workflow=workflow,
             )
             resolution, used_provider_id = await self._generate_resolution(
+                session_id=session_id,
+                request_type="story_plan",
+                world=world,
                 provider_ids=provider_ids,
                 system=system,
                 prompt=first_prompt,
                 config=config,
+                expected_actor=session["next_actor"],
+                roster=roster,
+                enforce_mobile_limits=bool(
+                    workflow and config.enforce_mobile_output
+                ),
             )
 
             dice: DiceResult | None = None
@@ -967,10 +1231,10 @@ class TavernEngine:
                     or "通用"
                 )
                 authoritative = await self.database.authoritative_modifier(
-                    session_id,
-                    sender_id,
-                    effective_stat,
+                    session_id, sender_id, effective_stat,
                 )
+                if world_contract(world)["resolution"]["mode"] == "attribute" and not authoritative.get("matched"):
+                    raise TavernEngineError(f"检定属性“{effective_stat}”不属于当前世界或角色卡，本轮没有投骰")
                 check_context = await self.database.check_context(
                     session_id,
                     sender_id,
@@ -1178,15 +1442,31 @@ class TavernEngine:
                 )
                 resolution, used_provider_id = (
                     await self._generate_resolution(
+                        session_id=session_id,
+                        request_type="story_checked",
+                        world=world,
                         provider_ids=second_stage_providers,
                         system=system,
                         prompt=check_prompt,
                         config=config,
+                        expected_actor=session["next_actor"],
+                        roster=roster,
+                        enforce_mobile_limits=bool(
+                            workflow and config.enforce_mobile_output
+                        ),
                     )
                 )
                 if resolution.mode != "resolve":
                     raise TavernEngineError("模型未完成检定后的最终裁定")
 
+            new_state = (
+                dict(session.get("world_state") or {})
+                if resolution.group_decision
+                else apply_state_patch(
+                    session.get("world_state"),
+                    resolution.state_patch,
+                )
+            )
             if workflow:
                 if workflow.get("requires_check") and first_mode != "check":
                     raise TavernEngineError(
@@ -1201,23 +1481,44 @@ class TavernEngine:
                         "该选项影响全队，但模型没有生成集体表决；"
                         "为避免单人越权，本轮没有提交"
                     )
-                if (
-                    not resolution.next_choices
-                    and not resolution.group_decision
-                ):
+                if resolution.group_decision:
+                    resolution = replace(
+                        resolution,
+                        next_choices=(),
+                    )
+                else:
+                    expected_id = str(
+                        session["next_actor"].get("id")
+                        or session["next_actor"].get("participant_id")
+                        or ""
+                    )
+                    next_participant = next(
+                        (
+                            item
+                            for item in roster
+                            if str(item.get("id") or "") == expected_id
+                        ),
+                        session["next_actor"],
+                    )
+                    resolution = await self._ensure_next_choices(
+                        resolution=resolution,
+                        provider_ids=self._provider_order(
+                            used_provider_id,
+                            tuple(provider_ids),
+                        ),
+                        world=world,
+                        session=session,
+                        participant=next_participant,
+                        roster=roster,
+                        events=events,
+                        candidate_state=new_state,
+                        config=config,
+                    )
+                if not resolution.next_choices and not resolution.group_decision:
                     raise TavernEngineError(
                         "模型未生成下一位玩家的 A/B/C/D 选项；"
                         "本轮没有提交"
                     )
-
-            new_state = (
-                dict(session.get("world_state") or {})
-                if resolution.group_decision
-                else apply_state_patch(
-                    session.get("world_state"),
-                    resolution.state_patch,
-                )
-            )
             normalized_memories = []
             for memory in resolution.memories:
                 entry = dict(memory)
@@ -1310,7 +1611,8 @@ class TavernEngine:
                 }
             )
             next_turn = await self.database.get_turn_status(session_id)
-            output = narrative
+            story_body = self._format_story_paragraphs(narrative)
+            story_output = "📖 【故事推进】\n\n" + story_body
             if dice:
                 stat = (
                     check_payload.get("stat", "通用")
@@ -1318,10 +1620,10 @@ class TavernEngine:
                     else "通用"
                 )
                 dice_text = self._format_dice_result(dice, stat)
-                output = (
-                    f"{dice_text}\n\n{narrative}"
+                story_output = (
+                    f"{dice_text}\n\n📖 【故事推进】\n\n{story_body}"
                     if dice_text
-                    else narrative
+                    else f"📖 【故事推进】\n\n{story_body}"
                 )
             current_name = (
                 next_turn["current_name"]
@@ -1336,31 +1638,31 @@ class TavernEngine:
             vote_pending = bool(workflow_result.get("vote_id"))
             if vote_pending:
                 turn_footer = (
-                    f"【回合秩序】{current_name} 的行动权已挂起 · "
+                    f"⚔️ 【回合秩序】{current_name} 的行动权已挂起 · "
                     "集体投票不消耗本次机会"
                 )
             elif len(next_turn["order"]) > 1:
                 if next_turn["round_no"] > acting_round:
                     turn_footer = (
-                        f"【回合秩序】第 {acting_round} 轮结束 · "
+                        f"⚔️ 【回合秩序】第 {acting_round} 轮结束 · "
                         f"第 {next_turn['round_no']} 轮：{current_name}"
                     )
                 else:
                     turn_footer = (
-                        f"【回合秩序】第 {acting_round} 轮 · "
+                        f"⚔️ 【回合秩序】第 {acting_round} 轮 · "
                         f"下一位：{current_name}"
                     )
             else:
                 turn_footer = (
-                    f"【回合秩序】第 {next_turn['round_no']} 轮 · "
+                    f"⚔️ 【回合秩序】第 {next_turn['round_no']} 轮 · "
                     f"当前：{current_name}"
                 )
-            output = f"{output}\n\n{turn_footer}"
+            turn_output = turn_footer
             if commit_workflow:
                 world_event = workflow_result.get("world_event")
                 if world_event:
-                    output += (
-                        "\n\n【世界脉冲】"
+                    turn_output += (
+                        "\n\n🌐 【世界脉冲】"
                         f"{world_event.get('title') or '局势变化'}\n"
                         f"{world_event.get('description')}"
                     )
@@ -1369,24 +1671,24 @@ class TavernEngine:
                     vote = await self.database.active_vote(session_id)
                     if vote:
                         vote_lines = [
-                            "【集体决策】",
+                            "🗳️ 【集体决策】",
                             vote["question"],
                             *[
                                 f"{item.get('key')}. {item.get('text')}"
                                 for item in vote["options"]
                             ],
                             "",
-                            "发送：/酒馆 投票 A",
+                            "💬 发送：/酒馆 投票 A",
                             "投票期间不消耗当前玩家的行动机会。",
                         ]
-                        output += "\n\n" + "\n".join(vote_lines)
+                        turn_output += "\n\n" + "\n".join(vote_lines)
                 else:
                     next_choice = await self.database.active_choice_set(
                         session_id
                     )
                     if next_choice and next_choice.get("participant"):
                         next_actor = next_choice["participant"]
-                        output += "\n\n" + format_choices(
+                        turn_output += "\n\n" + format_choices(
                             next_actor["character_name"]
                             or next_actor["display_name"],
                             next_choice["choices"],
@@ -1395,11 +1697,120 @@ class TavernEngine:
                             ),
                         )
             return EngineReply(
-                text=output,
+                text=f"{story_output}\n\n{turn_output}",
                 session=updated_session,
                 dice=dice,
                 turn=next_turn,
+                story_text=story_output,
+                turn_text=turn_output,
             )
+
+    async def _ensure_next_choices(
+        self,
+        *,
+        resolution: Resolution,
+        provider_ids: Sequence[str],
+        world: Mapping[str, Any],
+        session: Mapping[str, Any],
+        participant: Mapping[str, Any],
+        roster: Sequence[Mapping[str, Any]],
+        events: Sequence[Mapping[str, Any]],
+        candidate_state: Mapping[str, Any],
+        config: TavernConfig,
+    ) -> Resolution:
+        raw_choices = resolution.raw.get("next_choices")
+        validation_error = str(
+            resolution.raw.get("_next_choices_error") or ""
+        )
+        if resolution.next_choices:
+            choices = self._validate_choices_for_actor(
+                resolution.next_choices,
+                expected_actor=participant,
+                roster=roster,
+            )
+            return replace(
+                resolution,
+                next_choices=tuple(choices),
+            )
+
+        if raw_choices is not None:
+            try:
+                choices = normalize_choices_compat(raw_choices, world)
+                choices = self._validate_choices_for_actor(
+                    choices,
+                    expected_actor=participant,
+                    roster=roster,
+                )
+                return replace(
+                    resolution,
+                    next_choices=tuple(choices),
+                )
+            except (TypeError, ValueError) as exc:
+                validation_error = str(exc)
+        elif not validation_error:
+            validation_error = "模型未提供 next_choices"
+
+        avoid = (
+            [
+                dict(item)
+                for item in raw_choices
+                if isinstance(item, Mapping)
+            ]
+            if isinstance(raw_choices, Sequence)
+            and not isinstance(raw_choices, (str, bytes))
+            else []
+        )
+        choice_session = dict(session)
+        choice_session["world_state"] = dict(candidate_state)
+        recovery_method = "model"
+        try:
+            choices = await self._generate_choices(
+                provider_ids=provider_ids,
+                world=world,
+                session=choice_session,
+                participant=participant,
+                roster=roster,
+                events=events,
+                config=config,
+                avoid=avoid,
+                request_type="story_choices",
+                validation_error=validation_error,
+                story_context=resolution.narrative,
+            )
+        except TavernEngineError as exc:
+            recovery_method = "fallback"
+            logger.warning(
+                "AI 酒馆选项专用修复失败，已使用安全兜底："
+                "session=%s initial_error=%s repair_error=%s",
+                session.get("id") or "",
+                validation_error,
+                exc,
+            )
+            choices = fallback_choices(candidate_state, world)
+            expected_actor_id = str(
+                participant.get("id")
+                or participant.get("participant_id")
+                or ""
+            )
+            for choice in choices:
+                choice["actor_id"] = expected_actor_id
+            choices = self._validate_choices_for_actor(
+                choices,
+                expected_actor=participant,
+                roster=roster,
+            )
+
+        raw_payload = dict(resolution.raw)
+        raw_payload["next_choices"] = [dict(item) for item in choices]
+        raw_payload["_choice_recovery"] = {
+            "method": recovery_method,
+            "validation_error": validation_error,
+        }
+        return replace(
+            resolution,
+            next_choices=tuple(choices),
+            raw=raw_payload,
+        )
 
     async def _generate_choices(
         self,
@@ -1411,15 +1822,54 @@ class TavernEngine:
         events: Sequence[Mapping[str, Any]],
         config: TavernConfig,
         avoid: Sequence[Mapping[str, Any]] = (),
+        roster: Sequence[Mapping[str, Any]] = (),
+        request_type: str = "choice_reroll",
+        validation_error: str = "",
+        story_context: str = "",
     ) -> list[dict[str, Any]]:
+        contract = world_contract(world)
+        resolution_mode = str(contract["resolution"]["mode"])
+        if resolution_mode in {"none", "narrative"}:
+            check_rule = (
+                "当前世界不启用程序检定；四项 check 必须全部为 null，"
+                "不得生成检定属性、难度或骰点请求；"
+            )
+            checked_example = '"check":null'
+        elif resolution_mode == "dice_only":
+            check_rule = (
+                "当前世界使用纯骰检定；需要检定时提交结构化 check，"
+                "attribute_id 必须为空；"
+            )
+            checked_example = (
+                '"check":{"required":true,"attribute_id":"",'
+                '"type":"standard","difficulty":12}'
+            )
+        else:
+            attribute_lines = "、".join(
+                f"{item.get('key')}={item.get('label')}"
+                for item in contract["attributes"]
+            )
+            check_rule = (
+                "需要检定时提交结构化 check，其 attribute_id 只能使用："
+                f"{attribute_lines}；"
+            )
+            checked_example = (
+                '"check":{"required":true,"attribute_id":"perception",'
+                '"type":"standard","difficulty":12,'
+                '"known_consequences":"可能错过最佳时机"}'
+            )
         prompt = (
             "只生成当前角色在当前场景可选的四个行动意图。"
             "返回单个 JSON 对象，字段名 choices。"
             "必须恰好包含 A、B、C、D，至少一个 safe 风险；"
+            "每项必须填写 actor_id，且必须等于 acting_character.id；"
+            "每个选项正文最多 50 字，正文禁止自带风险或检定括号；只能描述当前角色本人"
+            "能够尝试的行为，不得替其他玩家角色说话、移动、使用能力、"
+            "消耗物品、同意或决定；"
             "不得预设成功，不得添加角色没有的能力、物品或知识；"
             "风险使用 safe/controlled/dangerous/desperate/lethal；"
-            "需要检定时同时给出 check_type、check_stat、difficulty、"
-            "known_consequences 以及已经成立的优劣势来源；"
+            "危险度与是否检定相互独立；"
+            f"{check_rule}"
             "致命风险必须明确可能后果，同一原因不能同时提高 DC 和造成劣势；"
             "影响全队的转场、主线分支、共有资源或不可逆决定，"
             "只能标记 collective=true，不能替队伍决定。\n\n"
@@ -1428,54 +1878,105 @@ class TavernEngine:
             f"<acting_character>{dict(participant)}</acting_character>\n"
             f"<recent_history>{list(events)[-12:]}</recent_history>\n"
             f"<avoid_repeating>{list(avoid)}</avoid_repeating>\n"
+            f"<resolved_story>{story_context}</resolved_story>\n"
+            f"<previous_choice_error>{validation_error}</previous_choice_error>\n"
             "格式示例："
-            '{"choices":[{"key":"A","text":"...","risk":"safe",'
-            '"requires_check":false,"collective":false,"difficulty":12},'
-            '{"key":"B","text":"...","risk":"controlled",'
-            '"requires_check":true,"collective":false,"check_type":"standard",'
-            '"check_stat":"敏捷","difficulty":12,"known_consequences":"..."},'
-            '{"key":"C","text":"...","risk":"controlled",'
-            '"requires_check":false,"collective":false},'
-            '{"key":"D","text":"...","risk":"dangerous",'
-            '"requires_check":true,"collective":true}]}'
+            '{"choices":[{"key":"A","actor_id":"...",'
+            '"text":"...","danger_id":"safe","check":null,'
+            '"collective":false},{"key":"B","actor_id":"...",'
+            '"text":"...","danger_id":"controlled",'
+            f'{checked_example},"collective":false}},'
+            '{"key":"C","actor_id":"...","text":"...",'
+            '"danger_id":"controlled","check":null,"collective":false},'
+            '{"key":"D","actor_id":"...","text":"...",'
+            '"danger_id":"safe","check":null,"collective":false}]}'
         )
         failures: list[str] = []
+        attempts = config.json_repair_attempts + 1
         for provider_id in provider_ids:
-            try:
-                response = await asyncio.wait_for(
-                    self.context.llm_generate(
-                        chat_provider_id=provider_id,
-                        prompt=prompt,
-                        system_prompt=system_prompt(world),
-                        temperature=config.temperature,
-                        max_tokens=min(config.max_tokens, 1200),
+            current_prompt = prompt
+            last_error = ""
+            timed_out = False
+            for attempt in range(attempts):
+                try:
+                    response = await asyncio.wait_for(
+                        self._llm_generate_metered(
+                            session_id=str(session.get("id") or ""),
+                            request_type=(
+                                request_type
+                                if attempt == 0
+                                else request_type + "_repair"
+                            ),
+                            provider_id=provider_id,
+                            prompt=current_prompt,
+                            system_prompt_value=system_prompt(world),
+                            temperature=config.temperature,
+                            max_tokens=min(config.max_tokens, 1200),
+                        ),
+                        timeout=config.request_timeout_seconds,
+                    )
+                except TimeoutError:
+                    failures.append(f"{provider_id}：请求超时")
+                    await self.database.record_provider_result(
+                        provider_id,
+                        success=False,
+                        reason="选项生成请求超时",
+                    )
+                    timed_out = True
+                    break
+                except Exception as exc:
+                    failures.append(
+                        f"{provider_id}：{type(exc).__name__}"
+                    )
+                    await self.database.record_provider_result(
+                        provider_id,
+                        success=False,
+                        reason=(
+                            "选项生成调用失败："
+                            f"{type(exc).__name__}: {exc}"
+                        ),
+                    )
+                    timed_out = True
+                    break
+                raw = str(
+                    getattr(response, "completion_text", "") or ""
+                )
+                try:
+                    payload = extract_json_object(raw)
+                    choices = normalize_choices_compat(
+                        payload.get("choices", payload.get("next_choices")), world
+                    )
+                    choices = self._validate_choices_for_actor(
+                        choices,
+                        expected_actor=participant,
+                        roster=roster,
+                    )
+                    await self.database.record_provider_result(
+                        provider_id,
+                        success=True,
+                    )
+                    return choices
+                except (TypeError, ValueError) as exc:
+                    last_error = str(exc)
+                    if attempt + 1 >= attempts:
+                        break
+                    current_prompt = repair_prompt(
+                        raw,
+                        last_error,
+                        prompt,
+                    )
+            if not timed_out:
+                failures.append(
+                    f"{provider_id}：结构校验失败"
+                    f"（{last_error or '未知错误'}）"
+                )
+                await self.database.record_provider_result(
+                    provider_id,
+                    success=False,
+                    reason=(
+                        "选项生成结构校验失败："
+                        f"{last_error or '未知错误'}"
                     ),
-                    timeout=config.request_timeout_seconds,
-                )
-                payload = extract_json_object(
-                    str(getattr(response, "completion_text", "") or "")
-                )
-                choices = normalize_choices(
-                    payload.get("choices", payload.get("next_choices"))
-                )
-                await self.database.record_provider_result(
-                    provider_id,
-                    success=True,
-                )
-                return choices
-            except TimeoutError:
-                failures.append(f"{provider_id}：请求超时")
-                await self.database.record_provider_result(
-                    provider_id,
-                    success=False,
-                    reason="选项生成请求超时",
-                )
-            except Exception as exc:
-                failures.append(f"{provider_id}：{exc}")
-                await self.database.record_provider_result(
-                    provider_id,
-                    success=False,
-                    reason=f"选项生成失败：{type(exc).__name__}: {exc}",
                 )
         raise TavernEngineError(
             "未能生成一组合法的新选项："
@@ -1485,10 +1986,16 @@ class TavernEngine:
     async def _generate_resolution(
         self,
         *,
+        session_id: str,
+        request_type: str,
+        world: Mapping[str, Any],
         provider_ids: list[str],
         system: str,
         prompt: str,
         config: TavernConfig,
+        expected_actor: Mapping[str, Any] | None = None,
+        roster: Sequence[Mapping[str, Any]] = (),
+        enforce_mobile_limits: bool = False,
     ) -> tuple[Resolution, str]:
         attempts = config.json_repair_attempts + 1
         original_prompt = prompt
@@ -1500,10 +2007,16 @@ class TavernEngine:
             for attempt in range(attempts):
                 try:
                     response = await asyncio.wait_for(
-                        self.context.llm_generate(
-                            chat_provider_id=provider_id,
+                        self._llm_generate_metered(
+                            session_id=session_id,
+                            request_type=(
+                                request_type
+                                if attempt == 0
+                                else request_type + "_repair"
+                            ),
+                            provider_id=provider_id,
                             prompt=current_prompt,
-                            system_prompt=system,
+                            system_prompt_value=system,
                             temperature=config.temperature,
                             max_tokens=config.max_tokens,
                         ),
@@ -1535,7 +2048,40 @@ class TavernEngine:
                 )
                 try:
                     payload = extract_json_object(raw)
-                    resolution = validate_resolution(payload)
+                    core_payload = dict(payload)
+                    raw_choices = core_payload.pop("next_choices", None)
+                    resolution = validate_resolution(core_payload)
+                    if enforce_mobile_limits:
+                        resolution = self._validate_mobile_resolution(
+                            resolution,
+                            expected_actor=expected_actor,
+                            roster=roster,
+                        )
+                    choice_error = ""
+                    normalized_choices: list[dict[str, Any]] = []
+                    if resolution.mode == "resolve" and raw_choices is not None:
+                        try:
+                            normalized_choices = normalize_choices_compat(
+                                raw_choices, world
+                            )
+                            if enforce_mobile_limits:
+                                normalized_choices = (
+                                    self._validate_choices_for_actor(
+                                        normalized_choices,
+                                        expected_actor=expected_actor,
+                                        roster=roster,
+                                    )
+                                )
+                        except (TypeError, ValueError) as exc:
+                            choice_error = str(exc)
+                    raw_payload = dict(payload)
+                    if choice_error:
+                        raw_payload["_next_choices_error"] = choice_error
+                    resolution = replace(
+                        resolution,
+                        next_choices=tuple(normalized_choices),
+                        raw=raw_payload,
+                    )
                     await self.database.record_provider_result(
                         provider_id,
                         success=True,

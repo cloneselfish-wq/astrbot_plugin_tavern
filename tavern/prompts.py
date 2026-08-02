@@ -5,6 +5,7 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 from .constants import CORE_NARRATOR_RULES
+from .world_contract import world_contract
 
 
 def _json(value: Any) -> str:
@@ -67,16 +68,19 @@ RESOLUTION_SCHEMA = {
     "next_choices": [
         {
             "key": "A | B | C | D，必须恰好四项且不重复",
+            "actor_id": "必须等于插件提供的 next_actor.participant_id",
             "text": "下一位玩家可选择的行动意图，不预设结果",
-            "risk": "safe | controlled | dangerous | desperate | lethal",
-            "requires_check": "布尔值",
+            "danger_id": "世界声明的危险度 ID",
+            "check": {
+                "required": "布尔值",
+                "attribute_id": "attribute 模式填写世界属性 ID；其他模式留空",
+                "type": "standard | leader | group | resistance | opposed",
+                "difficulty": "5-25",
+                "known_consequences": "玩家可预见的风险；不能泄露隐藏真相",
+                "advantage_sources": ["选项生成时已经成立的优势来源"],
+                "disadvantage_sources": ["选项生成时已经成立的劣势来源"],
+            },
             "collective": "布尔值；影响全队时为 true",
-            "check_type": "standard | leader | group | resistance | opposed",
-            "check_stat": "建议检定维度；插件最终校验",
-            "difficulty": "5-25；只反映行动本身难度",
-            "known_consequences": "玩家可预见的风险；不能泄露隐藏真相",
-            "advantage_sources": ["选项生成时已经成立的优势来源"],
-            "disadvantage_sources": ["选项生成时已经成立的劣势来源"],
         }
     ],
     "group_decision": {
@@ -166,6 +170,14 @@ RESOLUTION_SCHEMA = {
 def system_prompt(world: Mapping[str, Any]) -> str:
     world_prompt = str(world.get("system_prompt", "")).strip()
     rules = world.get("rules", {})
+    rules = rules if isinstance(rules, Mapping) else {}
+    narrative_rules = {key: value for key, value in rules.items() if key not in {"character_card", "option_presentation", "danger_levels", "capabilities", "world_schema_version"}}
+    contract = world_contract(world)
+    schema = json.loads(json.dumps(RESOLUTION_SCHEMA, ensure_ascii=False))
+    if contract["resolution"]["mode"] in {"none", "narrative"}:
+        schema["mode"] = "resolve"
+        schema.pop("check", None)
+        schema["next_choices"][0]["check"] = None
     characters = world.get("characters", [])
     character_text = []
     for character in characters:
@@ -186,13 +198,13 @@ def system_prompt(world: Mapping[str, Any]) -> str:
         f"{world_prompt}\n"
         "</world_definition>\n\n"
         "<world_rules>\n"
-        f"{_json(rules)}\n"
+        f"{_json(narrative_rules)}\n"
         "</world_rules>\n\n"
         "<resident_characters>\n"
         f"{_json(character_text)}\n"
         "</resident_characters>\n\n"
         "<required_output_schema>\n"
-        f"{_json(RESOLUTION_SCHEMA)}\n"
+        f"{_json(schema)}\n"
         "</required_output_schema>\n"
     )
 
@@ -213,21 +225,30 @@ def _history(events: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
 
 
 def _party(roster: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
-    return [
-        {
-            "participant_id": item.get("id"),
-            "character_name": item.get("character_name"),
-            "character_code": item.get("character_code"),
-            "card_status": item.get("card_status"),
-            "participation_status": item.get("participation_status"),
-            "profile": item.get("card_profile", {}),
-            "stats": item.get("card_stats", {}),
-            "runtime_state": item.get("runtime_state", {}),
-        }
-        for item in roster
-        if isinstance(item, Mapping)
-        and item.get("participation_status") in {"active", "standby", "away"}
-    ]
+    result: list[dict[str, Any]] = []
+    for item in roster:
+        if not isinstance(item, Mapping) or item.get(
+            "participation_status"
+        ) not in {"active", "standby", "away"}:
+            continue
+        profile = item.get("card_profile")
+        profile = profile if isinstance(profile, Mapping) else {}
+        runtime = item.get("runtime_state")
+        runtime = runtime if isinstance(runtime, Mapping) else {}
+        # 非行动角色只暴露现场可观察信息，避免模型把其性格、秘密、
+        # 专长或决定权混入下一位玩家的行动选项。
+        result.append(
+            {
+                "participant_id": item.get("id"),
+                "character_name": item.get("character_name"),
+                "character_code": item.get("character_code"),
+                "participation_status": item.get("participation_status"),
+                "public_appearance": profile.get("appearance", ""),
+                "visible_location": runtime.get("current_location", ""),
+                "visible_statuses": runtime.get("statuses", []),
+            }
+        )
+    return result
 
 
 def planning_prompt(
@@ -304,6 +325,11 @@ def planning_prompt(
         "没有风险和不确定性的动作直接成功；明确不可能的动作直接说明边界，"
         "不能用自然 20 突破世界事实。"
         "不得替玩家决定内心、未经选择的对白、情感或对其他玩家角色的伤害。"
+        "本回合故事正文必须为 100—300 个中文可见字符，使用简洁白描；"
+        "不要用冗长心理描写凑字数。每个 next_choices.text 正文"
+        "不得超过 50 字，正文禁止自带风险或检定括号。四个选项的 actor_id 必须全部等于 next_actor 的"
+        " participant_id；选项只能描述该角色本人可尝试的行动，不能替其他"
+        "玩家角色说话、移动、使用能力、消耗物品、同意或作决定。"
         "新 NPC 必须有名字，并至少满足直接互动、掌握重要线索或写入长期记忆"
         "之一；create 时用 registration_reasons 的固定值说明依据。"
         "已登记 NPC 必须使用 active_npcs 中的稳定 npc_id 更新，"
@@ -323,6 +349,9 @@ def planning_prompt(
         '<active_party trust="untrusted-data">\n'
         f"{_json(_party(session.get('roster', [])))}\n"
         "</active_party>\n\n"
+        '<next_actor trust="plugin-authoritative">\n'
+        f"{_json(session.get('next_actor', {}))}\n"
+        "</next_actor>\n\n"
         '<relevant_memories trust="untrusted-data">\n'
         f"{_json(list(memories))}\n"
         "</relevant_memories>\n\n"
@@ -385,6 +414,10 @@ def checked_resolution_prompt(
         "之一；create 时用 registration_reasons 的固定值说明依据。"
         "已登记 NPC 必须使用稳定 npc_id 更新，不能凭相似名称静默合并。"
         "只写本次行动直接造成且能被当前场景确认的变化。"
+        "本回合故事正文必须为 100—300 个中文可见字符，使用简洁白描；"
+        "每个 next_choices.text 连同括号内容不得超过 50 字。"
+        "四个选项的 actor_id 必须全部等于 next_actor 的 participant_id，"
+        "并且只能描述该角色本人可尝试的行动，不得操控其他玩家角色。"
         "同时必须生成恰好四个合规 next_choices；"
         "关键集体节点使用 group_decision；生成表决时，state_patch "
         "不得提前写入尚未通过的集体结果。\n\n"
@@ -397,6 +430,9 @@ def checked_resolution_prompt(
         '<active_party trust="untrusted-data">\n'
         f"{_json(_party(session.get('roster', [])))}\n"
         "</active_party>\n\n"
+        '<next_actor trust="plugin-authoritative">\n'
+        f"{_json(session.get('next_actor', {}))}\n"
+        "</next_actor>\n\n"
         '<relevant_memories trust="untrusted-data">\n'
         f"{_json(list(memories))}\n"
         "</relevant_memories>\n\n"
@@ -442,8 +478,10 @@ def repair_prompt(
     original_prompt: str,
 ) -> str:
     return (
-        "上一份输出无法通过结构校验。只修复 JSON 结构与字段类型，"
-        "不得新增剧情、改变检定结论或解释错误。返回单个 JSON 对象。\n\n"
+        "上一份输出无法通过校验。只修复 JSON 结构、字段类型、正文长度、"
+        "选项长度与行动角色归属；可以在不改变已发生事实的前提下压缩或"
+        "补足叙事，并重写越权选项。不得改变检定结论、世界状态变化、代价"
+        "或记忆事实，也不要解释错误。返回单个 JSON 对象。\n\n"
         "<original_task_context>\n"
         f"{original_prompt}\n"
         "</original_task_context>\n\n"

@@ -15,7 +15,7 @@ function installMockBridge() {
   window.__mockGets = [];
   const world = {
     id: "world_demo",
-    slug: "border-tavern",
+    slug: "aelvion-ashen-crown",
     name: "边境无名酒馆",
     description: "一座位于诸界夹缝中的中立酒馆。",
     system_prompt: "这是一个低魔、克制、因果连续的奇幻世界。",
@@ -86,7 +86,7 @@ function installMockBridge() {
       json_repair_attempts: 1,
     },
     runtime: {
-      default_world_slug: "border-tavern",
+      default_world_slug: "aelvion-ashen-crown",
       trigger_prefix: "jg",
       two_phase_checks: true,
       max_input_chars: 2000,
@@ -292,6 +292,24 @@ function installMockBridge() {
     if (endpoint === "characters") return { items: characters };
     if (endpoint === "memories") return { items: memories };
     if (endpoint === "audit") return { items: [] };
+    if (endpoint === "groups/token-usage") {
+      return {
+        usage: {
+          platform_id: session.platform_id,
+          group_id: session.group_id,
+          session_id: session.id,
+          group: { hour: 1200, day: 8600, all: 45200 },
+          quota: {
+            scope_type: "group",
+            window_seconds: 86400,
+            token_limit: 500000,
+            enabled: true,
+            used: 8600,
+            remaining: 491400,
+          },
+        },
+      };
+    }
     if (endpoint === "sessions/detail") {
       return {
         session,
@@ -479,6 +497,18 @@ async function installTestFont(page) {
   await page
     .locator("#editor-cancel-button")
     .evaluate((element) => element.click());
+  await page.locator('[data-group-action="token-quota"]').click();
+  assert.match(
+    await page.locator("#editor-modal-title").textContent(),
+    /Token 限额/,
+  );
+  assert.equal(
+    await page.locator("#group-quota-enabled").isChecked(),
+    true,
+  );
+  await page
+    .locator("#editor-cancel-button")
+    .evaluate((element) => element.click());
   await page.locator("#session-search-clear").click();
   await page.locator('[data-session-action="detail"]').click();
   await page.locator('[data-session-tab="roster"]').click();
@@ -544,7 +574,7 @@ async function installTestFont(page) {
   assert.equal(posts[0].body.platform_id, "qq-instance");
   assert.equal(posts[0].body.group_id, "78210432");
   assert.equal(posts[0].body.instance_name, "边境无名酒馆");
-  assert.equal(posts[0].body.instance_slug, "border-tavern");
+  assert.equal(posts[0].body.instance_slug, "aelvion-ashen-crown");
 
   await page.locator('[data-view="settings"]').click();
   assert.equal(await page.locator("#setting-provider").inputValue(), "story-primary");

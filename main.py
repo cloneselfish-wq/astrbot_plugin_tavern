@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import re
+import time
 from collections.abc import Sequence
 from typing import Any, Mapping
 
@@ -34,12 +36,16 @@ from .tavern.engine import (
 )
 from .tavern.events import EventBroker
 from .tavern.lifecycle import (
+    attribute_maps,
     card_stat_allocation,
+    find_profession_preset,
     format_choices,
     normalize_time_rules,
     parse_choice_input,
     parse_duration,
     player_limits,
+    resolve_profession_stats,
+    uses_profession_preset_stats,
 )
 from .tavern.security import (
     ParsedCommand,
@@ -53,11 +59,18 @@ from .tavern.web_console import TavernWebConsole
 INSTANCE_LIST_PAGE_SIZE = 5
 INSTANCE_INTRO_MAX_CHARS = 220
 REVIEW_LIST_PAGE_SIZE = 5
+# 计时轮询与通知频控
+TIMER_POLL_INTERVAL_SECONDS = 15
+# 同一个计时器在该窗口内只允许推送一次，防止重复行造成刷屏。
+TIMER_NOTICE_DEDUP_SECONDS = 25
+# 相邻两条主动通知之间的最小间隔，规避 QQ 官方主动消息频控。
+TIMER_NOTICE_MIN_GAP_SECONDS = 2.0
 PRIVATE_CARD_ACTIONS = frozenset(
     {
         "card",
         "card_fill",
         "card_stats_reset",
+        "card_timer_notice",
         "card_preview",
         "card_confirm",
         "card_cancel",
@@ -72,16 +85,16 @@ _INSTANCE_PAGE_PATTERNS = (
 
 
 HELP_TEXT = """\
-【AI 酒馆 v0.5.2 Alpha｜多人跑团与独立存档】
+【AI 酒馆 v0.6.0｜多人跑团与独立存档】
 主持：/酒馆 开启 <副本> → /酒馆 开演
-恢复：/酒馆 暂停 → /酒馆 继续 → 全员准备 → /酒馆 继续
+恢复：/酒馆 暂停 → /酒馆 恢复 → 全员准备 → /酒馆 继续
 玩家：/酒馆 加入｜角色｜准备｜阵容｜暂离｜返回队列｜退出
-建卡：加入后私聊 Bot 发送 /酒馆 建卡 <验证码>｜重填数值
+建卡：私聊 /酒馆 建卡 <验证码>｜重填数值｜建卡提醒 开/关
 回合：jg A｜/酒馆 选择 A｜/酒馆 重整选项
 裁定：/酒馆 灵感｜/酒馆 灵感 A 优势｜/酒馆 灵感重投 A
 集体：/酒馆 投票 A（不消耗个人行动）
-记录：/酒馆 回顾｜存档列表｜存档 <名称>｜读档 <名称>｜回滚
-管理：审核｜跳过｜移至｜指定｜封禁｜解封｜黑名单｜延时
+记录：/酒馆 回顾｜存档列表｜存档 <名称>｜删档 <名称>｜读档｜回滚
+管理：审核｜强制全员准备｜强制下一位｜倒计时｜用量｜限额｜移至｜指定
 安全：任一出场玩家可发送 /酒馆 安全暂停
 结束：/酒馆 关闭｜/酒馆 完结 确认｜/酒馆 强制终止 确认 <原因>
 
@@ -284,6 +297,240 @@ def format_vote(vote: Mapping[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def format_recovered_timer(
+    timers: Sequence[Mapping[str, Any]],
+    *,
+    vote_active: bool,
+) -> str:
+    timer_type = "vote" if vote_active else "turn"
+    timer = next(
+        (
+            item
+            for item in timers
+            if item.get("timer_type") == timer_type
+            and item.get("status") == "active"
+        ),
+        None,
+    )
+    if not timer:
+        return "⏳ 【恢复计时】当前流程不限时或倒计时已关闭"
+    try:
+        remaining = max(0, int(timer.get("remaining_seconds") or 0))
+    except (TypeError, ValueError, OverflowError):
+        remaining = 0
+    minutes, seconds = divmod(remaining, 60)
+    label = "投票" if vote_active else "行动回合"
+    if minutes:
+        text = f"{minutes} 分 {seconds} 秒"
+    else:
+        text = f"{seconds} 秒"
+    return f"⏳ 【恢复计时】{label}剩余 {text}"
+
+
+def world_preset_brief(world: Mapping[str, Any], focus: str = "") -> str:
+    """Build a compact summary of the world's preset content (professions,
+    factions, regions) to show when a player starts creating a character."""
+    if not isinstance(world, Mapping):
+        return ""
+    rules = world.get("rules")
+    if not isinstance(rules, Mapping):
+        return ""
+    professions = rules.get("professions")
+    professions = professions if isinstance(professions, list) else []
+    modules = rules.get("setting_modules")
+    modules = modules if isinstance(modules, Mapping) else {}
+    stat_rules = rules.get("character_card") or {}
+    stat_defs = (stat_rules.get("stats") or {}).get("attributes") or []
+    stat_labels: dict[str, str] = {}
+    for _attr in stat_defs:
+        if isinstance(_attr, Mapping) and _attr.get("key"):
+            stat_labels[str(_attr["key"])] = str(
+                _attr.get("label") or _attr["key"]
+            )
+    if not professions:
+        _pp = stat_rules.get("profession_presets")
+        if isinstance(_pp, list):
+            professions = _pp
+    _stats_raw = stat_rules.get("stats") or {}
+    _profession_mode = bool(
+        isinstance(_stats_raw, Mapping)
+        and (
+            _stats_raw.get("mode") == "preset"
+            or _stats_raw.get("input_mode")
+            == "automatic_profession_base_plus_two_fixed_bonus_choices"
+            or _stats_raw.get("allocation_mode")
+            == "profession_base_plus_primary7_secondary3"
+        )
+    )
+    _bonus_note = (
+        f"（基础属性合计 {_stats_raw.get('base_budget', 50)} 点已锁定，随后选主属性 +{_stats_raw.get('primary_bonus', 7)}、副属性 +{_stats_raw.get('secondary_bonus', 3)}，最终固定 {_stats_raw.get('budget', 60)} 点）"
+        if _profession_mode
+        else ""
+    )
+    lines: list[str] = []
+    if professions:
+        if focus == "profession":
+            lines.append(
+                "【可选预设职业】填写以下任一名称即可自动套用其基础数值："
+                + _bonus_note
+            )
+        else:
+            lines.append(
+                "【本世界预设职业】（建卡时在「预设职业」一栏填写其一，"
+                "将自动套用基础数值）"
+                + _bonus_note
+            )
+        for item in professions:
+            if not isinstance(item, Mapping):
+                continue
+            disp = item.get("label") or item.get("name") or item.get("key") or "?"
+            base = item.get("base_stats")
+            if not isinstance(base, Mapping):
+                base = item.get("attributes")
+            if not isinstance(base, Mapping):
+                base = item.get("base_attributes")
+            base = base if isinstance(base, Mapping) else {}
+            if base:
+                bs_text = "、".join(
+                    f"{stat_labels.get(str(k), k)}{v}"
+                    for k, v in base.items()
+                )
+            else:
+                bs_text = "数值自定"
+            free = item.get("free_points")
+            free_text = (
+                f" · 可分配 {free} 点" if isinstance(free, int) else ""
+            )
+            desc = item.get("description")
+            desc_text = f" — {desc}" if desc else ""
+            lines.append(f"· {disp}：{bs_text}{free_text}{desc_text}")
+    if focus != "profession":
+        factions = modules.get("factions")
+        factions = factions if isinstance(factions, list) else []
+        if factions:
+            names = [
+                f.get("name", "")
+                for f in factions[:5]
+                if isinstance(f, Mapping)
+            ]
+            if names:
+                lines.append("【主要势力】" + "、".join(names))
+        regions = modules.get("regions")
+        regions = regions if isinstance(regions, list) else []
+        if regions:
+            names = [
+                r.get("name", "")
+                for r in regions[:5]
+                if isinstance(r, Mapping)
+            ]
+            if names:
+                lines.append("【主要地点】" + "、".join(names))
+    return "\n".join(lines)
+
+
+def _profession_preset_line(
+    preset: Mapping[str, Any],
+    key_to_label: Mapping[str, str],
+) -> str:
+    """Render one profession preset as a single readable line."""
+    display = str(preset.get("display_text") or "").strip()
+    if display:
+        return display
+    name = str(preset.get("name") or "").strip() or "?"
+    base = preset.get("base_attributes")
+    if not isinstance(base, Mapping):
+        base = preset.get("attributes")
+    base = base if isinstance(base, Mapping) else {}
+    numbers = "｜".join(str(int(value)) for value in base.values())
+    total = sum(int(value) for value in base.values()) if base else 0
+    role = str(preset.get("role") or "").strip()
+    text = f"{name}：{numbers}"
+    if base:
+        text += f"（合计{total}）"
+    if role:
+        text += f" — {role}"
+    return text
+
+
+def _format_profession_step_prompt(
+    template: Mapping[str, Any],
+    values: Mapping[str, Any],
+    field: Mapping[str, Any],
+    step: int,
+    total_fields: int,
+) -> str:
+    """Prompts for the profession-preset stat mode (fixed 50 base +7/+3)."""
+    field_key = str(field.get("key") or "")
+    if field_key not in {
+        "profession",
+        "primary_attribute",
+        "secondary_attribute",
+    }:
+        return ""
+    _label_to_key, key_to_label = attribute_maps(template)
+    attribute_options = "、".join(key_to_label.values())
+    if field_key == "profession":
+        lines = [
+            f"【角色卡 {step + 1}/{total_fields}】选择职业",
+            "选择职业后会自动载入固定 50 点基础属性。",
+            "属性顺序：" + "｜".join(key_to_label.values()),
+            "",
+        ]
+        for preset in template.get("profession_presets") or []:
+            if not isinstance(preset, Mapping):
+                continue
+            line = _profession_preset_line(preset, key_to_label)
+            if line:
+                lines.append(f"· {line}")
+        first_name = ""
+        for preset in template.get("profession_presets") or []:
+            if isinstance(preset, Mapping) and preset.get("name"):
+                first_name = str(preset["name"])
+                break
+        example = first_name or "骑士"
+        lines.extend(
+            [
+                "",
+                f"直接回复职业名称，例如：{example}",
+                f"或发送：/酒馆 填写 {example}",
+            ]
+        )
+        return "\n".join(lines)
+    try:
+        resolved = resolve_profession_stats(
+            template,
+            values,
+            require_complete=False,
+        )
+    except ValueError as exc:
+        return f"【无法继续】{exc}\n请先重新选择职业：/酒馆 填写 <职业名称>"
+    if field_key == "primary_attribute":
+        lines = [
+            "【选择主属性｜固定+7】",
+            f"当前职业：{resolved['profession']}",
+            "职业基础属性：",
+        ]
+        for key, value in resolved["base"].items():
+            lines.append(f"· {resolved['labels'][key]}：{value}")
+        lines.extend(
+            [
+                "",
+                f"可选：{attribute_options}",
+                "直接回复属性名称，例如："
+                + next(iter(key_to_label.values()), "力量"),
+            ]
+        )
+        return "\n".join(lines)
+    return (
+        "【选择副属性｜固定+3】\n"
+        f"职业：{resolved['profession']}\n"
+        f"已选主属性：{values.get('primary_attribute') or '（未选）'}（+7）\n"
+        "副属性不能与主属性相同。\n"
+        f"可选：{attribute_options}\n"
+        "直接回复属性名称"
+    )
+
+
 def format_card_prompt(draft: Mapping[str, Any]) -> str:
     template = draft.get("template") or {}
     fields = template.get("fields") or []
@@ -292,6 +539,44 @@ def format_card_prompt(draft: Mapping[str, Any]) -> str:
     step = int(
         draft.get("current_step", draft.get("draft_step", 0)) or 0
     )
+    world = draft.get("world") or {}
+    preset_mode = uses_profession_preset_stats(template)
+    if step >= len(fields) and preset_mode:
+        try:
+            resolved = resolve_profession_stats(
+                template,
+                values,
+                require_complete=True,
+            )
+        except ValueError as exc:
+            return f"【角色卡数值尚未完成】{exc}"
+        lines = [
+            "【角色卡字段已填写完成】",
+            f"职业：{resolved['profession']}",
+            (
+                f"主属性：{resolved['primary']['label']}"
+                f" +{resolved['primary']['bonus']}"
+            ),
+            (
+                f"副属性：{resolved['secondary']['label']}"
+                f" +{resolved['secondary']['bonus']}"
+            ),
+            "最终属性：",
+        ]
+        for key, value in resolved["raw"].items():
+            lines.append(f"· {resolved['labels'][key]}：{value}")
+        lines.extend(
+            [
+                f"基础总和：{resolved['base_total']}",
+                f"专精加成：{resolved['bonus_total']}",
+                f"最终总和：{resolved['effective_total']}",
+                "",
+                "重新选择主副属性：/酒馆 重填数值",
+                "发送 /酒馆 预览 检查内容，"
+                "确认无误后发送 /酒馆 确认建卡。",
+            ]
+        )
+        return "\n".join(lines)
     if step >= len(fields):
         allocation = card_stat_allocation(template, values)
         lines = ["【角色卡字段已填写完成】"]
@@ -304,12 +589,27 @@ def format_card_prompt(draft: Mapping[str, Any]) -> str:
             lines.append(
                 "只重新分配数值：/酒馆 重填数值"
             )
+        if values.get("profession"):
+            lines.append(
+                "若已选预设职业，其基础数值已自动套用；"
+                "剩余点数可经 /酒馆 重填数值 自由分配。"
+            )
         lines.append(
             "发送 /酒馆 预览 检查内容，"
             "确认无误后发送 /酒馆 确认建卡。"
         )
         return "\n".join(lines)
     field = fields[step]
+    if preset_mode:
+        preset_prompt = _format_profession_step_prompt(
+            template,
+            values,
+            field,
+            step,
+            len(fields),
+        )
+        if preset_prompt:
+            return preset_prompt
     allocation = card_stat_allocation(template, values, step)
     current_stat = allocation.get("current")
     if isinstance(current_stat, Mapping):
@@ -357,9 +657,21 @@ def format_card_prompt(draft: Mapping[str, Any]) -> str:
             ]
         )
         return "\n".join(lines)
+    preset_prefix = ""
+    field_key = str(field.get("key") or "")
+    if world:
+        if step == 0:
+            brief = world_preset_brief(world)
+            if brief:
+                preset_prefix = brief + "\n\n"
+        elif field_key == "profession":
+            brief = world_preset_brief(world, focus="profession")
+            if brief:
+                preset_prefix = brief + "\n\n"
     required = "必填" if field.get("required") else "选填"
     return (
-        f"【角色卡 {step + 1}/{len(fields)}】"
+        preset_prefix
+        + f"【角色卡 {step + 1}/{len(fields)}】"
         f"{field.get('label')}（{required}，最多 {field.get('max_chars')} 字）\n"
         "字段内容不得包含空格、全角空格、换行或制表符。\n"
         "直接回复内容，或发送：/酒馆 填写 <内容>"
@@ -377,6 +689,49 @@ def format_card_preview(draft: Mapping[str, Any]) -> str:
         if definition.get("private"):
             value = "（私密字段已保存）" if value else "（未填写）"
         lines.append(f"· {definition.get('label')}：{value or '（未填写）'}")
+    if uses_profession_preset_stats(template):
+        lines.append("")
+        try:
+            resolved = resolve_profession_stats(
+                template,
+                fields,
+                require_complete=False,
+            )
+        except ValueError as exc:
+            lines.append(f"【角色数值】尚未生成：{exc}")
+        else:
+            lines.append("【角色数值｜职业预设】")
+            lines.append(f"· 职业：{resolved['profession']}")
+            lines.append(
+                f"· 主属性：{resolved['primary']['label'] or '（未选）'}"
+                f" +{resolved['primary']['bonus']}"
+            )
+            lines.append(
+                f"· 副属性：{resolved['secondary']['label'] or '（未选）'}"
+                f" +{resolved['secondary']['bonus']}"
+            )
+            for key, value in resolved["raw"].items():
+                base_value = resolved["base"][key]
+                delta = value - base_value
+                delta_text = f"（基础{base_value}{delta:+d}）" if delta else ""
+                lines.append(
+                    f"· {resolved['labels'][key]}：{value}{delta_text}"
+                    f"（检定修正 {resolved['modifiers'][key]:+d}）"
+                )
+            lines.append(
+                f"· 总和：基础 {resolved['base_total']}"
+                f" + 加成 {resolved['bonus_total']}"
+                f" = {resolved['effective_total']}"
+            )
+        lines.extend(
+            [
+                "",
+                "重新选择主副属性：/酒馆 重填数值",
+                "确认：/酒馆 确认建卡",
+                "放弃并释放席位：/酒馆 取消建卡",
+            ]
+        )
+        return "\n".join(lines)
     allocation = card_stat_allocation(template, fields)
     if allocation["stat_fields"]:
         modifier_table = (template.get("stats") or {}).get(
@@ -555,6 +910,91 @@ def format_review_card(
             value_text = str(value or "").strip() or "（未填写）"
         lines.append(f"· {definition.get('label')}：{value_text}")
 
+    if uses_profession_preset_stats(template):
+        lines.extend(["", "【角色数值｜职业预设】"])
+        try:
+            resolved = resolve_profession_stats(
+                template,
+                profile,
+                require_complete=True,
+            )
+        except ValueError as exc:
+            stored_raw = stats.get("raw")
+            stored_raw = (
+                stored_raw if isinstance(stored_raw, Mapping) else {}
+            )
+            lines.append(f"· 校验结果：不通过（{exc}）")
+            if stored_raw:
+                lines.append(
+                    "· 存档数值："
+                    + "、".join(
+                        f"{key}{value}"
+                        for key, value in stored_raw.items()
+                    )
+                )
+            lines.append("· 建议驳回并让玩家重新使用「/酒馆 重填数值」。")
+        else:
+            lines.append(f"· 职业：{resolved['profession']}")
+            lines.append(
+                "· 基础属性："
+                + "、".join(
+                    f"{resolved['labels'][key]}{value}"
+                    for key, value in resolved["base"].items()
+                )
+            )
+            lines.append(
+                f"· 主属性：{resolved['primary']['label']}"
+                f" +{resolved['primary']['bonus']}"
+            )
+            lines.append(
+                f"· 副属性：{resolved['secondary']['label']}"
+                f" +{resolved['secondary']['bonus']}"
+            )
+            lines.append(
+                "· 最终属性："
+                + "、".join(
+                    f"{resolved['labels'][key]}{value}"
+                    f"({resolved['modifiers'][key]:+d})"
+                    for key, value in resolved["raw"].items()
+                )
+            )
+            lines.append(f"· 基础总和：{resolved['base_total']}")
+            lines.append(f"· 加成总和：{resolved['bonus_total']}")
+            lines.append(f"· 最终总和：{resolved['effective_total']}")
+            stored_raw = stats.get("raw")
+            stored_raw = (
+                stored_raw if isinstance(stored_raw, Mapping) else {}
+            )
+            tampered = [
+                resolved["labels"][key]
+                for key, value in resolved["raw"].items()
+                if key in stored_raw and int(stored_raw[key]) != value
+            ]
+            if tampered:
+                lines.append(
+                    "· 校验结果：不通过（存档与公式不符："
+                    + "、".join(tampered)
+                    + "）"
+                )
+            else:
+                lines.append("· 校验结果：通过")
+        lines.extend(
+            [
+                "",
+                "标为私密的字段不会在群聊展开；"
+                "完整内容仍可在后台“准备与角色”查看。",
+                (
+                    f"通过：/酒馆 审核 {_review_reference(participant)}"
+                    " 通过 [备注]"
+                ),
+                (
+                    f"驳回：/酒馆 审核 {_review_reference(participant)}"
+                    " 驳回 [原因]"
+                ),
+            ]
+        )
+        return "\n".join(lines)
+
     attributes = (template.get("stats") or {}).get("attributes") or []
     raw_stats = stats.get("raw")
     raw_stats = raw_stats if isinstance(raw_stats, Mapping) else {}
@@ -616,6 +1056,23 @@ def _format_remaining_time(value: Any) -> str:
     return "".join(parts)
 
 
+def _story_reply_parts(value: str) -> list[str]:
+    text = str(value or "").strip()
+    marker = "【回合秩序】"
+    idx = text.find(marker)
+    if idx == -1:
+        return [text] if text else []
+    # 兼容标记前可能带有的 emoji 前缀（如 ⚔️ ），整段作为回合内容保留
+    prefix_start = idx
+    while prefix_start > 0 and text[prefix_start - 1] not in "\n\r":
+        prefix_start -= 1
+    story = text[:prefix_start].strip()
+    turn = text[prefix_start:].strip()
+    if not story:
+        return [turn]
+    return [story, turn]
+
+
 class TavernPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -642,6 +1099,19 @@ class TavernPlugin(Star):
             config_lock=self._config_lock,
         )
         self._timer_task: asyncio.Task[None] | None = None
+        # 计时通知的去重与频控状态：
+        # QQ 官方接口对主动消息有频控（40034100），
+        # 一旦同一轮吐出多条提醒就会被整段拒绝并反复刷屏重试。
+        self._timer_notice_last_sent: dict[str, float] = {}
+        self._timer_notice_last_at: float = 0.0
+        # 富卡片运行时状态：
+        # 1) _rich_titles：按会话缓存「当前副本 · 世界」名，供卡片标题自动取用；
+        # 2) _rich_fail_counts / _rich_broken：探测某档卡片是否真的可用。
+        #    QQ 侧「无模板权限（304004）」不会抛异常，适配器只返回空
+        #    message_id，若不检测就会静默发出空消息（表现为“指令没反应”）。
+        self._rich_titles: dict[str, str] = {}
+        self._rich_fail_counts: dict[str, int] = {}
+        self._rich_broken: set[str] = set()
 
     def runtime_config(self) -> TavernConfig:
         return TavernConfig.from_mapping(self.plugin_config)
@@ -742,6 +1212,215 @@ class TavernPlugin(Star):
         origin = str(getattr(event, "unified_msg_origin", "") or "")
         return origin.split(":", 1)[0] if ":" in origin else "qq"
 
+    async def _send_text(self, origin: str, text: str) -> bool:
+        """Send one message without yielding from the active event handler."""
+
+        target = str(origin or "").strip()
+        content = str(text or "").strip()
+        sender = getattr(self.context, "send_message", None)
+        if not target or not content or not callable(sender):
+            return False
+        try:
+            from astrbot.api.event import MessageChain
+
+            sent = await sender(target, MessageChain().message(content))
+            return sent is not False
+        except Exception:
+            logger.exception("AI 酒馆主动消息发送失败：origin=%s", target)
+            return False
+
+    async def _send_event_text(
+        self,
+        event: AstrMessageEvent,
+        text: str,
+    ) -> bool:
+        text = str(text or "").strip()
+        if not text:
+            return False
+        if self._rich_enabled() and await self._rich_try_send(event, text, None):
+            return True
+        return await self._send_text(self._rich_origin(event), text)
+
+    async def _send_event_parts(
+        self,
+        event: AstrMessageEvent,
+        parts: Sequence[str],
+    ) -> list[str]:
+        """Send ordered parts and return only parts that could not be sent."""
+
+        unsent: list[str] = []
+        for part in parts:
+            text = str(part or "").strip()
+            if text and not await self._send_event_text(event, text):
+                unsent.append(text)
+        return unsent
+
+    # ── 富卡片（第二档真·结构化卡片）发送层 ──────────────────────────
+    # 仅当「配置开启」且「当前事件对象支持 reply_markdown_aj / reply_ark」
+    # （由 astrbot_plugin_qq_restapi 等 REST API 适配器提供）时才发送
+    # 结构化卡片；否则自动退回第一档 emoji 纯文本，绝不向调用方抛出异常。
+    def _rich_enabled(self, config: Any = None) -> bool:
+        cfg = config or self.runtime_config()
+        return bool(getattr(cfg, "rich_cards_enabled", True))
+
+    def _rich_mode(self, config: Any = None) -> str:
+        cfg = config or self.runtime_config()
+        return str(getattr(cfg, "rich_card_mode", "markdown")).strip().lower()
+
+    @staticmethod
+    def _rich_origin(event: Any) -> str:
+        return str(getattr(event, "unified_msg_origin", "") or "")
+
+    def _remember_rich_title(self, event: Any, session: Any) -> None:
+        """缓存当前会话的副本 / 世界名，供富卡片标题自动取用。"""
+
+        origin = self._rich_origin(event)
+        if not origin or not session:
+            return
+        try:
+            instance = str(session["instance_name"] or "").strip()
+            world = str(session["world_name"] or "").strip()
+        except Exception:
+            return
+        title = instance or world
+        if not title:
+            return
+        if instance and world and world != instance:
+            title = f"{instance} · {world}"
+        self._rich_titles[origin] = f"🍺 {title}"[:60]
+
+    def _rich_title(self, config: Any = None, event: Any = None) -> str:
+        """卡片标题：配置显式填写优先，否则自动取当前正在游玩的世界。"""
+
+        cfg = config or self.runtime_config()
+        configured = str(getattr(cfg, "rich_card_title", "") or "").strip()
+        if configured:
+            return configured
+        if event is not None:
+            auto = self._rich_titles.get(self._rich_origin(event))
+            if auto:
+                return auto
+        return "🍺 AI 酒馆"
+
+    def _rich_note_failure(self, kind: str, reason: Any) -> None:
+        """连续失败 2 次即熔断该档卡片，避免持续空发与日志刷屏。"""
+
+        count = self._rich_fail_counts.get(kind, 0) + 1
+        self._rich_fail_counts[kind] = count
+        logger.warning(
+            "AI 酒馆 %s 卡片发送失败（第 %d 次），尝试降级：%s",
+            kind,
+            count,
+            reason,
+        )
+        if count >= 2 and kind not in self._rich_broken:
+            self._rich_broken.add(kind)
+            logger.warning(
+                "AI 酒馆已停用 %s 卡片并回退纯文本。"
+                "如需启用：markdown 需在 qq_restapi 适配器填写 "
+                "markdown_aj_template_id / markdown_aj_keys；"
+                "ark 需要 QQ 侧开通对应模板权限（被动消息 Ark 需申请）。",
+                kind,
+            )
+
+    def _rich_note_success(self, kind: str) -> None:
+        if self._rich_fail_counts.get(kind):
+            self._rich_fail_counts[kind] = 0
+
+    def _rich_usable(self, kind: str, mode: str) -> bool:
+        return mode in (kind, "auto") and kind not in self._rich_broken
+
+    async def _rich_try_send(self, event: Any, text: str, config: Any) -> bool:
+        """按 markdown → ark 顺序尝试发卡片；成功返回 True。"""
+
+        mode = self._rich_mode(config)
+        if self._rich_usable("markdown", mode):
+            fn = getattr(event, "reply_markdown_aj", None)
+            if callable(fn):
+                try:
+                    # 适配器返回 message_id；为空说明平台侧拒绝了这条消息。
+                    if await fn(text):
+                        self._rich_note_success("markdown")
+                        return True
+                    self._rich_note_failure(
+                        "markdown", "适配器未返回消息 ID（平台可能已拒绝）"
+                    )
+                except Exception as exc:
+                    self._rich_note_failure("markdown", exc)
+        if self._rich_usable("ark", mode):
+            fn = getattr(event, "reply_ark", None)
+            if callable(fn):
+                try:
+                    if await fn(
+                        template_id=24,
+                        kv_data=self._rich_ark_kv(
+                            text, self._rich_title(config, event)
+                        ),
+                    ):
+                        self._rich_note_success("ark")
+                        return True
+                    self._rich_note_failure(
+                        "ark", "适配器未返回消息 ID（平台可能已拒绝）"
+                    )
+                except Exception as exc:
+                    self._rich_note_failure("ark", exc)
+        return False
+
+    @staticmethod
+    def _rich_ark_kv(text: str, title: str) -> list:
+        # 模板 24（文本 + 缩略图）通用 kv；文本压成单行并截断，避免单字段超长。
+        desc = str(text or "").strip().replace("\n", " ")[:300]
+        return [
+            {"key": "#TITLE#", "value": title},
+            {"key": "#PROMPT#", "value": title},
+            {"key": "#DESC#", "value": desc},
+        ]
+
+    async def _rich_result(self, event: Any, text: Any, config: Any = None):
+        """返回可 yield 的消息对象（富卡片或 plain_result）；空文本返回 None。"""
+
+        text = str(text or "").strip()
+        if not text:
+            return None
+        if self._rich_enabled(config) and await self._rich_try_send(
+            event, text, config
+        ):
+            # 已由适配器直接发出，返回 None 交由管线跳过（安全）。
+            return None
+        return event.plain_result(text)
+
+    async def _notify_group_card_created(
+        self,
+        result: Mapping[str, Any],
+    ) -> None:
+        """Best-effort group notification after a private card is committed."""
+
+        try:
+            session_id = str(result.get("session_id") or "")
+            if not session_id:
+                return
+            session = await self.database.get_session(session_id)
+            name = str(result.get("character_name") or "未命名角色")
+            review_text = (
+                "已自动通过审核。"
+                if result.get("auto_approved")
+                else "等待审核。"
+            )
+            sent = await self._send_text(
+                str(session.get("unified_origin") or ""),
+                f"【酒馆】角色卡{name}已建立，{review_text}",
+            )
+            if not sent:
+                logger.warning(
+                    "AI 酒馆角色卡建成通知未找到可用群会话：session=%s",
+                    session_id,
+                )
+        except Exception:
+            # The card transaction has already committed. A delivery problem
+            # must never make the private confirmation claim that creation
+            # failed or encourage the player to submit a duplicate card.
+            logger.exception("AI 酒馆角色卡建成通知发送失败")
+
     async def _write_security_audit(
         self,
         *,
@@ -800,13 +1479,55 @@ class TavernPlugin(Star):
                 return format_card_preview(preview)
             if command.matched and command.action == "card_stats_reset":
                 reset = await self.database.reset_card_draft_stats(origin)
+                if reset.get("profession_reset"):
+                    return (
+                        "【主副属性已重置】\n"
+                        "职业与职业固定基础属性均已保留；"
+                        "其他角色资料没有改变。\n"
+                        "请重新选择主属性和副属性。\n"
+                        + format_card_prompt(reset)
+                    )
                 return (
-                    "【角色数值已重置】"
-                    "文字角色资料均已保留。\n"
+                    "【角色数值已保留】已保留你已分配的数值，"
+                    "可重新调整未使用的剩余点数。\n"
                     + format_card_prompt(reset)
+                )
+            if command.matched and command.action == "card_timer_notice":
+                setting = str(command.argument or "").strip().casefold()
+                if setting in {"开", "开启", "on", "true", "1"}:
+                    enabled: bool | None = True
+                elif setting in {"关", "关闭", "off", "false", "0"}:
+                    enabled = False
+                elif setting:
+                    raise ValueError(
+                        "请使用 /酒馆 建卡提醒 开 或 /酒馆 建卡提醒 关"
+                    )
+                else:
+                    enabled = None
+                result = (
+                    await self.database.set_card_completion_reminder(
+                        origin,
+                        enabled,
+                    )
+                )
+                state = "已开启" if result["enabled"] else "已关闭"
+                remaining = (
+                    _format_remaining_time(result.get("remaining_seconds"))
+                    if result.get("has_deadline")
+                    else "不限时"
+                )
+                suffix = (
+                    "之后每 2 分钟私聊提示一次剩余时间。"
+                    if result["enabled"]
+                    else "建卡计时仍会继续，到期结果仍会私聊通知。"
+                )
+                return (
+                    f"【建卡倒计时提示{state}】"
+                    f"当前剩余 {remaining}。{suffix}"
                 )
             if command.matched and command.action == "card_confirm":
                 result = await self.database.confirm_card_draft(origin)
+                await self._notify_group_card_created(result)
                 status = (
                     "角色卡已自动通过，可以回群发送 /酒馆 准备。"
                     if result.get("auto_approved")
@@ -824,7 +1545,7 @@ class TavernPlugin(Star):
             elif command.matched:
                 return (
                     "【私聊建卡】可用：建卡、填写、预览、"
-                    "重填数值、确认建卡、取消建卡。"
+                    "重填数值、建卡提醒、确认建卡、取消建卡。"
                 )
             else:
                 value = message
@@ -900,7 +1621,7 @@ class TavernPlugin(Star):
 
         response = await self._run_native_command(event, "start")
         if response:
-            yield event.plain_result(response)
+            yield await self._rich_result(event, response)
 
     @tavern.command("开演", alias={"开始故事"}, priority=200)
     async def tavern_perform(self, event: AstrMessageEvent):
@@ -908,7 +1629,7 @@ class TavernPlugin(Star):
 
         response = await self._run_native_command(event, "perform")
         if response:
-            yield event.plain_result(response)
+            yield await self._rich_result(event, response)
 
     @tavern.command("暂停", priority=200)
     async def tavern_pause(self, event: AstrMessageEvent):
@@ -916,15 +1637,23 @@ class TavernPlugin(Star):
 
         response = await self._run_native_command(event, "pause")
         if response:
-            yield event.plain_result(response)
+            yield await self._rich_result(event, response)
 
-    @tavern.command("继续", alias={"恢复"}, priority=200)
+    @tavern.command("恢复", priority=200)
+    async def tavern_recover(self, event: AstrMessageEvent):
+        """进入恢复准备大厅，但不恢复剧情或计时。"""
+
+        response = await self._run_native_command(event, "recover")
+        if response:
+            yield await self._rich_result(event, response)
+
+    @tavern.command("继续", priority=200)
     async def tavern_resume(self, event: AstrMessageEvent):
-        """继续当前酒馆会话。"""
+        """在恢复准备完成后正式续演。"""
 
         response = await self._run_native_command(event, "resume")
         if response:
-            yield event.plain_result(response)
+            yield await self._rich_result(event, response)
 
     @tavern.command("关闭", priority=200)
     async def tavern_close(self, event: AstrMessageEvent):
@@ -932,7 +1661,7 @@ class TavernPlugin(Star):
 
         response = await self._run_native_command(event, "close")
         if response:
-            yield event.plain_result(response)
+            yield await self._rich_result(event, response)
 
     @tavern.command("完结", priority=200)
     async def tavern_finish(self, event: AstrMessageEvent):
@@ -940,7 +1669,7 @@ class TavernPlugin(Star):
 
         response = await self._run_native_command(event, "finish")
         if response:
-            yield event.plain_result(response)
+            yield await self._rich_result(event, response)
 
     @tavern.command("强制终止", priority=200)
     async def tavern_abort(self, event: AstrMessageEvent):
@@ -948,7 +1677,7 @@ class TavernPlugin(Star):
 
         response = await self._run_native_command(event, "abort")
         if response:
-            yield event.plain_result(response)
+            yield await self._rich_result(event, response)
 
     @tavern.command("安全暂停", priority=200)
     async def tavern_safety_pause(self, event: AstrMessageEvent):
@@ -956,7 +1685,7 @@ class TavernPlugin(Star):
 
         response = await self._run_native_command(event, "safety_pause")
         if response:
-            yield event.plain_result(response)
+            yield await self._rich_result(event, response)
 
     @tavern.command("维护", priority=200)
     async def tavern_maintenance(self, event: AstrMessageEvent):
@@ -964,7 +1693,7 @@ class TavernPlugin(Star):
 
         response = await self._run_native_command(event, "maintenance")
         if response:
-            yield event.plain_result(response)
+            yield await self._rich_result(event, response)
 
     @tavern.command("状态", priority=200)
     async def tavern_status(self, event: AstrMessageEvent):
@@ -972,7 +1701,7 @@ class TavernPlugin(Star):
 
         response = await self._run_native_command(event, "status")
         if response:
-            yield event.plain_result(response)
+            yield await self._rich_result(event, response)
 
     @tavern.command("存档", priority=200)
     async def tavern_save(self, event: AstrMessageEvent):
@@ -980,7 +1709,15 @@ class TavernPlugin(Star):
 
         response = await self._run_native_command(event, "save")
         if response:
-            yield event.plain_result(response)
+            yield await self._rich_result(event, response)
+
+    @tavern.command("删档", priority=200)
+    async def tavern_delete_save(self, event: AstrMessageEvent):
+        """删除普通手动存档。"""
+
+        response = await self._run_native_command(event, "delete_save")
+        if response:
+            yield await self._rich_result(event, response)
 
     @tavern.command("读档", priority=200)
     async def tavern_load(self, event: AstrMessageEvent):
@@ -988,7 +1725,7 @@ class TavernPlugin(Star):
 
         response = await self._run_native_command(event, "load")
         if response:
-            yield event.plain_result(response)
+            yield await self._rich_result(event, response)
 
     @tavern.command("回滚", priority=200)
     async def tavern_rollback(self, event: AstrMessageEvent):
@@ -996,7 +1733,7 @@ class TavernPlugin(Star):
 
         response = await self._run_native_command(event, "rollback")
         if response:
-            yield event.plain_result(response)
+            yield await self._rich_result(event, response)
 
     @tavern.command("世界列表", priority=200)
     async def tavern_worlds(self, event: AstrMessageEvent):
@@ -1004,7 +1741,7 @@ class TavernPlugin(Star):
 
         response = await self._run_native_command(event, "worlds")
         if response:
-            yield event.plain_result(response)
+            yield await self._rich_result(event, response)
 
     @tavern.command("副本列表", alias={"副本"}, priority=200)
     async def tavern_instances(self, event: AstrMessageEvent):
@@ -1012,7 +1749,7 @@ class TavernPlugin(Star):
 
         response = await self._run_native_command(event, "instances")
         if response:
-            yield event.plain_result(response)
+            yield await self._rich_result(event, response)
 
     @tavern.command("加入", priority=200)
     async def tavern_join(self, event: AstrMessageEvent):
@@ -1020,7 +1757,7 @@ class TavernPlugin(Star):
 
         response = await self._run_native_command(event, "join")
         if response:
-            yield event.plain_result(response)
+            yield await self._rich_result(event, response)
 
     @tavern.command("建卡", priority=200)
     async def tavern_card(self, event: AstrMessageEvent):
@@ -1028,7 +1765,7 @@ class TavernPlugin(Star):
 
         response = await self._run_native_command(event, "card")
         if response:
-            yield event.plain_result(response)
+            yield await self._rich_result(event, response)
 
     @tavern.command("填写", priority=200)
     async def tavern_card_fill(self, event: AstrMessageEvent):
@@ -1036,7 +1773,7 @@ class TavernPlugin(Star):
 
         response = await self._run_native_command(event, "card_fill")
         if response:
-            yield event.plain_result(response)
+            yield await self._rich_result(event, response)
 
     @tavern.command("预览", priority=200)
     async def tavern_card_preview(self, event: AstrMessageEvent):
@@ -1044,7 +1781,7 @@ class TavernPlugin(Star):
 
         response = await self._run_native_command(event, "card_preview")
         if response:
-            yield event.plain_result(response)
+            yield await self._rich_result(event, response)
 
     @tavern.command("重填数值", priority=200)
     async def tavern_card_stats_reset(self, event: AstrMessageEvent):
@@ -1055,7 +1792,18 @@ class TavernPlugin(Star):
             "card_stats_reset",
         )
         if response:
-            yield event.plain_result(response)
+            yield await self._rich_result(event, response)
+
+    @tavern.command("建卡提醒", priority=200)
+    async def tavern_card_timer_notice(self, event: AstrMessageEvent):
+        """在私聊中查询、开启或关闭角色卡倒计时提示。"""
+
+        response = await self._run_native_command(
+            event,
+            "card_timer_notice",
+        )
+        if response:
+            yield await self._rich_result(event, response)
 
     @tavern.command("确认建卡", priority=200)
     async def tavern_card_confirm(self, event: AstrMessageEvent):
@@ -1063,7 +1811,7 @@ class TavernPlugin(Star):
 
         response = await self._run_native_command(event, "card_confirm")
         if response:
-            yield event.plain_result(response)
+            yield await self._rich_result(event, response)
 
     @tavern.command("取消建卡", priority=200)
     async def tavern_card_cancel(self, event: AstrMessageEvent):
@@ -1071,7 +1819,7 @@ class TavernPlugin(Star):
 
         response = await self._run_native_command(event, "card_cancel")
         if response:
-            yield event.plain_result(response)
+            yield await self._rich_result(event, response)
 
     @tavern.command("角色", priority=200)
     async def tavern_character(self, event: AstrMessageEvent):
@@ -1079,7 +1827,7 @@ class TavernPlugin(Star):
 
         response = await self._run_native_command(event, "character")
         if response:
-            yield event.plain_result(response)
+            yield await self._rich_result(event, response)
 
     @tavern.command("准备", priority=200)
     async def tavern_ready(self, event: AstrMessageEvent):
@@ -1087,7 +1835,15 @@ class TavernPlugin(Star):
 
         response = await self._run_native_command(event, "ready")
         if response:
-            yield event.plain_result(response)
+            yield await self._rich_result(event, response)
+
+    @tavern.command("强制全员准备", priority=200)
+    async def tavern_force_ready(self, event: AstrMessageEvent):
+        """由主持人将全部合格出场角色设为已准备。"""
+
+        response = await self._run_native_command(event, "force_ready")
+        if response:
+            yield await self._rich_result(event, response)
 
     @tavern.command("阵容", priority=200)
     async def tavern_roster(self, event: AstrMessageEvent):
@@ -1095,7 +1851,7 @@ class TavernPlugin(Star):
 
         response = await self._run_native_command(event, "roster")
         if response:
-            yield event.plain_result(response)
+            yield await self._rich_result(event, response)
 
     @tavern.command("审核", priority=200)
     async def tavern_review(self, event: AstrMessageEvent):
@@ -1103,42 +1859,82 @@ class TavernPlugin(Star):
 
         response = await self._run_native_command(event, "review")
         if response:
-            yield event.plain_result(response)
+            yield await self._rich_result(event, response)
 
     @tavern.command("选择", priority=200)
     async def tavern_choose(self, event: AstrMessageEvent):
         """选择当前回合的 A/B/C/D 行动。"""
 
+        await self._send_event_text(
+            event,
+            "【酒馆】已收到你的选择，后续内容正在生成中……"
+        )
         response = await self._run_native_command(event, "choose")
         if response:
-            yield event.plain_result(response)
+            unsent = await self._send_event_parts(
+                event,
+                _story_reply_parts(response),
+            )
+            if unsent:
+                yield event.plain_result("\n\n".join(unsent))
 
     @tavern.command("重整选项", priority=200)
     async def tavern_reroll(self, event: AstrMessageEvent):
         """免费重整本回合选项一次。"""
 
+        await self._send_event_text(
+            event,
+            "🎲 【酒馆】已收到重整请求，正在重新生成本回合选项……",
+        )
         response = await self._run_native_command(event, "reroll")
         if response:
-            yield event.plain_result(response)
+            yield await self._rich_result(event, response)
 
     @tavern.command("灵感", priority=200)
     async def tavern_inspiration(self, event: AstrMessageEvent):
         """查看灵感，或在选择检定选项时消耗一点取得优势。"""
 
+        getter = getattr(event, "get_message_str", None)
+        raw_message = str(
+            getter() if callable(getter) else getattr(event, "message_str", "")
+        )
+        choosing = len(raw_message.strip().split()) >= 3
+        if choosing:
+            await self._send_event_text(
+                event,
+                "【酒馆】已收到你的选择，后续内容正在生成中……"
+            )
         response = await self._run_native_command(event, "inspiration")
         if response:
-            yield event.plain_result(response)
+            if choosing:
+                unsent = await self._send_event_parts(
+                    event,
+                    _story_reply_parts(response),
+                )
+                if unsent:
+                    yield event.plain_result("\n\n".join(unsent))
+            else:
+                yield await self._rich_result(event, response)
 
     @tavern.command("灵感重投", priority=200)
     async def tavern_inspiration_reroll(self, event: AstrMessageEvent):
         """选择检定选项并消耗一点灵感重投完整骰池。"""
 
+        await self._send_event_text(
+            event,
+            "【酒馆】已收到你的选择，后续内容正在生成中……"
+        )
         response = await self._run_native_command(
             event,
             "inspiration_reroll",
         )
         if response:
-            yield event.plain_result(response)
+            unsent = await self._send_event_parts(
+                event,
+                _story_reply_parts(response),
+            )
+            if unsent:
+                yield event.plain_result("\n\n".join(unsent))
 
     @tavern.command("投票", priority=200)
     async def tavern_vote(self, event: AstrMessageEvent):
@@ -1146,7 +1942,39 @@ class TavernPlugin(Star):
 
         response = await self._run_native_command(event, "vote")
         if response:
-            yield event.plain_result(response)
+            yield await self._rich_result(event, response)
+
+    @tavern.command("倒计时", priority=200)
+    async def tavern_countdown(self, event: AstrMessageEvent):
+        """查询、总开关或逐类开关副本倒计时。"""
+
+        response = await self._run_native_command(event, "countdown")
+        if response:
+            yield await self._rich_result(event, response)
+
+    @tavern.command("用量", alias={"Token用量"}, priority=200)
+    async def tavern_usage(self, event: AstrMessageEvent):
+        """查看当前群与副本的模型 Token 用量。"""
+
+        response = await self._run_native_command(event, "usage")
+        if response:
+            yield await self._rich_result(event, response)
+
+    @tavern.command("限额", alias={"Token限额"}, priority=200)
+    async def tavern_quota(self, event: AstrMessageEvent):
+        """设置当前群或副本的滚动 Token 限额。"""
+
+        response = await self._run_native_command(event, "quota")
+        if response:
+            yield await self._rich_result(event, response)
+
+    @tavern.command("删除副本", priority=200)
+    async def tavern_delete_session(self, event: AstrMessageEvent):
+        """删除已关闭或已归档副本并移入回收目录。"""
+
+        response = await self._run_native_command(event, "delete_session")
+        if response:
+            yield await self._rich_result(event, response)
 
     @tavern.command("暂离", priority=200)
     async def tavern_away(self, event: AstrMessageEvent):
@@ -1154,7 +1982,7 @@ class TavernPlugin(Star):
 
         response = await self._run_native_command(event, "away")
         if response:
-            yield event.plain_result(response)
+            yield await self._rich_result(event, response)
 
     @tavern.command("返回队列", priority=200)
     async def tavern_return_queue(self, event: AstrMessageEvent):
@@ -1162,7 +1990,7 @@ class TavernPlugin(Star):
 
         response = await self._run_native_command(event, "return_queue")
         if response:
-            yield event.plain_result(response)
+            yield await self._rich_result(event, response)
 
     @tavern.command("申请返场", priority=200)
     async def tavern_return_request(self, event: AstrMessageEvent):
@@ -1170,7 +1998,7 @@ class TavernPlugin(Star):
 
         response = await self._run_native_command(event, "return_request")
         if response:
-            yield event.plain_result(response)
+            yield await self._rich_result(event, response)
 
     @tavern.command("退出", priority=200)
     async def tavern_leave(self, event: AstrMessageEvent):
@@ -1178,7 +2006,7 @@ class TavernPlugin(Star):
 
         response = await self._run_native_command(event, "leave")
         if response:
-            yield event.plain_result(response)
+            yield await self._rich_result(event, response)
 
     @tavern.command("顺序", alias={"轮次"}, priority=200)
     async def tavern_order(self, event: AstrMessageEvent):
@@ -1186,7 +2014,7 @@ class TavernPlugin(Star):
 
         response = await self._run_native_command(event, "order")
         if response:
-            yield event.plain_result(response)
+            yield await self._rich_result(event, response)
 
     @tavern.command("跳过", priority=200)
     async def tavern_skip(self, event: AstrMessageEvent):
@@ -1194,15 +2022,15 @@ class TavernPlugin(Star):
 
         response = await self._run_native_command(event, "skip")
         if response:
-            yield event.plain_result(response)
+            yield await self._rich_result(event, response)
 
-    @tavern.command("下一位", priority=200)
+    @tavern.command("强制下一位", priority=200)
     async def tavern_next(self, event: AstrMessageEvent):
         """管理员强制跳过当前行动者。"""
 
         response = await self._run_native_command(event, "next")
         if response:
-            yield event.plain_result(response)
+            yield await self._rich_result(event, response)
 
     @tavern.command("帮助", priority=200)
     async def tavern_help(self, event: AstrMessageEvent):
@@ -1210,7 +2038,7 @@ class TavernPlugin(Star):
 
         response = await self._run_native_command(event, "help")
         if response:
-            yield event.plain_result(response)
+            yield await self._rich_result(event, response)
 
     @filter.on_astrbot_loaded()
     async def on_loaded(self):
@@ -1238,25 +2066,48 @@ class TavernPlugin(Star):
             )
 
     async def _timer_loop(self) -> None:
-        try:
-            while True:
+        # 自愈循环：异常时原地重试，不再另起一个 task。
+        # 旧实现会在异常分支里 create_task 派生新循环，
+        # 反复出错时会叠加出多个并行轮询，进一步放大刷屏。
+        while True:
+            try:
                 notifications = await self.database.process_due_timers()
                 for item in notifications:
                     await self._send_timer_notice(item)
-                await asyncio.sleep(15)
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.exception("AI 酒馆计时器轮询异常，将在稍后重试")
-            await asyncio.sleep(15)
-            if not self._timer_task or self._timer_task.cancelled():
-                return
-            self._timer_task = asyncio.create_task(
-                self._timer_loop(),
-                name="ai-tavern-timers-retry",
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("AI 酒馆计时器轮询异常，将在稍后重试")
+            await asyncio.sleep(TIMER_POLL_INTERVAL_SECONDS)
+
+    def _timer_notice_should_skip(self, item: Mapping[str, Any]) -> bool:
+        """同一计时器短时间内重复触发时丢弃，防止刷屏。"""
+
+        key = "|".join(
+            (
+                str(item.get("session_id") or ""),
+                str(item.get("timer_type") or ""),
+                str(item.get("participant_id") or ""),
+                str(item.get("kind") or ""),
             )
+        )
+        now = time.monotonic()
+        last = self._timer_notice_last_sent.get(key)
+        if last is not None and now - last < TIMER_NOTICE_DEDUP_SECONDS:
+            return True
+        self._timer_notice_last_sent[key] = now
+        if len(self._timer_notice_last_sent) > 512:
+            cutoff = now - TIMER_NOTICE_DEDUP_SECONDS * 4
+            self._timer_notice_last_sent = {
+                cached_key: seen
+                for cached_key, seen in self._timer_notice_last_sent.items()
+                if seen >= cutoff
+            }
+        return False
 
     async def _send_timer_notice(self, item: Mapping[str, Any]) -> None:
+        if self._timer_notice_should_skip(item):
+            return
         try:
             session = await self.database.get_session(
                 str(item.get("session_id") or "")
@@ -1264,12 +2115,14 @@ class TavernPlugin(Star):
             instance_config = await self.database.get_instance_config(
                 session["id"]
             )
-            if not instance_config["time_rules"].get(
-                "announce_timeouts",
-                True,
+            timer_type = str(item.get("timer_type") or "")
+            if timer_type != "card_completion" and not (
+                instance_config["time_rules"].get(
+                    "announce_timeouts",
+                    True,
+                )
             ):
                 return
-            timer_type = str(item.get("timer_type") or "")
             kind = str(item.get("kind") or "")
             labels = {
                 "turn": "行动回合",
@@ -1283,7 +2136,10 @@ class TavernPlugin(Star):
             }
             if kind == "idle_pause":
                 text = "【酒馆已自动暂停】全员超过设定时间没有酒馆互动。"
-                text += "全部计时已冻结；重新准备后由主持人发送 /酒馆 继续。"
+                text += (
+                    "全部计时已冻结；先由主持人发送 /酒馆 恢复，"
+                    "全员重新准备后再发送 /酒馆 继续。"
+                )
             elif kind == "reminder":
                 remaining = _format_remaining_time(
                     item.get("remaining_seconds")
@@ -1292,7 +2148,10 @@ class TavernPlugin(Star):
                     "turn": "请及时完成本回合操作。",
                     "vote": "请尚未投票的玩家完成投票。",
                     "card_code": "请及时绑定私聊建卡码。",
-                    "card_completion": "请及时完成角色卡创建。",
+                    "card_completion": (
+                        "请及时完成角色卡创建；"
+                        "关闭提示可发送 /酒馆 建卡提醒 关。"
+                    ),
                     "ready": "请及时完成准备确认。",
                     "preparation": "请及时完成准备流程。",
                     "standby": "请在保留期内返回队列。",
@@ -1316,10 +2175,12 @@ class TavernPlugin(Star):
                 return
             from astrbot.api.event import MessageChain
 
-            chain = MessageChain()
-            mention_count = 0
             targets = item.get("targets")
-            if isinstance(targets, Sequence):
+            target_items: list[Mapping[str, Any]] = []
+            if isinstance(targets, Sequence) and not isinstance(
+                targets,
+                (str, bytes),
+            ):
                 seen: set[str] = set()
                 for target in targets:
                     if not isinstance(target, Mapping):
@@ -1328,16 +2189,77 @@ class TavernPlugin(Star):
                     if not user_id or user_id in seen:
                         continue
                     seen.add(user_id)
+                    target_items.append(target)
+
+            private_delivery = timer_type == "card_completion"
+            if private_delivery:
+                private_origin = next(
+                    (
+                        str(target.get("private_origin") or "")
+                        for target in target_items
+                        if target.get("private_origin")
+                    ),
+                    "",
+                )
+                # QQ 官方机器人只能在玩家先建立私聊会话后主动私发。
+                # 未绑定建卡码时不回退到群聊，避免泄漏建卡倒计时。
+                if not private_origin:
+                    return
+                origin = private_origin
+
+            chain = MessageChain()
+            mention_count = 0
+            if not private_delivery:
+                platform_name = ""
+                get_platform_inst = getattr(
+                    self.context,
+                    "get_platform_inst",
+                    None,
+                )
+                if callable(get_platform_inst):
+                    platform = get_platform_inst(
+                        str(session.get("platform_id") or "")
+                    )
+                    if platform is not None:
+                        meta = getattr(platform, "meta", None)
+                        metadata = meta() if callable(meta) else None
+                        platform_name = str(
+                            getattr(metadata, "name", "") or ""
+                        )
+                if not platform_name:
+                    platform_name = str(
+                        session.get("platform_id") or ""
+                    )
+                qq_official = platform_name in {
+                    "qq_official",
+                    "qq_official_webhook",
+                }
+                for target in target_items:
+                    user_id = str(target.get("user_id") or "")
                     display_name = str(
                         target.get("display_name") or user_id
                     )
-                    chain.at(display_name, user_id).message(" ")
+                    if qq_official:
+                        # AstrBot 4.26 的 QQ 官方适配器会忽略 At 组件；
+                        # 使用 QQBot 官方文本交互协议才能形成真实艾特。
+                        escaped_id = html.escape(user_id, quote=True)
+                        chain.message(
+                            f'<qqbot-at-user id="{escaped_id}" /> '
+                        )
+                    else:
+                        chain.at(display_name, user_id).message(" ")
                     mention_count += 1
             if kind == "reminder" and timer_type in {
                 "vote",
                 "preparation",
             } and mention_count == 0:
                 return
+            # 主动消息之间保持最小间隔，避免一次吐出多条时触发
+            # QQ 官方频控（40034100），进而被整批拒绝。
+            gap = time.monotonic() - self._timer_notice_last_at
+            if gap < TIMER_NOTICE_MIN_GAP_SECONDS:
+                await asyncio.sleep(TIMER_NOTICE_MIN_GAP_SECONDS - gap)
+            self._timer_notice_last_at = time.monotonic()
             sent = await sender(origin, chain.message(text))
             if not sent:
                 logger.warning(
@@ -1351,20 +2273,59 @@ class TavernPlugin(Star):
                 item.get("session_id"),
             )
 
+    @staticmethod
+    def _looks_like_bare_tavern(text: str) -> bool:
+        """Whether ``text`` is a tavern command missing its ``/`` prefix."""
+
+        return text == "酒馆" or (
+            text.startswith("酒馆") and text[2:3].isspace()
+        )
+
+    def _parse_command_relaxed(
+        self,
+        event: AstrMessageEvent,
+        message: str,
+    ) -> ParsedCommand:
+        """Parse a tavern command, tolerating a missing ``/`` prefix.
+
+        某些接入方式（QQ 官方平台 + qq_restapi 全量群消息）会吞掉开头的
+        ``/``，并且把「视为被 @」的唤醒标记推迟到 handler 阶段才补写。
+        而 AstrBot 的 ``CommandFilter`` 在更早的唤醒检查阶段就会因
+        ``is_at_or_wake_command`` 为假而把全部原生指令过滤掉，导致指令
+        静默失效。因此这里不再依赖唤醒标记，直接按裸指令兜底解析。
+        """
+
+        command = parse_tavern_command(message)
+        if command.matched:
+            return command
+        text = str(message or "").strip()
+        if not self._looks_like_bare_tavern(text):
+            return command
+        relaxed = parse_tavern_command("/" + text)
+        if not relaxed.matched:
+            return command
+        if relaxed.action not in ("unknown", "help"):
+            return relaxed
+        # 裸「酒馆」与无法识别的动作只在确实被唤醒时回应，
+        # 避免把普通群聊里的日常用词误当成指令。
+        if bool(getattr(event, "is_at_or_wake_command", False)):
+            return relaxed
+        return command
+
     @filter.event_message_type(
         getattr(filter.EventMessageType, "PRIVATE_MESSAGE", "private"),
         priority=110,
     )
     async def on_private_message(self, event: AstrMessageEvent):
         message = str(getattr(event, "message_str", "") or "").strip()
-        command = parse_tavern_command(message)
+        command = self._parse_command_relaxed(event, message)
         response = await self._handle_private_card_message(
             event,
             command,
             message,
         )
         if response:
-            yield event.plain_result(response)
+            yield await self._rich_result(event, response)
 
     @filter.event_message_type(
         filter.EventMessageType.GROUP_MESSAGE,
@@ -1372,20 +2333,7 @@ class TavernPlugin(Star):
     )
     async def on_group_message(self, event: AstrMessageEvent):
         message = str(event.message_str or "")
-        command = parse_tavern_command(message)
-        normalized_message = message.strip()
-        if (
-            not command.matched
-            and bool(getattr(event, "is_at_or_wake_command", False))
-            and (
-                normalized_message == "酒馆"
-                or (
-                    normalized_message.startswith("酒馆")
-                    and normalized_message[2:3].isspace()
-                )
-            )
-        ):
-            command = parse_tavern_command("/" + normalized_message)
+        command = self._parse_command_relaxed(event, message)
         config = self.runtime_config()
         group_id = self._group_id(event)
         sender_id = str(event.get_sender_id() or "")
@@ -1426,7 +2374,7 @@ class TavernPlugin(Star):
                     else None
                 )
             if response:
-                yield event.plain_result(response)
+                yield await self._rich_result(event, response)
             return
 
         if content is None:
@@ -1437,45 +2385,57 @@ class TavernPlugin(Star):
             platform_id,
             group_id,
         )
+        self._remember_rich_title(event, session)
 
         event.stop_event()
         if not session or session["state"] == SESSION_CLOSED:
-            yield event.plain_result(
-                "【酒馆】当前群尚未开馆，请由管理员发送 /酒馆 开启。"
+            yield await self._rich_result(
+                event, "【酒馆】当前群尚未开馆，请由管理员发送 /酒馆 开启。"
             )
             return
         if session["state"] == SESSION_PREPARING:
-            yield event.plain_result(
+            next_command = (
+                "/酒馆 继续"
+                if int(session.get("turn_no") or 0) > 0
+                else "/酒馆 开演"
+            )
+            yield await self._rich_result(
+                event,
                 "【故事尚未开演】当前处于角色准备阶段。"
                 "请先完成角色卡并发送 /酒馆 准备，"
-                "由主持人发送 /酒馆 开演 或 /酒馆 继续。"
+                f"由主持人发送 {next_command}。",
             )
             return
         if session["state"] == SESSION_PAUSED:
-            yield event.plain_result(
-                "【酒馆】剧情已暂停，本条内容未记录。"
+            yield await self._rich_result(
+                event, "【酒馆】剧情已暂停，本条内容未记录。"
             )
             return
         if session["state"] == SESSION_FINISHED:
-            yield event.plain_result(
-                "【酒馆】故事已经完结，本条内容未记录。"
+            yield await self._rich_result(
+                event, "【酒馆】故事已经完结，本条内容未记录。"
             )
             return
         if session["state"] == SESSION_MAINTENANCE:
-            yield event.plain_result(
-                "【酒馆】当前处于维护模式，本条内容未记录。"
+            yield await self._rich_result(
+                event, "【酒馆】当前处于维护模式，本条内容未记录。"
             )
             return
 
         try:
             vote = await self.database.active_vote(session["id"])
             if vote:
-                yield event.plain_result(
+                yield await self._rich_result(
+                    event,
                     "【集体投票进行中】请使用 /酒馆 投票 A；"
-                    "投票不会消耗个人行动机会。"
+                    "投票不会消耗个人行动机会。",
                 )
                 return
             choice_key, flavor_text = parse_choice_input(content)
+            await self._send_event_text(
+                event,
+                "【酒馆】已收到你的选择，后续内容正在生成中……"
+            )
             reply = await self.engine.process_choice(
                 event=event,
                 session_id=session["id"],
@@ -1484,7 +2444,16 @@ class TavernPlugin(Star):
                 choice_key=choice_key,
                 flavor_text=flavor_text,
             )
-            yield event.plain_result(reply.text)
+            reply_parts: list[str] = []
+            if reply.story_text:
+                reply_parts.append(reply.story_text)
+            if reply.turn_text:
+                reply_parts.append(reply.turn_text)
+            if not reply.story_text and not reply.turn_text:
+                reply_parts.append(reply.text)
+            unsent = await self._send_event_parts(event, reply_parts)
+            if unsent:
+                yield event.plain_result("\n\n".join(unsent))
         except TavernTurnOrderError as exc:
             yield event.plain_result(f"【回合秩序】{exc}")
         except TavernBusyError as exc:
@@ -1546,6 +2515,7 @@ class TavernPlugin(Star):
             platform_id,
             group_id,
         )
+        self._remember_rich_title(event, session)
         roles = (
             await self.database.permission_roles(session["id"], sender_id)
             if session
@@ -1557,16 +2527,23 @@ class TavernPlugin(Star):
             "start",
             "perform",
             "pause",
+            "recover",
             "resume",
             "close",
             "finish",
             "abort",
             "save",
+            "delete_save",
             "load",
             "rollback",
             "save_list",
             "review",
+            "force_ready",
             "extend",
+            "countdown",
+            "usage",
+            "quota",
+            "delete_session",
             "instances",
             "worlds",
         }
@@ -1645,6 +2622,31 @@ class TavernPlugin(Star):
                     f"【酒馆】未知命令：{command.raw_action}\n\n{help_text}"
                 )
             return help_text
+
+        # ── 暂停态守卫 ─────────────────────────────────────────────
+        # 会话处于「已暂停」时，任何会改变剧情 / 选项 / 投票 / 队列 /
+        # 角色卡的玩法指令都必须拦截，避免“已暂停却能重整选项、推进游戏”。
+        # 仅放行主持人 / 管理员的会话管理类指令（恢复、续演、关闭、存档、
+        # 状态查询等），这些指令在上方权限层已做 host 校验。
+        if session and session["state"] == SESSION_PAUSED:
+            paused_blocked_actions = {
+                # 选项 / 行动 / 投票（核心玩法循环）
+                "choose", "reroll", "inspiration", "inspiration_reroll",
+                "vote",
+                # 队列 / 回合控制
+                "join", "ready", "away", "return_queue", "return_request",
+                "delegate", "delegate_revoke", "leave", "order", "skip",
+                "next", "move", "designate", "perform", "force_ready",
+                # 角色卡建立
+                "card", "card_fill", "card_preview", "card_stats_reset",
+                "card_timer_notice", "card_confirm", "card_cancel",
+            }
+            if command.action in paused_blocked_actions:
+                return (
+                    "【酒馆】剧情已暂停，暂不可进行选项 / 投票 / 行动 / "
+                    "建卡等玩法操作。\n请先由主持人发送 /酒馆 恢复 "
+                    "进入恢复准备大厅，再发送 /酒馆 继续 续演。"
+                )
 
         try:
             if command.action == "worlds":
@@ -1764,6 +2766,11 @@ class TavernPlugin(Star):
                         merged_time_rules,
                         sender_id,
                     )
+                elif int(session.get("turn_no") or 0) > 0:
+                    await self.database.pause_session_timers(
+                        session["id"],
+                        sender_id,
+                    )
                 session = await self.database.transition_session(
                     session["id"],
                     SESSION_PREPARING,
@@ -1813,9 +2820,18 @@ class TavernPlugin(Star):
                     + "\n\n"
                     + format_roster(roster)
                     + (
-                        "\n\n玩家发送 /酒馆 加入，按提示私聊建卡，"
-                        "完成后发送 /酒馆 准备。"
-                        "\n主持人最后发送 /酒馆 开演；此时不会自动开演。"
+                        (
+                            "\n\n这是已有剧情进度的副本，暂停时的对话、"
+                            "行动者、投票与选项均已保留。"
+                            "\n全员确认准备后，主持人发送 /酒馆 继续；"
+                            "不要使用 /酒馆 开演。"
+                        )
+                        if int(session.get("turn_no") or 0) > 0
+                        else (
+                            "\n\n玩家发送 /酒馆 加入，按提示私聊建卡，"
+                            "完成后发送 /酒馆 准备。"
+                            "\n主持人最后发送 /酒馆 开演；此时不会自动开演。"
+                        )
                     )
                 )
 
@@ -1950,7 +2966,11 @@ class TavernPlugin(Star):
                 )
                 waiting = len(preflight["blockers"])
                 suffix = (
-                    "\n【全员准备完成】主持人现在可以发送 /酒馆 开演"
+                    (
+                        "\n【全员准备完成】主持人现在可以发送 /酒馆 继续"
+                        if preflight.get("resume_mode")
+                        else "\n【全员准备完成】主持人现在可以发送 /酒馆 开演"
+                    )
                     if preflight["ok"]
                     else f"\n当前仍有 {waiting} 项准备阻塞。"
                 )
@@ -1958,6 +2978,45 @@ class TavernPlugin(Star):
                     f"【{participant.get('character_name') or participant.get('display_name')} 已准备】"
                     + suffix
                 )
+            if command.action == "force_ready":
+                if command.argument not in {"确认", "confirm", "CONFIRM"}:
+                    return (
+                        "【确认强制全员准备】只会处理角色卡已审核通过、"
+                        "且当前出场的玩家；不会绕过建卡或审核。"
+                        "\n请发送：/酒馆 强制全员准备 确认"
+                    )
+                result = await self.database.force_all_ready(
+                    session["id"],
+                    sender_id,
+                )
+                lines = [
+                    "【强制准备完成】",
+                    f"已准备：{result['ready_count']} 人",
+                ]
+                if result["skipped"]:
+                    lines.append(
+                        "未处理："
+                        + "；".join(
+                            (
+                                f"{item['name']}（{item['card_status']}/"
+                                f"{item['participation_status']}）"
+                            )
+                            for item in result["skipped"]
+                        )
+                    )
+                preflight = await self.database.opening_preflight(
+                    session["id"]
+                )
+                lines.append(
+                    "主持人现在可以发送 /酒馆 继续。"
+                    if int(session.get("turn_no") or 0) > 0
+                    else "主持人现在可以发送 /酒馆 开演。"
+                )
+                if not preflight["ok"]:
+                    lines.append(
+                        "仍有阻塞：" + "；".join(preflight["blockers"])
+                    )
+                return "\n".join(lines)
             if command.action == "roster":
                 return format_roster(
                     await self.database.list_roster(session["id"])
@@ -2466,6 +3525,218 @@ class TavernPlugin(Star):
                     f" · 新截止：{timer.get('deadline_at') or '暂停中'}"
                 )
 
+            if command.action == "countdown":
+                labels = {
+                    "card_code": "建卡码",
+                    "card_completion": "角色卡完成",
+                    "preparation": "准备大厅",
+                    "ready": "准备确认",
+                    "turn": "行动回合",
+                    "vote": "集体投票",
+                    "standby": "候补等待",
+                }
+                aliases = {
+                    "总": "all",
+                    "全部": "all",
+                    "全局": "all",
+                    "建卡码": "card_code",
+                    "建卡": "card_completion",
+                    "角色卡": "card_completion",
+                    "准备阶段": "preparation",
+                    "准备大厅": "preparation",
+                    "准备": "ready",
+                    "回合": "turn",
+                    "行动": "turn",
+                    "投票": "vote",
+                    "候补": "standby",
+                }
+                argument = str(command.argument or "").strip()
+                compact = argument.replace(" ", "")
+                if not argument or argument in {"状态", "status"}:
+                    policy = await self.database.get_timer_policy(
+                        session["id"]
+                    )
+                else:
+                    setting: bool | None = None
+                    target_text = ""
+                    for suffix, value in (
+                        ("开启", True),
+                        ("打开", True),
+                        ("开", True),
+                        ("关闭", False),
+                        ("关", False),
+                    ):
+                        if compact.endswith(suffix):
+                            target_text = compact[: -len(suffix)]
+                            setting = value
+                            break
+                    if setting is None or target_text not in aliases:
+                        return (
+                            "【倒计时】格式：\n"
+                            "/酒馆 倒计时 状态\n"
+                            "/酒馆 倒计时 总关\n"
+                            "/酒馆 倒计时 回合 关\n"
+                            "/酒馆 倒计时 投票 开"
+                        )
+                    policy = await self.database.set_timer_policy(
+                        session["id"],
+                        aliases[target_text],
+                        setting,
+                        sender_id,
+                    )
+                lines = [
+                    "【倒计时开关】",
+                    "总开关："
+                    + (
+                        "开启"
+                        if policy["global_enabled"]
+                        else "关闭（全部冻结）"
+                    ),
+                ]
+                for key, label in labels.items():
+                    switch = policy["switches"][key]
+                    effective = policy["effective"][key]
+                    lines.append(
+                        f"· {label}："
+                        + (
+                            "开启"
+                            if effective
+                            else (
+                                "分类关闭"
+                                if not switch
+                                else "随总开关冻结"
+                            )
+                        )
+                    )
+                lines.append("关闭后保留真实剩余时间，不执行超时处罚。")
+                return "\n".join(lines)
+
+            if command.action == "usage":
+                usage = await self.database.token_usage_summary(
+                    session["id"]
+                )
+                lines = [
+                    "【Token 用量】",
+                    (
+                        "当前副本："
+                        f"1小时 {usage['session']['hour']} · "
+                        f"24小时 {usage['session']['day']} · "
+                        f"累计 {usage['session']['all']}"
+                    ),
+                    (
+                        "当前群："
+                        f"1小时 {usage['group']['hour']} · "
+                        f"24小时 {usage['group']['day']} · "
+                        f"累计 {usage['group']['all']}"
+                    ),
+                ]
+                if usage["quotas"]:
+                    lines.append("滚动限额：")
+                    for item in usage["quotas"]:
+                        scope = (
+                            "群"
+                            if item["scope_type"] == "group"
+                            else "副本"
+                        )
+                        lines.append(
+                            f"· {scope}：{item['used']}/"
+                            f"{item['token_limit']}，"
+                            f"剩余 {item['remaining']}，"
+                            f"窗口 {_format_remaining_time(item['window_seconds'])}"
+                            + ("" if item["enabled"] else "（已关闭）")
+                        )
+                else:
+                    lines.append("滚动限额：未设置")
+                return "\n".join(lines)
+
+            if command.action == "quota":
+                parts = str(command.argument or "").strip().split()
+                if not parts or parts[0] not in {"群", "副本"}:
+                    return (
+                        "【Token 限额】格式：\n"
+                        "/酒馆 限额 群 24小时 500000\n"
+                        "/酒馆 限额 副本 1小时 100000\n"
+                        "/酒馆 限额 群 关"
+                    )
+                scope_type = "group" if parts[0] == "群" else "session"
+                if len(parts) == 2 and parts[1] in {"关", "关闭"}:
+                    current_usage = await self.database.token_usage_summary(
+                        session["id"]
+                    )
+                    current = next(
+                        (
+                            item for item in current_usage["quotas"]
+                            if item["scope_type"] == scope_type
+                        ),
+                        None,
+                    )
+                    if not current:
+                        return "【Token 限额】该范围尚未设置限额。"
+                    await self.database.set_token_quota(
+                        session["id"],
+                        scope_type,
+                        window_seconds=current["window_seconds"],
+                        token_limit=current["token_limit"],
+                        enabled=False,
+                        actor_id=sender_id,
+                    )
+                    return f"【Token 限额已关闭】{parts[0]}范围不再拦截请求。"
+                if len(parts) != 3:
+                    return (
+                        "【Token 限额】请提供时间窗口和 Token 上限，"
+                        "例如：/酒馆 限额 副本 1小时 100000"
+                    )
+                window_seconds = parse_duration(parts[1])
+                token_limit = int(parts[2])
+                result = await self.database.set_token_quota(
+                    session["id"],
+                    scope_type,
+                    window_seconds=window_seconds,
+                    token_limit=token_limit,
+                    enabled=True,
+                    actor_id=sender_id,
+                )
+                item = next(
+                    entry for entry in result["quotas"]
+                    if entry["scope_type"] == scope_type
+                )
+                return (
+                    f"【Token 限额已设置】{parts[0]}\n"
+                    f"窗口：{_format_remaining_time(item['window_seconds'])}\n"
+                    f"上限：{item['token_limit']} Token\n"
+                    f"当前已用：{item['used']} · 剩余：{item['remaining']}"
+                )
+
+            if command.action == "delete_session":
+                argument = str(command.argument or "").strip()
+                prefix = "确认 "
+                if not argument.startswith(prefix):
+                    return (
+                        "【确认删除整个副本】只能删除已关闭或已归档副本；"
+                        "角色、剧情、Token 流水、存档和独立数据库会一并移入"
+                        "回收目录。\n请发送：/酒馆 删除副本 确认 "
+                        f"{session['instance_name']}"
+                    )
+                confirm_name = argument[len(prefix) :].strip()
+                result = await self.database.delete_session(
+                    session["id"],
+                    sender_id,
+                    confirm_name,
+                )
+                suffix = (
+                    "\n副本文件已移入回收目录，可由服务器管理员恢复。"
+                    if result.get("trash_path")
+                    else "\n目录中没有残留的副本文件。"
+                )
+                if result.get("trash_error"):
+                    suffix = (
+                        "\n数据库记录已删除，但文件移入回收目录失败："
+                        + result["trash_error"]
+                    )
+                return (
+                    f"【副本已删除】{result['instance_name']}" + suffix
+                )
+
             if command.action == "pause":
                 await self.database.pause_session_timers(
                     session["id"],
@@ -2479,6 +3750,7 @@ class TavernPlugin(Star):
                 return (
                     "【酒馆已暂停】现场、未完成选项、投票和剩余时间"
                     "均已持久化；暂停期间默认不计时。"
+                    "\n恢复时请先发送 /酒馆 恢复。"
                 )
             if command.action == "safety_pause":
                 if session["state"] == SESSION_PAUSED:
@@ -2508,9 +3780,10 @@ class TavernPlugin(Star):
                 )
                 return (
                     "【安全暂停】故事、行动、投票与全部计时已立即冻结。"
-                    "\n无需在群内说明原因；由主持人与参与者确认边界后再恢复。"
+                    "\n无需在群内说明原因；由主持人与参与者确认边界后，"
+                    "由主持人发送 /酒馆 恢复。"
                 )
-            if command.action == "resume":
+            if command.action == "recover":
                 if session["state"] in {
                     SESSION_PAUSED,
                     SESSION_MAINTENANCE,
@@ -2527,11 +3800,49 @@ class TavernPlugin(Star):
                         + format_roster(
                             await self.database.list_roster(session["id"])
                         )
-                        + "\n\n全员重新发送 /酒馆 准备；完成后主持人再次发送 /酒馆 继续。"
+                        + "\n\n全员重新发送 /酒馆 准备；"
+                        "完成后主持人发送 /酒馆 继续。"
+                    )
+                if session["state"] == SESSION_PREPARING:
+                    if int(session.get("turn_no") or 0) > 0:
+                        return (
+                            "【酒馆】已经位于恢复准备大厅。"
+                            "请等待全员发送 /酒馆 准备；"
+                            "全部完成后由主持人发送 /酒馆 继续。"
+                        )
+                    return (
+                        "【酒馆】当前是新故事准备大厅，"
+                        "准备完成后请使用 /酒馆 开演。"
+                    )
+                if session["state"] == SESSION_RUNNING:
+                    return (
+                        "【酒馆】故事当前正在运行，无需恢复。"
+                        "如需停团，请先发送 /酒馆 暂停。"
+                    )
+                if session["state"] == SESSION_CLOSED:
+                    return (
+                        "【酒馆】副本当前已关闭；"
+                        "请使用 /酒馆 开启 <副本标识> 重新进入。"
+                    )
+                raise InvalidTransitionError("当前副本状态不能进入恢复准备大厅")
+            if command.action == "resume":
+                if session["state"] in {
+                    SESSION_PAUSED,
+                    SESSION_MAINTENANCE,
+                }:
+                    return (
+                        "【酒馆】副本仍处于暂停状态。"
+                        "请先发送 /酒馆 恢复 进入恢复准备大厅；"
+                        "本次没有切换状态，也没有恢复任何计时。"
                     )
                 if session["state"] != SESSION_PREPARING:
                     raise InvalidTransitionError(
-                        "只有暂停后进入准备大厅的副本可以继续"
+                        "只有恢复准备大厅中的副本可以继续"
+                    )
+                if int(session.get("turn_no") or 0) <= 0:
+                    return (
+                        "【酒馆】该副本尚未产生剧情，"
+                        "新故事请使用 /酒馆 开演。"
                     )
                 result = await self.database.activate_story(
                     session["id"],
@@ -2547,10 +3858,27 @@ class TavernPlugin(Star):
                     session["id"],
                     sender_id,
                 )
+                session = result["session"]
                 current = result["current_participant"]
+                active_vote = await self.database.active_vote(session["id"])
+                recent_events = await self.database.recent_events(
+                    session["id"],
+                    80,
+                )
+                last_story = next(
+                    (
+                        str(item.get("content") or "")
+                        for item in reversed(recent_events)
+                        if item.get("role") == "narrator"
+                    ),
+                    str(
+                        session["world_state"].get("scene_summary")
+                        or "暂无剧情正文"
+                    ),
+                )
                 workflow_text = (
-                    format_vote(result["vote"])
-                    if result.get("vote")
+                    format_vote(active_vote)
+                    if active_vote
                     else format_choices(
                         current.get("character_name")
                         or current.get("display_name"),
@@ -2567,12 +3895,19 @@ class TavernPlugin(Star):
                         ),
                     )
                 )
+                timer_text = format_recovered_timer(
+                    await self.database.list_timers(session["id"]),
+                    vote_active=bool(active_vote),
+                )
                 return (
-                    f"【故事继续】{session['instance_name']}\n"
-                    f"当前行动者："
+                    f"📜 【故事继续】{session['instance_name']}\n"
+                    f"🎭 当前行动者："
                     f"{current.get('character_name') or current.get('display_name')}"
+                    f"\n\n📖 【恢复时的最后剧情】\n{last_story}"
                     "\n\n"
                     + workflow_text
+                    + "\n\n"
+                    + timer_text
                 )
             if command.action == "close":
                 await self.database.pause_session_timers(
@@ -2669,16 +4004,64 @@ class TavernPlugin(Star):
                     )
                 if not command.argument:
                     return "【酒馆】请提供存档名：/酒馆 存档 <名称>"
+                name = str(command.argument).strip()
+                replace = False
+                if name.endswith(" 覆盖确认"):
+                    name = name[: -len(" 覆盖确认")].strip()
+                    replace = True
+                existing = next(
+                    (
+                        item
+                        for item in await self.database.list_snapshots(
+                            session["id"]
+                        )
+                        if item["name"] == name
+                    ),
+                    None,
+                )
+                if existing and not replace:
+                    return (
+                        "【发现同名存档】\n"
+                        f"存档：{existing['name']}\n"
+                        f"位置：第 {existing['turn_no']} 回合\n"
+                        f"创建时间：{existing['created_at']}\n\n"
+                        f"确认覆盖请发送：/酒馆 存档 {name} 覆盖确认"
+                    )
                 snapshot = await self.database.create_snapshot(
                     session["id"],
-                    command.argument,
+                    name,
                     sender_id,
-                    replace=False,
+                    replace=replace,
                 )
                 return (
-                    f"【存档完成】{snapshot['name']}"
-                    f"\n记录于第 {snapshot['turn_no']} 回合。"
+                    (
+                        f"【覆盖成功】{snapshot['name']}"
+                        if replace
+                        else f"【存档完成】{snapshot['name']}"
+                    )
+                    + f"\n记录于第 {snapshot['turn_no']} 回合。"
                 )
+            if command.action == "delete_save":
+                if not command.argument:
+                    return "【酒馆】格式：/酒馆 删档 <存档名>"
+                snapshots = await self.database.list_snapshots(
+                    session["id"]
+                )
+                snapshot = next(
+                    (
+                        item for item in snapshots
+                        if item["id"] == command.argument
+                        or item["name"] == command.argument
+                    ),
+                    None,
+                )
+                if not snapshot:
+                    raise DatabaseNotFoundError("存档不存在")
+                await self.database.delete_snapshot(
+                    snapshot["id"],
+                    sender_id,
+                )
+                return f"【删档完成】已删除存档「{snapshot['name']}」。"
             if command.action == "load":
                 if not command.argument:
                     return "【酒馆】请提供存档名：/酒馆 读档 <名称>"
@@ -2693,7 +4076,7 @@ class TavernPlugin(Star):
                 )
                 return (
                     f"【读档完成】已恢复至第 {restored['turn_no']} 回合。"
-                    "\n会话已暂停；发送 /酒馆 继续 进入恢复准备大厅。"
+                    "\n会话已暂停；发送 /酒馆 恢复 进入恢复准备大厅。"
                 )
             if command.action == "rollback":
                 restored = await self.database.restore_latest_auto(
@@ -2706,7 +4089,7 @@ class TavernPlugin(Star):
                 )
                 return (
                     f"【回滚完成】已恢复至第 {restored['turn_no']} 回合。"
-                    "\n会话已暂停；发送 /酒馆 继续 进入恢复准备大厅。"
+                    "\n会话已暂停；发送 /酒馆 恢复 进入恢复准备大厅。"
                 )
         except (
             DatabaseNotFoundError,

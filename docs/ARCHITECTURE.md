@@ -1,4 +1,4 @@
-# v0.5.1 Alpha 架构与安全边界
+# v0.6.0 架构与安全边界
 
 ## 对象分层
 
@@ -147,7 +147,7 @@ flowchart TD
 
 ## 存档
 
-Schema 5 的回合级快速恢复点除世界状态与时间线指针外，还包含：
+Schema 6 的回合级快速恢复点除世界状态与剧情事件锚点外，还包含：
 
 - 角色卡引用和角色副本运行状态
 - 参与、准备、候补、暂离和退场状态
@@ -161,14 +161,14 @@ Schema 5 的回合级快速恢复点除世界状态与时间线指针外，还�
 ## 数据库与升级
 
 - SQLite WAL、外键和 busy timeout。
-- Schema 5 使用 `catalog.sqlite3` 协调全局目录和兼容事务。
+- Schema 6 使用 `catalog.sqlite3` 协调全局目录和兼容事务。
 - 每个群拥有稳定目录，每轮故事副本拥有带创建时间和唯一 ID 的独立目录。
 - 每个副本持续物化为自包含 `instance.sqlite3`，并用 `manifest.json` 与 SHA-256 校验。
 - 回合级恢复点保存在副本数据库内部；手动、最终和周期备份生成独立时间戳 ZIP。
-- Schema 5 结构升级前用 SQLite backup API 生成一致备份。
+- Schema 6 结构升级前用 SQLite backup API 生成一致备份。
 - 备份失败时停止迁移。
 - 0.4 `finished` 自动迁移为永久归档。
-- Schema 1—4 JSON 备份可导入并补齐 0.5.1 状态。
+- Schema 1—5 JSON 备份可导入并补齐 0.5.3 的倒计时与 Token 状态。
 
 目录关系：
 

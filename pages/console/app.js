@@ -1384,13 +1384,19 @@ function renderSessions() {
                   : ""
               }</p>
             </div>
-            <button class="action-button" data-group-action="remark"
-              data-platform-id="${escapeHTML(sample.platform_id)}"
-              data-group-id="${escapeHTML(sample.group_id)}"
-              data-group-remark="${escapeHTML(remark)}"
-              data-group-revision="${escapeHTML(
-                meta.revision || sample.group_revision || 1,
-              )}">编辑群备注</button>
+            <div class="table-actions">
+              <button class="action-button" data-group-action="token-quota"
+                data-platform-id="${escapeHTML(sample.platform_id)}"
+                data-group-id="${escapeHTML(sample.group_id)}"
+                data-group-name="${escapeHTML(displayName)}">群 Token 限额</button>
+              <button class="action-button" data-group-action="remark"
+                data-platform-id="${escapeHTML(sample.platform_id)}"
+                data-group-id="${escapeHTML(sample.group_id)}"
+                data-group-remark="${escapeHTML(remark)}"
+                data-group-revision="${escapeHTML(
+                  meta.revision || sample.group_revision || 1,
+                )}">编辑群备注</button>
+            </div>
           </header>
           <div class="session-card-grid">${sessions
             .map(sessionCardMarkup)
@@ -1497,7 +1503,7 @@ function openWorldEditor(world = null) {
       <div class="form-grid">
         <div class="field">
           <label for="world-name">世界名称</label>
-          <input id="world-name" value="${escapeHTML(item.name)}" maxlength="100" />
+          <input id="world-name" value="${escapeHTML(item.name)}" maxlength="400" />
         </div>
         <div class="field">
           <label for="world-slug">唯一标识</label>
@@ -1586,6 +1592,7 @@ function openWorldEditor(world = null) {
             prettyJSON(characterCardTemplate),
           )}</textarea>
           <small>独立校验模板版本、重复字段、name/code 必需字段、属性预算与范围；常驻 NPC 不在这里管理。</small>
+          <div class="template-preview" id="world-character-card-preview" hidden></div>
         </div>
         <div class="field field-span-2">
           <label for="world-state">初始世界状态 JSON</label>
@@ -1629,20 +1636,28 @@ function openWorldEditor(world = null) {
     toast("已恢复默认角色卡模板；保存世界后生效", "success");
   });
   $("#preview-character-card").addEventListener("click", () => {
-    const template = validateCharacterCardTemplate(
-      parseJSONField("#world-character-card", "玩家角色卡模板"),
-    );
-    const fields = template.fields
-      .map(
-        (field, index) =>
-          `${index + 1}. ${field.label || field.key}${field.required ? "（必填）" : "（选填）"}${
-            field.private ? " · 私密" : ""
-          }`,
-      )
-      .join("\n");
-    window.alert(
-      `模板 v${template.version} · ${template.fields.length} 个字段 · 属性预算 ${template.stats.budget}\n\n${fields}`,
-    );
+    // 预览必须自带异常处理：模板缺少 fields / JSON 非法时会抛错，
+    // 之前既没有 try/catch 也没有页面内反馈，表现为“点了没反应”。
+    const panel = $("#world-character-card-preview");
+    try {
+      const template = validateCharacterCardTemplate(
+        parseJSONField("#world-character-card", "玩家角色卡模板"),
+      );
+      // 不再使用 window.alert：控制台以 iframe 形式嵌在 AstrBot 面板中，
+      // 浏览器会静默拦截跨源 iframe 里的模态框，导致点击毫无反馈。
+      panel.innerHTML = renderCharacterCardTemplatePreview(template);
+      panel.hidden = false;
+      toast(
+        `模板 v${template.version} 校验通过 · ${template.fields.length} 个字段`,
+        "success",
+      );
+    } catch (error) {
+      panel.innerHTML = `<p class="template-preview-error">${escapeHTML(
+        error?.message || String(error),
+      )}</p>`;
+      panel.hidden = false;
+      showError(error);
+    }
   });
 }
 
@@ -2207,6 +2222,19 @@ async function openSessionDetail(sessionId) {
   const ledger = detail.story_ledger || [];
   const clocks = detail.scene_clocks || [];
   const storage = detail.storage || {};
+  const timerPolicy = detail.timer_policy || {
+    global_enabled: true,
+    switches: {},
+    effective: {},
+  };
+  const tokenUsage = detail.token_usage || {
+    session: { hour: 0, day: 0, all: 0 },
+    group: { hour: 0, day: 0, all: 0 },
+    quotas: [],
+    by_type: [],
+  };
+  const sessionQuota =
+    tokenUsage.quotas.find((item) => item.scope_type === "session") || {};
   const characterCardTemplate = resolvedCharacterCardTemplate(detail);
   const readonly = Boolean(detail.archive?.readonly);
   const turn = detail.turn || {
@@ -2431,9 +2459,14 @@ async function openSessionDetail(sessionId) {
     <div class="tab-panel" data-session-tab-panel="roster">
       <div class="section-toolbar">
         <p>每名玩家均显示完整角色资料、属性修正、当前副本状态与审核记录；点击卡片标题可收起或展开。</p>
-        <span class="status-badge status-${escapeHTML(session.state)}">${escapeHTML(
-          detail.preflight?.ok ? "可开演" : `${detail.preflight?.blockers?.length || 0} 项阻塞`,
-        )}</span>
+        <div class="toolbar-actions">
+          <span class="status-badge status-${escapeHTML(session.state)}">${escapeHTML(
+            detail.preflight?.ok ? "可开演" : `${detail.preflight?.blockers?.length || 0} 项阻塞`,
+          )}</span>
+          <button class="button button-primary" data-session-detail-action="force-ready" ${
+            readonly || session.state !== "preparing" ? "disabled" : ""
+          }>强制所有合格角色准备</button>
+        </div>
       </div>
       <div class="roster-character-list">
         ${
@@ -2464,6 +2497,68 @@ async function openSessionDetail(sessionId) {
       }
     </div>
     <div class="tab-panel" data-session-tab-panel="timing">
+      <div class="panel" style="margin-bottom:18px">
+        <div class="panel-head"><div><div class="eyebrow">COUNTDOWN POLICY</div>
+          <h2>倒计时总开关与分类开关</h2></div>
+          <button class="button button-primary" data-timer-policy="all"
+            data-enabled="${timerPolicy.global_enabled ? "false" : "true"}" ${
+              readonly ? "disabled" : ""
+            }>${timerPolicy.global_enabled ? "关闭全部倒计时" : "恢复全部倒计时"}</button>
+        </div>
+        <div class="tag-row">
+          ${[
+            ["card_code", "建卡码"],
+            ["card_completion", "角色卡完成"],
+            ["preparation", "准备大厅"],
+            ["ready", "准备确认"],
+            ["turn", "行动回合"],
+            ["vote", "集体投票"],
+            ["standby", "候补等待"],
+          ]
+            .map(
+              ([key, label]) => `<button class="action-button ${
+                timerPolicy.effective?.[key] ? "" : "is-danger"
+              }" data-timer-policy="${key}"
+                data-enabled="${timerPolicy.switches?.[key] === false ? "true" : "false"}"
+                ${readonly ? "disabled" : ""}>${escapeHTML(label)}：${
+                  timerPolicy.effective?.[key] ? "开" : "关"
+                }</button>`,
+            )
+            .join("")}
+        </div>
+        <p>关闭会冻结对应计时器并保存真实剩余时间；重新开启后继续，不执行停用期间的超时处罚。</p>
+      </div>
+      <div class="panel" style="margin-bottom:18px">
+        <div class="panel-head"><div><div class="eyebrow">TOKEN BUDGET</div>
+          <h2>当前副本 Token 用量与滚动限额</h2></div>
+          <button class="button button-primary" data-session-detail-action="save-session-token-quota" ${
+            readonly ? "disabled" : ""
+          }>保存副本限额</button>
+        </div>
+        <div class="detail-grid">
+          <div class="detail-card"><span>副本 1 小时</span><strong>${escapeHTML(
+            tokenUsage.session.hour,
+          )}</strong></div>
+          <div class="detail-card"><span>副本 24 小时</span><strong>${escapeHTML(
+            tokenUsage.session.day,
+          )}</strong></div>
+          <div class="detail-card"><span>副本累计</span><strong>${escapeHTML(
+            tokenUsage.session.all,
+          )}</strong></div>
+        </div>
+        <div class="form-grid" style="margin-top:16px">
+          <label class="switch-field"><input id="quota-session-enabled" type="checkbox" ${
+            sessionQuota.enabled ? "checked" : ""
+          } /><span><strong>启用副本限额</strong><small>只限制当前故事副本</small></span></label>
+          <div class="field"><label for="quota-session-window">副本滚动窗口（秒）</label>
+            <input id="quota-session-window" type="number" min="60"
+              value="${escapeHTML(sessionQuota.window_seconds || 3600)}" /></div>
+          <div class="field"><label for="quota-session-limit">副本 Token 上限</label>
+            <input id="quota-session-limit" type="number" min="1"
+              value="${escapeHTML(sessionQuota.token_limit || 100000)}" /></div>
+        </div>
+        <p>群级 Token 限额已移到群会话标题旁的“群 Token 限额”，不会再跟随某个副本详情修改。</p>
+      </div>
       <div class="section-toolbar">
         <p>留空表示不限时。副本值是创建时快照，修改世界模板不会突变正在运行的团。</p>
         <button class="button button-primary" data-session-detail-action="save-timing" ${
@@ -2725,17 +2820,28 @@ async function openSessionDetail(sessionId) {
                   ${escapeHTML(formatDate(item.created_at))}</div>
               </div><div class="session-location">${escapeHTML(
                 formatBytes(item.size || 0),
-              )}</div></div>`,
+              )}</div>${
+                item.kind === "save"
+                  ? `<button class="action-button is-danger"
+                      data-session-detail-action="delete-independent-save"
+                      data-filename="${escapeHTML(item.filename)}">删除文件</button>`
+                  : ""
+              }</div>`,
             )
             .join("") ||
           '<div class="empty-state compact"><span>尚未生成独立安全文件</span></div>'
         }
       </div>
       <div class="section-toolbar">
-        <p>下方是数据库内部的回合级快速恢复点；删除快速点不会自动删除上方独立 ZIP。</p>
-        <button class="button button-primary" data-session-detail-action="new-save">
-          ＋ 创建存档
-        </button>
+        <p>上方独立 ZIP 与下方回合恢复点分别管理；最终保护 ZIP 会拒绝删除。</p>
+        <div class="toolbar-actions">
+          <button class="button button-primary" data-session-detail-action="new-save" ${
+            readonly ? "disabled" : ""
+          }>＋ 创建存档</button>
+          <button class="button is-danger" data-session-detail-action="delete-session" ${
+            ["closed", "finished"].includes(session.state) ? "" : "disabled"
+          }>删除整个故事副本</button>
+        </div>
       </div>
       <div class="session-stack">
         ${
@@ -2806,6 +2912,13 @@ async function openSessionDetail(sessionId) {
     $$(
       "#session-modal-body [data-session-detail-action], #session-modal-body [data-timer-action]",
     ).forEach((item) => {
+      if (
+        ["delete-session", "delete-independent-save"].includes(
+          item.dataset.sessionDetailAction,
+        )
+      ) {
+        return;
+      }
       item.disabled = true;
       item.title = "永久归档副本为只读；请从存档克隆新副本后继续";
     });
@@ -2892,17 +3005,30 @@ function openSnapshotEditor(sessionId) {
       <div class="field">
         <label for="snapshot-name">存档名称</label>
         <input id="snapshot-name" maxlength="100" placeholder="例如：进入旧塔之前" />
-        <small>同名存档默认不会覆盖，避免误操作。</small>
+        <small>发现同名存档时会展示覆盖确认，不再返回通用错误。</small>
       </div>
     `,
     saveLabel: "创建存档",
     onSave: async () => {
+      const name = $("#snapshot-name").value.trim();
+      const existing = (app.currentSession?.snapshots || []).find(
+        (item) => item.name === name,
+      );
+      let replace = false;
+      if (existing) {
+        replace = await confirmAction(
+          `覆盖同名存档「${name}」？`,
+          `原存档位于第 ${existing.turn_no} 回合，覆盖后无法恢复旧内容。`,
+          "确认覆盖",
+        );
+        if (!replace) return;
+      }
       await bridge.apiPost("snapshots/create", {
         session_id: sessionId,
-        name: $("#snapshot-name").value,
-        replace: false,
+        name,
+        replace,
       });
-      toast("存档已创建", "success");
+      toast(replace ? "同名存档已覆盖" : "存档已创建", "success");
       await openSessionDetail(sessionId);
     },
   });
@@ -3526,6 +3652,73 @@ function openGroupRemarkEditor(button) {
   });
 }
 
+async function openGroupTokenQuotaEditor(button) {
+  const platformId = button.dataset.platformId;
+  const groupId = button.dataset.groupId;
+  const groupName = button.dataset.groupName || `群 ${groupId}`;
+  const response = await bridge.apiGet("groups/token-usage", {
+    platform_id: platformId,
+    group_id: groupId,
+  });
+  const usage = response.usage || {};
+  const totals = usage.group || { hour: 0, day: 0, all: 0 };
+  const quota = usage.quota || {};
+  openEditor({
+    title: `${groupName} · Token 限额`,
+    kicker: "GROUP TOKEN BUDGET",
+    body: `
+      <div class="detail-grid">
+        <div class="detail-card"><span>群 1 小时</span><strong>${escapeHTML(
+          totals.hour || 0,
+        )}</strong></div>
+        <div class="detail-card"><span>群 24 小时</span><strong>${escapeHTML(
+          totals.day || 0,
+        )}</strong></div>
+        <div class="detail-card"><span>群累计</span><strong>${escapeHTML(
+          totals.all || 0,
+        )}</strong></div>
+      </div>
+      <div class="form-grid" style="margin-top:18px">
+        <label class="switch-field"><input id="group-quota-enabled" type="checkbox" ${
+          quota.enabled ? "checked" : ""
+        } /><span><strong>启用群 Token 限额</strong><small>该群内全部故事副本共享同一额度</small></span></label>
+        <div class="field"><label for="group-quota-window">群滚动窗口（秒）</label>
+          <input id="group-quota-window" type="number" min="60"
+            value="${escapeHTML(quota.window_seconds || 86400)}" /></div>
+        <div class="field"><label for="group-quota-limit">群 Token 上限</label>
+          <input id="group-quota-limit" type="number" min="1"
+            value="${escapeHTML(quota.token_limit || 500000)}" /></div>
+      </div>
+      <div class="binding-guide">
+        <strong>${escapeHTML(platformId)}</strong>
+        <span>群 ID：${escapeHTML(groupId)}</span>
+      </div>
+    `,
+    saveLabel: "保存群限额",
+    onSave: async () => {
+      const windowSeconds = Number($("#group-quota-window").value);
+      const tokenLimit = Number($("#group-quota-limit").value);
+      if (
+        !Number.isInteger(windowSeconds) ||
+        windowSeconds < 60 ||
+        !Number.isInteger(tokenLimit) ||
+        tokenLimit < 1
+      ) {
+        throw new Error("Token 限额窗口至少 60 秒，Token 上限必须为正整数");
+      }
+      await bridge.apiPost("groups/token-quota", {
+        platform_id: platformId,
+        group_id: groupId,
+        enabled: $("#group-quota-enabled").checked,
+        window_seconds: windowSeconds,
+        token_limit: tokenLimit,
+      });
+      toast("群 Token 限额已保存", "success");
+      await loadSessionPage();
+    },
+  });
+}
+
 async function handleCharacterAction(button) {
   const action = button.dataset.characterAction;
   const worldId = button.dataset.worldId;
@@ -3558,7 +3751,74 @@ async function handleSessionDetailAction(button) {
   if (!detail) return;
   const sessionId = detail.session.id;
   const action = button.dataset.sessionDetailAction;
-  if (action === "save-state") {
+  if (action === "force-ready") {
+    const ok = await confirmAction(
+      "强制所有合格角色准备？",
+      "只处理角色卡已审核通过且当前出场的玩家；不会绕过建卡或审核，也不会自动开演。",
+      "确认强制准备",
+    );
+    if (!ok) return;
+    await withBusy(button, async () => {
+      const response = await bridge.apiPost("sessions/action", {
+        session_id: sessionId,
+        action: "force_ready",
+      });
+      toast(
+        `已强制准备 ${response.result?.ready_count || 0} 人`,
+        "success",
+      );
+      await openSessionDetail(sessionId);
+    });
+  } else if (action === "save-session-token-quota") {
+    const policy = {
+      scope_type: "session",
+      enabled: $("#quota-session-enabled").checked,
+      window_seconds: Number($("#quota-session-window").value),
+      token_limit: Number($("#quota-session-limit").value),
+    };
+    if (
+      !Number.isInteger(policy.window_seconds) ||
+      policy.window_seconds < 60 ||
+      !Number.isInteger(policy.token_limit) ||
+      policy.token_limit < 1
+    ) {
+      throw new Error("Token 限额窗口至少 60 秒，Token 上限必须为正整数");
+    }
+    await withBusy(button, async () => {
+      await bridge.apiPost("sessions/token-quota", {
+        session_id: sessionId,
+        ...policy,
+      });
+      toast("副本 Token 限额已保存", "success");
+      await openSessionDetail(sessionId);
+    });
+  } else if (action === "delete-session") {
+    const name = detail.session.instance_name;
+    const entered = window.prompt(
+      `此操作会把整个故事副本移入回收目录。\n请输入副本名“${name}”确认：`,
+      "",
+    );
+    if (entered === null) return;
+    if (entered.trim() !== name) {
+      throw new Error("输入的副本名不一致，未执行删除");
+    }
+    const ok = await confirmAction(
+      `删除整个故事副本「${name}」？`,
+      "角色、剧情、存档、Token 流水和独立 SQLite 都会从运行数据库移除，并尝试移入服务器回收目录。",
+      "确认删除副本",
+    );
+    if (!ok) return;
+    await withBusy(button, async () => {
+      await bridge.apiPost("sessions/action", {
+        session_id: sessionId,
+        action: "delete",
+        confirm_name: name,
+      });
+      $("#session-modal").close();
+      toast("整个故事副本已删除并移入回收目录", "success");
+      await loadCore();
+    });
+  } else if (action === "save-state") {
     const worldState = parseJSONField("#session-state-json", "世界状态");
     await withBusy(button, async () => {
       await bridge.apiPost("sessions/state", {
@@ -3747,6 +4007,21 @@ async function handleSessionDetailAction(button) {
     await bridge.apiPost("snapshots/delete", { id: button.dataset.id });
     toast("存档已删除", "success");
     await openSessionDetail(sessionId);
+  } else if (action === "delete-independent-save") {
+    const filename = button.dataset.filename;
+    const ok = await confirmAction(
+      `删除独立存档文件「${filename}」？`,
+      "文件会移入当前副本的回收目录；最终保护存档不会被允许删除。",
+      "删除独立存档",
+    );
+    if (!ok) return;
+    await bridge.apiPost("archives/delete", {
+      session_id: sessionId,
+      kind: "save",
+      filename,
+    });
+    toast("独立存档文件已移入回收目录", "success");
+    await openSessionDetail(sessionId);
   }
 }
 
@@ -3830,6 +4105,8 @@ document.addEventListener("click", async (event) => {
     try {
       if (groupButton.dataset.groupAction === "remark") {
         openGroupRemarkEditor(groupButton);
+      } else if (groupButton.dataset.groupAction === "token-quota") {
+        await openGroupTokenQuotaEditor(groupButton);
       }
     } catch (error) {
       showError(error);
@@ -3877,6 +4154,25 @@ document.addEventListener("click", async (event) => {
   if (detailAction) {
     try {
       await handleSessionDetailAction(detailAction);
+    } catch (error) {
+      showError(error);
+    }
+  }
+
+  const timerPolicyAction = event.target.closest("[data-timer-policy]");
+  if (timerPolicyAction) {
+    try {
+      const sessionId = app.currentSession?.session?.id;
+      if (!sessionId) return;
+      await withBusy(timerPolicyAction, async () => {
+        await bridge.apiPost("sessions/timer-policy", {
+          session_id: sessionId,
+          timer_type: timerPolicyAction.dataset.timerPolicy,
+          enabled: timerPolicyAction.dataset.enabled === "true",
+        });
+        toast("倒计时开关已更新", "success");
+        await openSessionDetail(sessionId);
+      });
     } catch (error) {
       showError(error);
     }
@@ -4037,6 +4333,8 @@ $("#session-page-next").addEventListener("click", async () => {
 });
 
 $("#new-world-button").addEventListener("click", () => openWorldEditor());
+$("#import-world-package-button").addEventListener("click", openWorldPackageImportDialog);
+$("#import-npc-button").addEventListener("click", openNpcImportDialog);
 $("#new-session-button").addEventListener("click", openSessionCreator);
 $("#new-memory-button").addEventListener("click", () => openMemoryEditor());
 $("#add-fallback-provider").addEventListener("click", () => {
@@ -4130,7 +4428,7 @@ $("#export-backup-button").addEventListener("click", async (event) => {
       await bridge.download(
         "backup/export",
         {},
-        "backup_tavern_v0.5.2-alpha.zip",
+        "backup_tavern_v0.6.0.zip",
       );
     });
     toast("备份已生成", "success");
@@ -4166,6 +4464,163 @@ window.addEventListener("beforeunload", () => {
   if (app.sseId) bridge.unsubscribeSSE(app.sseId);
   if (app.contextOff) app.contextOff();
 });
+
+function _readImportSource(fileInput, text) {
+  return new Promise((resolve, reject) => {
+    if (fileInput.files && fileInput.files[0]) {
+      const reader = new FileReader();
+      reader.onload = () => resolve(String(reader.result || ""));
+      reader.onerror = () => reject(new Error("文件读取失败"));
+      reader.readAsText(fileInput.files[0]);
+    } else {
+      resolve(text);
+    }
+  });
+}
+
+function openWorldPackageImportDialog() {
+  const body = `
+    <p class="field-hint">导入<b>世界包</b> JSON（必须包含 <code>slug</code> / <code>name</code> / <code>system_prompt</code>）。按 <code>slug</code> 新建或更新世界，导入后会<strong>直接打开该世界</strong>。</p>
+    <div class="field">
+      <label for="wp-import-file">世界包 JSON 文件</label>
+      <input type="file" id="wp-import-file" accept=".json,application/json" />
+    </div>
+    <div class="field">
+      <label for="wp-import-text">或粘贴 JSON 文本</label>
+      <textarea id="wp-import-text" rows="12" placeholder='将世界包 JSON 粘贴到这里…'></textarea>
+    </div>
+    <div class="import-actions">
+      <button type="button" class="button button-primary" id="wp-import-submit">导入并创建世界</button>
+      <button type="button" class="action-button" id="wp-import-cancel">取消</button>
+    </div>
+    <div class="import-result" id="wp-import-result" hidden></div>
+  `;
+  openEditor({ title: "导入世界包", kicker: "WORLD IMPORT", body });
+
+  $("#wp-import-cancel").addEventListener("click", () => $("#editor-modal").close());
+  $("#wp-import-submit").addEventListener("click", async () => {
+    const resultEl = $("#wp-import-result");
+    resultEl.hidden = true;
+    resultEl.className = "import-result";
+    const raw = await _readImportSource($("#wp-import-file"), $("#wp-import-text").value.trim());
+    try {
+      if (!raw) throw new Error("请选择 JSON 文件或在文本框中粘贴内容");
+      let parsed;
+      try {
+        parsed = JSON.parse(raw);
+      } catch (parseError) {
+        throw new Error(`JSON 解析失败：${parseError.message}`);
+      }
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        throw new Error("世界包必须是包含 slug / name / system_prompt 的 JSON 对象");
+      }
+      const submit = $("#wp-import-submit");
+      submit.disabled = true;
+      try {
+        const resp = await bridge.apiPost("worlds/import", parsed);
+        const world = resp?.item || (app.worlds || []).find((w) => w.slug === parsed.slug);
+        toast(resp?.mode === "updated" ? "世界包已更新" : "世界包已导入并创建世界", "success");
+        await loadCore();
+        if (world) {
+          openWorldEditor(world);
+        } else {
+          $("#editor-modal").close();
+        }
+      } finally {
+        submit.disabled = false;
+      }
+    } catch (error) {
+      resultEl.hidden = false;
+      resultEl.classList.add("is-error");
+      resultEl.textContent = error?.message || String(error);
+      showError(error);
+    }
+  });
+}
+
+function openNpcImportDialog() {
+  const body = `
+    <p class="field-hint">导入<b>常驻 NPC</b>：JSON 为角色数组，或包含 <code>items</code> / <code>npcs</code> / <code>characters</code> 字段的对象。将批量写入下方选择的目标世界。</p>
+    <div class="field">
+      <label for="np-import-file">常驻 NPC JSON 文件</label>
+      <input type="file" id="np-import-file" accept=".json,application/json" />
+    </div>
+    <div class="field">
+      <label for="np-import-text">或粘贴 JSON 文本</label>
+      <textarea id="np-import-text" rows="12" placeholder='将常驻 NPC 的 JSON 粘贴到这里…'></textarea>
+    </div>
+    <div class="field">
+      <label for="np-import-world">目标世界</label>
+      <select id="np-import-world"></select>
+    </div>
+    <div class="import-actions">
+      <button type="button" class="button button-primary" id="np-import-submit">导入</button>
+      <button type="button" class="action-button" id="np-import-cancel">取消</button>
+    </div>
+    <div class="import-result" id="np-import-result" hidden></div>
+  `;
+  openEditor({ title: "导入常驻 NPC", kicker: "NPC IMPORT", body });
+
+  const worldSelect = $("#np-import-world");
+  worldSelect.innerHTML = (app.worlds || [])
+    .map(
+      (w) =>
+        `<option value="${escapeHTML(w.id)}">${escapeHTML(w.name)}（${escapeHTML(w.slug)}）</option>`,
+    )
+    .join("");
+  if (!app.worlds.length) {
+    worldSelect.innerHTML =
+      '<option value="">（暂无世界，请先导入或新建世界）</option>';
+  }
+
+  $("#np-import-cancel").addEventListener("click", () => $("#editor-modal").close());
+  $("#np-import-submit").addEventListener("click", async () => {
+    const resultEl = $("#np-import-result");
+    resultEl.hidden = true;
+    resultEl.className = "import-result";
+    const raw = await _readImportSource($("#np-import-file"), $("#np-import-text").value.trim());
+    try {
+      if (!raw) throw new Error("请选择 JSON 文件或在文本框中粘贴内容");
+      let parsed;
+      try {
+        parsed = JSON.parse(raw);
+      } catch (parseError) {
+        throw new Error(`JSON 解析失败：${parseError.message}`);
+      }
+      const worldId = worldSelect.value;
+      if (!worldId) throw new Error("请选择目标世界");
+      const payload = Array.isArray(parsed)
+        ? { world_id: worldId, items: parsed }
+        : { world_id: worldId, ...parsed };
+      if (
+        !Array.isArray(payload.items) &&
+        !Array.isArray(payload.npcs) &&
+        !Array.isArray(payload.characters)
+      ) {
+        throw new Error(
+          "常驻 NPC 必须是数组，或包含 items / npcs 字段的对象",
+        );
+      }
+      const submit = $("#np-import-submit");
+      submit.disabled = true;
+      try {
+        const res = await bridge.apiPost("characters/import", payload);
+        const count = res?.created ?? (res?.items || []).length;
+        toast(`已导入 ${count} 个常驻角色`, "success");
+        await loadCore();
+        await openCharacterManager(worldId);
+        $("#editor-modal").close();
+      } finally {
+        submit.disabled = false;
+      }
+    } catch (error) {
+      resultEl.hidden = false;
+      resultEl.classList.add("is-error");
+      resultEl.textContent = error?.message || String(error);
+      showError(error);
+    }
+  });
+}
 
 async function boot() {
   try {

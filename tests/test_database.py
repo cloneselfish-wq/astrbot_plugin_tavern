@@ -484,7 +484,16 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         )
 
         visible = await self.database.recent_events(session["id"], 100)
-        self.assertEqual([item["role"] for item in visible], ["system"])
+        self.assertEqual(
+            [item["role"] for item in visible],
+            ["player", "narrator", "system"],
+        )
+        self.assertTrue(
+            any("发现铜钥匙" in item["content"] for item in visible)
+        )
+        self.assertFalse(
+            any("打开北侧门" in item["content"] for item in visible)
+        )
         restored = await self.database.transition_session(
             restored["id"],
             SESSION_RUNNING,

@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 
 from tavern.config import TavernConfig
+from tavern.lifecycle import normalize_choices_compat
 from tavern.resolution import (
     apply_state_patch,
     extract_json_object,
@@ -26,6 +27,29 @@ class CoreRulesTests(unittest.TestCase):
         self.assertEqual(
             parse_tavern_command("/酒馆\t存档\t旧塔之前").argument,
             "旧塔之前",
+        )
+        reminder = parse_tavern_command("／酒馆 建卡提醒 关")
+        self.assertEqual(reminder.action, "card_timer_notice")
+        self.assertEqual(reminder.argument, "关")
+        self.assertEqual(
+            parse_tavern_command("/酒馆 恢复").action,
+            "recover",
+        )
+        self.assertEqual(
+            parse_tavern_command("/酒馆 继续").action,
+            "resume",
+        )
+        self.assertEqual(
+            parse_tavern_command("/酒馆 强制下一位").action,
+            "next",
+        )
+        self.assertEqual(
+            parse_tavern_command("/酒馆 倒计时提示 关").action,
+            "unknown",
+        )
+        self.assertEqual(
+            parse_tavern_command("/酒馆 下一位").action,
+            "unknown",
         )
 
         self.assertFalse(
@@ -181,6 +205,40 @@ class CoreRulesTests(unittest.TestCase):
         self.assertEqual(resolution.mode, "check")
         self.assertEqual(resolution.check.difficulty, 25)
         self.assertEqual(resolution.check.modifier, -10)
+
+    def test_choice_labels_accept_harmless_model_variants(self) -> None:
+        choices = normalize_choices_compat(
+            [
+                {"key": "选项A", "text": "观察门边", "risk": "safe"},
+                {"key": "Ｂ、", "text": "检查行囊"},
+                {"key": "c.", "text": "询问掌柜"},
+                {"key": "选项 D）", "text": "原地警戒"},
+            ]
+        )
+        self.assertEqual(
+            [item["key"] for item in choices],
+            ["A", "B", "C", "D"],
+        )
+        ordered = normalize_choices_compat(
+            [
+                {"text": "观察门边", "risk": "safe"},
+                {"text": "检查行囊"},
+                {"text": "询问掌柜"},
+                {"text": "原地警戒"},
+            ]
+        )
+        self.assertEqual(
+            [item["key"] for item in ordered],
+            ["A", "B", "C", "D"],
+        )
+        with self.assertRaisesRegex(ValueError, "四个有效选项"):
+            normalize_choices_compat(
+                [
+                    {"key": "A", "text": "观察门边", "risk": "safe"},
+                    {"key": "B", "text": "检查行囊"},
+                    {"key": "C", "text": "询问掌柜"},
+                ]
+            )
 
     def test_text_and_slug_validation(self) -> None:
         self.assertEqual(clean_text("a\x00b", max_chars=5), "ab")

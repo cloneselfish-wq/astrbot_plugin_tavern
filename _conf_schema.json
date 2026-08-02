@@ -127,7 +127,7 @@
         "description": "新副本默认世界包",
         "type": "string",
         "hint": "仅作为控制台建立副本时的初始选择；/酒馆 开启 仍要求明确选择副本。",
-        "default": "border-tavern"
+        "default": "aelvion-ashen-crown"
       },
       "trigger_prefix": {
         "description": "剧情触发前缀",
@@ -150,6 +150,12 @@
         "description": "单次回复上限",
         "type": "int",
         "default": 5000
+      },
+      "enforce_mobile_output": {
+        "description": "手机端短篇输出约束",
+        "type": "bool",
+        "hint": "开启后每回合故事正文强制 100—300 字，每个选项（含括号）最多 50 字。",
+        "default": true
       },
       "recent_turns": {
         "description": "带入最近回合数",
@@ -273,22 +279,42 @@
           "turn_timeout_action": {
             "description": "个人回合超时处理",
             "type": "string",
-            "options": ["skip", "hold"],
-            "labels": ["跳过并累计超时", "保留行动权"],
+            "options": [
+              "skip",
+              "hold"
+            ],
+            "labels": [
+              "跳过并累计超时",
+              "保留行动权"
+            ],
             "default": "skip"
           },
           "card_timeout_action": {
             "description": "建卡超时处理",
             "type": "string",
-            "options": ["standby", "release", "remind"],
-            "labels": ["转候补", "释放席位", "仅提醒"],
+            "options": [
+              "standby",
+              "release",
+              "remind"
+            ],
+            "labels": [
+              "转候补",
+              "释放席位",
+              "仅提醒"
+            ],
             "default": "standby"
           },
           "ready_timeout_action": {
             "description": "准备超时处理",
             "type": "string",
-            "options": ["standby", "remind"],
-            "labels": ["转候补", "仅提醒"],
+            "options": [
+              "standby",
+              "remind"
+            ],
+            "labels": [
+              "转候补",
+              "仅提醒"
+            ],
             "default": "standby"
           }
         }
@@ -314,6 +340,42 @@
         "description": "调试日志",
         "type": "bool",
         "default": false
+      }
+    }
+  },
+  "rich": {
+    "description": "富卡片（第二档真·结构化卡片）",
+    "type": "object",
+    "items": {
+      "enabled": {
+        "description": "启用富卡片",
+        "type": "bool",
+        "hint": "开启后，若当前 QQ 适配器支持（如安装 astrbot_plugin_qq_restapi），回合选项/剧情/状态等消息会以 Ark/Markdown 卡片呈现；不支持时自动退回 emoji 纯文本，不影响功能。",
+        "default": true
+      },
+      "mode": {
+        "description": "卡片渲染方式",
+        "type": "string",
+        "options": [
+          "auto",
+          "markdown",
+          "ark",
+          "text"
+        ],
+        "labels": [
+          "自动降级（推荐）",
+          "仅 Markdown 卡片",
+          "仅 Ark 模板卡片",
+          "纯文本（关闭卡片）"
+        ],
+        "hint": "auto：优先 Markdown 通用模板，未配置 AJ 模板 ID 时自动降级到 Ark 模板 24，再不行退回 emoji 纯文本。markdown 需在 qq_restapi 适配器中填写 markdown_aj_template_id；ark 使用模板 24（文本+缩略图），主动消息免申请；text 等价于关闭。",
+        "default": "auto"
+      },
+      "title": {
+        "description": "卡片标题（留空＝自动跟随世界）",
+        "type": "string",
+        "hint": "显示在 Ark 卡片标题栏。留空时自动取当前群正在游玩的副本与世界名（形如「🍺 AI 酒馆 · 阿尔维恩：灰烬王冠」），开馆/换本后自动更新；填写后则固定使用该文案。",
+        "default": ""
       }
     }
   }

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import hashlib
 import os
@@ -212,6 +213,18 @@ class TavernWebConsole:
                 ["POST"],
                 "Delete character",
             ),
+            (
+                "worlds/import",
+                self.world_import,
+                ["POST"],
+                "Import world package JSON",
+            ),
+            (
+                "characters/import",
+                self.character_import,
+                ["POST"],
+                "Import resident NPCs/characters JSON",
+            ),
             ("sessions", self.sessions, ["GET"], "List sessions"),
             (
                 "sessions/detail",
@@ -262,6 +275,18 @@ class TavernWebConsole:
                 "Control persistent timer",
             ),
             (
+                "sessions/timer-policy",
+                self.session_timer_policy,
+                ["POST"],
+                "Control countdown categories",
+            ),
+            (
+                "sessions/token-quota",
+                self.session_token_quota,
+                ["POST"],
+                "Control token quotas",
+            ),
+            (
                 "sessions/card-review",
                 self.session_card_review,
                 ["POST"],
@@ -284,6 +309,18 @@ class TavernWebConsole:
                 self.group_remark,
                 ["POST"],
                 "Save a group remark",
+            ),
+            (
+                "groups/token-usage",
+                self.group_token_usage,
+                ["GET"],
+                "Read group token usage and quota",
+            ),
+            (
+                "groups/token-quota",
+                self.group_token_quota,
+                ["POST"],
+                "Control a group token quota",
             ),
             ("players", self.players, ["GET"], "List players"),
             ("players/save", self.player_save, ["POST"], "Save player"),
@@ -319,6 +356,12 @@ class TavernWebConsole:
                 self.snapshot_delete,
                 ["POST"],
                 "Delete snapshot",
+            ),
+            (
+                "archives/delete",
+                self.archive_delete,
+                ["POST"],
+                "Delete independent save archive",
             ),
             ("audit", self.audit, ["GET"], "Audit log"),
             ("providers", self.providers, ["GET"], "List chat providers"),
@@ -484,6 +527,134 @@ class TavernWebConsole:
         except Exception as exc:
             return self._handle_error(exc)
 
+    async def world_import(self):
+        """导入世界包 JSON：校验结构后按 slug 新建或更新世界。"""
+        try:
+            self._username()
+            payload = await self._payload()
+            if not isinstance(payload, dict):
+                raise ValueError("世界包 JSON 格式无效：顶层必须是一个对象")
+            if not payload.get("slug"):
+                raise ValueError("世界包缺少必填字段 slug")
+            if not payload.get("name"):
+                raise ValueError("世界包缺少必填字段 name（世界名称）")
+            if not payload.get("system_prompt"):
+                raise ValueError("世界包缺少必填字段 system_prompt（世界设定）")
+            rules = payload.get("rules")
+            if rules is not None and not isinstance(rules, dict):
+                raise ValueError("rules 必须是 JSON 对象")
+            initial_state = payload.get("initial_state")
+            if initial_state is not None and not isinstance(initial_state, dict):
+                raise ValueError("initial_state 必须是 JSON 对象")
+            import_payload = {
+                "slug": payload["slug"],
+                "name": payload["name"],
+                "description": payload.get("description", ""),
+                "system_prompt": payload["system_prompt"],
+                "opening_scene": payload.get("opening_scene", ""),
+                "rules": rules if isinstance(rules, dict) else {},
+                "initial_state": (
+                    initial_state if isinstance(initial_state, dict) else {}
+                ),
+            }
+            # 按 slug 更新已存在世界，否则新建（save_world 会再次校验字段合法性）
+            mode = "created"
+            try:
+                existing = await self.database.get_world(str(payload["slug"]))
+                import_payload["id"] = existing["id"]
+                import_payload["revision"] = existing["revision"]
+                mode = "updated"
+            except DatabaseNotFoundError:
+                pass
+            item = await self.database.save_world(import_payload, self._actor())
+            await self.broker.publish({"type": "world", "action": "save"})
+            return json_response({"item": item, "mode": mode})
+        except Exception as exc:
+            return self._handle_error(exc)
+
+    async def character_import(self):
+        """导入常驻角色/NPC JSON：校验后批量写入指定世界。"""
+        try:
+            self._username()
+            payload = await self._payload()
+            world_ref = (
+                payload.get("world_id")
+                or payload.get("world_slug")
+                or payload.get("worldRef")
+                or ""
+            )
+            if not str(world_ref).strip():
+                raise ValueError(
+                    "请指定目标世界：world_id 或 world_slug 不能为空"
+                )
+            world = await self.database.get_world(str(world_ref).strip())
+            items = (
+                payload.get("items")
+                or payload.get("npcs")
+                or payload.get("characters")
+            )
+            if not isinstance(items, list) or not items:
+                raise ValueError(
+                    "常驻角色数据必须是非空数组（字段 items / npcs）"
+                )
+            existing = {
+                item["name"]: item
+                for item in (
+                    await self.database.list_characters(world["id"])
+                )
+                if isinstance(item.get("name"), str)
+            }
+            created = []
+            for index, raw in enumerate(items):
+                if not isinstance(raw, dict):
+                    raise ValueError(f"第 {index + 1} 个角色项必须是对象")
+                name = str(raw.get("name") or "").strip()
+                if not name:
+                    raise ValueError(f"第 {index + 1} 个角色缺少 name（名称）")
+                role = str(raw.get("role") or "npc").strip() or "npc"
+                npc_profile = raw.get("profile")
+                if npc_profile is not None and not isinstance(npc_profile, dict):
+                    raise ValueError(
+                        f"角色「{name}」的 profile 必须是 JSON 对象"
+                    )
+                profile = dict(npc_profile) if isinstance(npc_profile, dict) else {}
+                private = raw.get("private_direction") or raw.get("prompt") or ""
+                if private:
+                    profile.setdefault("private_direction", private)
+                character_payload = {
+                    "world_id": world["id"],
+                    "name": name,
+                    "role": role,
+                    "profile": profile,
+                    "prompt": str(private),
+                    "enabled": 1,
+                }
+                prior = existing.get(name)
+                if prior:
+                    character_payload["id"] = prior["id"]
+                    character_payload["revision"] = prior["revision"]
+                    character_payload["slug"] = prior["slug"]
+                    character_payload["sort_order"] = prior.get("sort_order", 0)
+                    character_payload["enabled"] = prior.get("enabled", 1)
+                else:
+                    character_payload["slug"] = f"npc_{uuid.uuid4().hex[:12]}"
+                created.append(
+                    await self.database.save_character(
+                        character_payload, self._actor()
+                    )
+                )
+            await self.broker.publish({"type": "world", "action": "save"})
+            return json_response(
+                {
+                    "created": len(created),
+                    "world_id": world["id"],
+                    "world_name": world.get("name"),
+                    "items": created,
+                }
+            )
+        except Exception as exc:
+            return self._handle_error(exc)
+
     async def sessions(self):
         try:
             self._username()
@@ -515,6 +686,12 @@ class TavernWebConsole:
                         await self.database.get_instance_config(session_id)
                     ),
                     "timers": await self.database.list_timers(session_id),
+                    "timer_policy": (
+                        await self.database.get_timer_policy(session_id)
+                    ),
+                    "token_usage": (
+                        await self.database.token_usage_summary(session_id)
+                    ),
                     "choice": await self.database.active_choice_set(session_id),
                     "vote": await self.database.active_vote(session_id),
                     "bans": await self.database.list_bans(session_id),
@@ -575,6 +752,42 @@ class TavernWebConsole:
                 }
             )
             return json_response({"item": item})
+        except Exception as exc:
+            return self._handle_error(exc)
+
+    async def group_token_usage(self):
+        try:
+            self._username()
+            item = await self.database.group_token_usage_summary(
+                str(request.query.get("platform_id", "") or ""),
+                str(request.query.get("group_id", "") or ""),
+            )
+            return json_response({"usage": item})
+        except Exception as exc:
+            return self._handle_error(exc)
+
+    async def group_token_quota(self):
+        try:
+            payload = await self._payload()
+            item = await self.database.set_group_token_quota(
+                str(payload.get("platform_id") or ""),
+                str(payload.get("group_id") or ""),
+                window_seconds=int(
+                    payload.get("window_seconds") or 86_400
+                ),
+                token_limit=int(payload.get("token_limit") or 500_000),
+                enabled=bool(payload.get("enabled", True)),
+                actor_id=self._actor(),
+            )
+            await self.broker.publish(
+                {
+                    "type": "token",
+                    "action": "group_quota",
+                    "platform_id": item["platform_id"],
+                    "group_id": item["group_id"],
+                }
+            )
+            return json_response({"usage": item})
         except Exception as exc:
             return self._handle_error(exc)
 
@@ -645,6 +858,33 @@ class TavernWebConsole:
                 )
             else:
                 session_id = str(payload.get("session_id") or "")
+                if action == "force_ready":
+                    result = await self.database.force_all_ready(
+                        session_id,
+                        actor,
+                    )
+                    await self.broker.publish(
+                        {
+                            "type": "session",
+                            "action": action,
+                            "session_id": session_id,
+                        }
+                    )
+                    return json_response({"result": result})
+                if action == "delete":
+                    result = await self.database.delete_session(
+                        session_id,
+                        actor,
+                        str(payload.get("confirm_name") or ""),
+                    )
+                    await self.broker.publish(
+                        {
+                            "type": "session",
+                            "action": action,
+                            "session_id": session_id,
+                        }
+                    )
+                    return json_response({"result": result})
                 if action == "perform":
                     result = await self.database.activate_story(
                         session_id,
@@ -842,6 +1082,48 @@ class TavernWebConsole:
                 }
             )
             return json_response({"timer": item})
+        except Exception as exc:
+            return self._handle_error(exc)
+
+    async def session_timer_policy(self):
+        try:
+            payload = await self._payload()
+            item = await self.database.set_timer_policy(
+                str(payload.get("session_id") or ""),
+                str(payload.get("timer_type") or "all"),
+                bool(payload.get("enabled", False)),
+                self._actor(),
+            )
+            await self.broker.publish(
+                {
+                    "type": "timing",
+                    "action": "policy",
+                    "session_id": item["session_id"],
+                }
+            )
+            return json_response({"policy": item})
+        except Exception as exc:
+            return self._handle_error(exc)
+
+    async def session_token_quota(self):
+        try:
+            payload = await self._payload()
+            item = await self.database.set_token_quota(
+                str(payload.get("session_id") or ""),
+                str(payload.get("scope_type") or "session"),
+                window_seconds=int(payload.get("window_seconds") or 3600),
+                token_limit=int(payload.get("token_limit") or 100000),
+                enabled=bool(payload.get("enabled", True)),
+                actor_id=self._actor(),
+            )
+            await self.broker.publish(
+                {
+                    "type": "token",
+                    "action": "quota",
+                    "session_id": item["session_id"],
+                }
+            )
+            return json_response({"usage": item})
         except Exception as exc:
             return self._handle_error(exc)
 
@@ -1061,6 +1343,26 @@ class TavernWebConsole:
                 self._actor(),
             )
             return json_response({"deleted": True})
+        except Exception as exc:
+            return self._handle_error(exc)
+
+    async def archive_delete(self):
+        try:
+            payload = await self._payload()
+            item = await asyncio.to_thread(
+                self.database.storage.trash_archive,
+                str(payload.get("session_id") or ""),
+                kind=str(payload.get("kind") or "save"),
+                filename=str(payload.get("filename") or ""),
+            )
+            await self.broker.publish(
+                {
+                    "type": "storage",
+                    "action": "archive_delete",
+                    "session_id": item["session_id"],
+                }
+            )
+            return json_response({"item": item})
         except Exception as exc:
             return self._handle_error(exc)
 

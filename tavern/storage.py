@@ -1013,6 +1013,94 @@ class InstanceStorage:
         )
         return storage
 
+    def trash_relative_path(
+        self,
+        relative_path: str,
+        *,
+        label: str,
+    ) -> Path | None:
+        """Move a deleted story tree to a recoverable local trash folder."""
+
+        relative = Path(str(relative_path or ""))
+        if (
+            not relative.parts
+            or relative.is_absolute()
+            or ".." in relative.parts
+            or relative.parts[0] != "groups"
+        ):
+            raise ValueError("副本存储路径无效，已拒绝移动")
+        source = self.data_dir / relative
+        if not source.exists():
+            return None
+        trash_dir = self.data_dir / "trash"
+        trash_dir.mkdir(parents=True, exist_ok=True)
+        safe_label = safe_component(label, "story", maximum=52)
+        target = next_timestamped_path(
+            trash_dir,
+            f"deleted_{safe_label}",
+            "",
+        )
+        replace_with_retry(source, target)
+        return target
+
+    def trash_archive(
+        self,
+        session_id: str,
+        *,
+        kind: str,
+        filename: str,
+    ) -> dict[str, Any]:
+        """Move one independent save archive to the story-local trash."""
+
+        if kind != "save":
+            raise ValueError("只能手动删除独立命名存档")
+        safe_name = Path(str(filename or "")).name
+        if (
+            safe_name != str(filename or "")
+            or not safe_name.startswith("save_")
+            or not safe_name.endswith(".zip")
+        ):
+            raise ValueError("独立存档文件名无效")
+        indexed = self._ensure_index(session_id)
+        story_dir = self.data_dir / str(
+            indexed["storage"]["relative_path"]
+        )
+        source = story_dir / "saves" / safe_name
+        if not source.is_file():
+            raise FileNotFoundError("独立存档文件不存在")
+        try:
+            with zipfile.ZipFile(source, "r") as archive:
+                manifest = json.loads(
+                    archive.read("manifest.json").decode("utf-8")
+                )
+        except (
+            KeyError,
+            OSError,
+            UnicodeDecodeError,
+            ValueError,
+            zipfile.BadZipFile,
+        ) as exc:
+            raise ValueError("独立存档无法验证，已拒绝删除") from exc
+        reason = str(
+            (manifest.get("archive") or {}).get("reason") or ""
+        )
+        if "最终" in reason:
+            raise ValueError("最终保护存档不能手动删除")
+        trash_dir = story_dir / "trash"
+        trash_dir.mkdir(parents=True, exist_ok=True)
+        target = next_timestamped_path(
+            trash_dir,
+            f"deleted_{safe_component(source.stem, 'save', maximum=80)}",
+            ".zip",
+        )
+        replace_with_retry(source, target)
+        return {
+            "session_id": session_id,
+            "filename": safe_name,
+            "reason": reason,
+            "trash_path": str(target),
+        }
+
     def list_archives(
         self,
         session_id: str,

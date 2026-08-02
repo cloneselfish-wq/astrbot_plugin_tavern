@@ -12,6 +12,7 @@ import unittest
 import zipfile
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -39,6 +40,27 @@ def _install_astrbot_stubs(data_dir: Path) -> None:
 
     class AstrMessageEvent:
         pass
+
+    class Plain:
+        def __init__(self, text):
+            self.text = text
+
+    class At:
+        def __init__(self, name, qq):
+            self.name = name
+            self.qq = qq
+
+    class MessageChain:
+        def __init__(self):
+            self.chain = []
+
+        def message(self, text):
+            self.chain.append(Plain(text))
+            return self
+
+        def at(self, name, qq):
+            self.chain.append(At(name, qq))
+            return self
 
     class Filter:
         class EventMessageType:
@@ -105,6 +127,7 @@ def _install_astrbot_stubs(data_dir: Path) -> None:
     api.AstrBotConfig = AstrBotConfig
     api.logger = Logger()
     event.AstrMessageEvent = AstrMessageEvent
+    event.MessageChain = MessageChain
     event.filter = Filter()
     star.Context = Context
     star.Star = Star
@@ -127,6 +150,8 @@ def _install_astrbot_stubs(data_dir: Path) -> None:
 class FakeContext:
     def __init__(self) -> None:
         self.routes: list[tuple] = []
+        self.sent_messages: list[tuple[str, object]] = []
+        self.platform_names: dict[str, str] = {}
 
     def register_web_api(self, *args):
         self.routes.append(args)
@@ -148,6 +173,18 @@ class FakeContext:
                 }
             ),
         ]
+
+    def get_platform_inst(self, platform_id):
+        name = self.platform_names.get(str(platform_id))
+        if not name:
+            return None
+        return SimpleNamespace(
+            meta=lambda: SimpleNamespace(id=str(platform_id), name=name)
+        )
+
+    async def send_message(self, origin, chain):
+        self.sent_messages.append((origin, chain))
+        return True
 
 
 class PluginShellTests(unittest.IsolatedAsyncioTestCase):
@@ -193,6 +230,138 @@ class PluginShellTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("/astrbot_plugin_tavern/groups/remark", paths)
         self.assertIn("/astrbot_plugin_tavern/backup/import/<mode>", paths)
         self.assertIn("/astrbot_plugin_tavern/events", paths)
+
+    async def test_timer_notice_mentions_target_and_shows_remaining_time(
+        self,
+    ) -> None:
+        from astrbot_plugin_tavern.tavern.constants import DEFAULT_WORLD_SLUG
+
+        session = await self.plugin.database.ensure_session(
+            "qq",
+            "group-timer-notice",
+            "qq:group-timer-notice",
+            DEFAULT_WORLD_SLUG,
+            "admin-1",
+        )
+        await self.plugin._send_timer_notice(
+            {
+                "kind": "reminder",
+                "session_id": session["id"],
+                "timer_type": "turn",
+                "remaining_seconds": 90,
+                "targets": [
+                    {
+                        "user_id": "target-user",
+                        "display_name": "白鸦",
+                    },
+                    {
+                        "user_id": "target-user",
+                        "display_name": "重复目标",
+                    },
+                ],
+            }
+        )
+        self.assertEqual(len(self.context.sent_messages), 1)
+        origin, chain = self.context.sent_messages[0]
+        self.assertEqual(origin, "qq:group-timer-notice")
+        mentions = [
+            component
+            for component in chain.chain
+            if hasattr(component, "qq")
+        ]
+        self.assertEqual(len(mentions), 1)
+        self.assertEqual(mentions[0].qq, "target-user")
+        text = "".join(
+            str(component.text)
+            for component in chain.chain
+            if hasattr(component, "text")
+        )
+        self.assertIn("行动回合剩余 1分30秒", text)
+        self.assertIn("请及时完成本回合操作", text)
+
+    async def test_qq_official_timer_notice_uses_real_mention_protocol(
+        self,
+    ) -> None:
+        from astrbot_plugin_tavern.tavern.constants import DEFAULT_WORLD_SLUG
+
+        self.context.platform_names["alice"] = "qq_official"
+        session = await self.plugin.database.ensure_session(
+            "alice",
+            "official-group",
+            "alice:GroupMessage:official-group",
+            DEFAULT_WORLD_SLUG,
+            "admin-1",
+        )
+        await self.plugin._send_timer_notice(
+            {
+                "kind": "reminder",
+                "session_id": session["id"],
+                "timer_type": "turn",
+                "remaining_seconds": 60,
+                "targets": [
+                    {
+                        "user_id": "MEMBER_OPENID_1",
+                        "display_name": "白鸦",
+                    }
+                ],
+            }
+        )
+        self.assertEqual(len(self.context.sent_messages), 1)
+        origin, chain = self.context.sent_messages[0]
+        self.assertEqual(origin, "alice:GroupMessage:official-group")
+        self.assertFalse(
+            any(hasattr(component, "qq") for component in chain.chain)
+        )
+        text = "".join(
+            str(component.text)
+            for component in chain.chain
+            if hasattr(component, "text")
+        )
+        self.assertIn(
+            '<qqbot-at-user id="MEMBER_OPENID_1" />',
+            text,
+        )
+        self.assertIn("行动回合剩余 1分", text)
+
+    async def test_card_countdown_notice_is_private_without_group_mention(
+        self,
+    ) -> None:
+        from astrbot_plugin_tavern.tavern.constants import DEFAULT_WORLD_SLUG
+
+        session = await self.plugin.database.ensure_session(
+            "qq",
+            "card-timer-group",
+            "qq:GroupMessage:card-timer-group",
+            DEFAULT_WORLD_SLUG,
+            "admin-1",
+        )
+        await self.plugin._send_timer_notice(
+            {
+                "kind": "reminder",
+                "session_id": session["id"],
+                "timer_type": "card_completion",
+                "remaining_seconds": 600,
+                "targets": [
+                    {
+                        "user_id": "card-user",
+                        "display_name": "建卡玩家",
+                        "private_origin": "qq:FriendMessage:card-user",
+                    }
+                ],
+            }
+        )
+        self.assertEqual(len(self.context.sent_messages), 1)
+        origin, chain = self.context.sent_messages[0]
+        self.assertEqual(origin, "qq:FriendMessage:card-user")
+        self.assertFalse(
+            any(hasattr(component, "qq") for component in chain.chain)
+        )
+        text = "".join(
+            str(component.text)
+            for component in chain.chain
+            if hasattr(component, "text")
+        )
+        self.assertIn("角色卡创建剩余 10分", text)
 
     async def test_full_backup_zip_requires_safe_verified_members(
         self,
@@ -345,6 +514,299 @@ class PluginShellTests(unittest.IsolatedAsyncioTestCase):
             "group-shell",
         )
         self.assertEqual(reopened["world_id"], original_world)
+
+    async def test_ready_prompt_uses_continue_for_existing_story(self) -> None:
+        from astrbot_plugin_tavern.tavern.config import TavernConfig
+        from astrbot_plugin_tavern.tavern.constants import (
+            DEFAULT_WORLD_SLUG,
+            SESSION_PREPARING,
+        )
+        from astrbot_plugin_tavern.tavern.security import ParsedCommand
+
+        session = await self.plugin.database.ensure_session(
+            "qq",
+            "group-shell",
+            "qq:group-shell",
+            DEFAULT_WORLD_SLUG,
+            "admin-1",
+        )
+        await self.plugin.database.transition_session(
+            session["id"],
+            SESSION_PREPARING,
+            "admin-1",
+        )
+        participant = {
+            "character_name": "那个男人",
+            "display_name": "Merlin",
+        }
+        with (
+            patch.object(
+                self.plugin.database,
+                "set_participant_ready",
+                AsyncMock(return_value=participant),
+            ),
+            patch.object(
+                self.plugin.database,
+                "opening_preflight",
+                AsyncMock(
+                    return_value={
+                        "ok": True,
+                        "blockers": [],
+                        "resume_mode": True,
+                    }
+                ),
+            ),
+        ):
+            response = await self.plugin._handle_command(
+                event=SimpleNamespace(unified_msg_origin="qq:group-shell"),
+                command=ParsedCommand(matched=True, action="ready"),
+                config=TavernConfig.from_mapping(self.config),
+                group_id="group-shell",
+                platform_id="qq",
+                sender_id="user-ready",
+            )
+        self.assertIn("/酒馆 继续", response)
+        self.assertNotIn("/酒馆 开演", response)
+
+    async def test_continue_does_not_recover_a_paused_session(self) -> None:
+        from astrbot_plugin_tavern.tavern.config import TavernConfig
+        from astrbot_plugin_tavern.tavern.constants import (
+            DEFAULT_WORLD_SLUG,
+            SESSION_PAUSED,
+            SESSION_PREPARING,
+        )
+        from astrbot_plugin_tavern.tavern.security import ParsedCommand
+
+        session = await self.plugin.database.ensure_session(
+            "qq",
+            "group-shell",
+            "qq:group-shell",
+            DEFAULT_WORLD_SLUG,
+            "admin-1",
+        )
+        await self.plugin.database.transition_session(
+            session["id"],
+            SESSION_PREPARING,
+            "admin-1",
+        )
+        await self.plugin.database.transition_session(
+            session["id"],
+            SESSION_PAUSED,
+            "admin-1",
+        )
+
+        with patch.object(
+            self.plugin.database,
+            "resume_session_timers",
+            AsyncMock(side_effect=AssertionError("不应恢复任何计时")),
+        ):
+            response = await self.plugin._handle_command(
+                event=SimpleNamespace(unified_msg_origin="qq:group-shell"),
+                command=ParsedCommand(matched=True, action="resume"),
+                config=TavernConfig.from_mapping(self.config),
+                group_id="group-shell",
+                platform_id="qq",
+                sender_id="admin-1",
+            )
+
+        current = await self.plugin.database.get_session(session["id"])
+        self.assertEqual(current["state"], SESSION_PAUSED)
+        self.assertIn("/酒馆 恢复", response)
+        self.assertIn("没有恢复任何计时", response)
+
+    async def test_recover_only_enters_resume_preparation_lobby(self) -> None:
+        from astrbot_plugin_tavern.tavern.config import TavernConfig
+        from astrbot_plugin_tavern.tavern.constants import (
+            DEFAULT_WORLD_SLUG,
+            SESSION_PAUSED,
+            SESSION_PREPARING,
+        )
+        from astrbot_plugin_tavern.tavern.security import ParsedCommand
+
+        session = await self.plugin.database.ensure_session(
+            "qq",
+            "group-shell",
+            "qq:group-shell",
+            DEFAULT_WORLD_SLUG,
+            "admin-1",
+        )
+        await self.plugin.database.transition_session(
+            session["id"],
+            SESSION_PREPARING,
+            "admin-1",
+        )
+        with self.plugin.database._connect() as connection:
+            connection.execute(
+                "UPDATE sessions SET turn_no = 3 WHERE id = ?",
+                (session["id"],),
+            )
+        await self.plugin.database.transition_session(
+            session["id"],
+            SESSION_PAUSED,
+            "admin-1",
+        )
+
+        with patch.object(
+            self.plugin.database,
+            "resume_session_timers",
+            AsyncMock(side_effect=AssertionError("恢复准备阶段不得恢复计时")),
+        ):
+            response = await self.plugin._handle_command(
+                event=SimpleNamespace(unified_msg_origin="qq:group-shell"),
+                command=ParsedCommand(matched=True, action="recover"),
+                config=TavernConfig.from_mapping(self.config),
+                group_id="group-shell",
+                platform_id="qq",
+                sender_id="admin-1",
+            )
+
+        current = await self.plugin.database.get_session(session["id"])
+        self.assertEqual(current["state"], SESSION_PREPARING)
+        self.assertIn("恢复准备大厅", response)
+        self.assertIn("/酒馆 准备", response)
+        self.assertIn("/酒馆 继续", response)
+
+    async def test_continue_rejects_a_new_story_preparation_lobby(self) -> None:
+        from astrbot_plugin_tavern.tavern.config import TavernConfig
+        from astrbot_plugin_tavern.tavern.constants import (
+            DEFAULT_WORLD_SLUG,
+            SESSION_PREPARING,
+        )
+        from astrbot_plugin_tavern.tavern.security import ParsedCommand
+
+        session = await self.plugin.database.ensure_session(
+            "qq",
+            "group-shell",
+            "qq:group-shell",
+            DEFAULT_WORLD_SLUG,
+            "admin-1",
+        )
+        await self.plugin.database.transition_session(
+            session["id"],
+            SESSION_PREPARING,
+            "admin-1",
+        )
+
+        with patch.object(
+            self.plugin.database,
+            "activate_story",
+            AsyncMock(side_effect=AssertionError("新故事不能由继续开演")),
+        ):
+            response = await self.plugin._handle_command(
+                event=SimpleNamespace(unified_msg_origin="qq:group-shell"),
+                command=ParsedCommand(matched=True, action="resume"),
+                config=TavernConfig.from_mapping(self.config),
+                group_id="group-shell",
+                platform_id="qq",
+                sender_id="admin-1",
+            )
+
+        self.assertIn("/酒馆 开演", response)
+
+    async def test_resume_replays_saved_story_choices_and_timer(self) -> None:
+        from astrbot_plugin_tavern.tavern.config import TavernConfig
+        from astrbot_plugin_tavern.tavern.constants import (
+            DEFAULT_WORLD_SLUG,
+            SESSION_PREPARING,
+        )
+        from astrbot_plugin_tavern.tavern.security import ParsedCommand
+
+        session = await self.plugin.database.ensure_session(
+            "qq",
+            "group-shell",
+            "qq:group-shell",
+            DEFAULT_WORLD_SLUG,
+            "admin-1",
+        )
+        await self.plugin.database.transition_session(
+            session["id"],
+            SESSION_PREPARING,
+            "admin-1",
+        )
+        with self.plugin.database._connect() as connection:
+            connection.execute(
+                "UPDATE sessions SET turn_no = 20 WHERE id = ?",
+                (session["id"],),
+            )
+        preparing = await self.plugin.database.get_session(session["id"])
+        running = {**preparing, "state": "running"}
+        current = {
+            "id": "participant-current",
+            "character_name": "那个男人",
+            "display_name": "Merlin",
+        }
+        old_text = "暂停前保存的原始长选项" * 8
+        choices = [
+            {
+                "key": key,
+                "text": old_text if key == "A" else f"原始选项 {key}",
+                "risk": "safe",
+            }
+            for key in ("A", "B", "C", "D")
+        ]
+        result = {
+            "started": True,
+            "session": running,
+            "current_participant": current,
+            "choice_set": {
+                "choices": choices,
+                "reroll_count": 0,
+            },
+            "vote": None,
+        }
+        with (
+            patch.object(
+                self.plugin.database,
+                "activate_story",
+                AsyncMock(return_value=result),
+            ),
+            patch.object(
+                self.plugin.database,
+                "resume_session_timers",
+                AsyncMock(return_value=1),
+            ),
+            patch.object(
+                self.plugin.database,
+                "active_vote",
+                AsyncMock(return_value=None),
+            ),
+            patch.object(
+                self.plugin.database,
+                "recent_events",
+                AsyncMock(
+                    return_value=[
+                        {
+                            "role": "narrator",
+                            "content": "这是暂停前最后一段正式剧情。",
+                        }
+                    ]
+                ),
+            ),
+            patch.object(
+                self.plugin.database,
+                "list_timers",
+                AsyncMock(
+                    return_value=[
+                        {
+                            "timer_type": "turn",
+                            "status": "active",
+                            "remaining_seconds": 87,
+                        }
+                    ]
+                ),
+            ),
+        ):
+            response = await self.plugin._handle_command(
+                event=SimpleNamespace(unified_msg_origin="qq:group-shell"),
+                command=ParsedCommand(matched=True, action="resume"),
+                config=TavernConfig.from_mapping(self.config),
+                group_id="group-shell",
+                platform_id="qq",
+                sender_id="admin-1",
+            )
+        self.assertIn("这是暂停前最后一段正式剧情", response)
+        self.assertIn(old_text, response)
+        self.assertIn("剩余 1 分 27 秒", response)
 
     def test_group_id_prefers_unified_event_accessor(self) -> None:
         event = SimpleNamespace(
@@ -664,6 +1126,7 @@ class PluginShellTests(unittest.IsolatedAsyncioTestCase):
                 "开启",
                 "开演",
                 "暂停",
+                "恢复",
                 "继续",
                 "关闭",
                 "完结",
@@ -672,6 +1135,7 @@ class PluginShellTests(unittest.IsolatedAsyncioTestCase):
                 "状态",
                 "安全暂停",
                 "存档",
+                "删档",
                 "读档",
                 "回滚",
                 "世界列表",
@@ -681,10 +1145,12 @@ class PluginShellTests(unittest.IsolatedAsyncioTestCase):
                 "填写",
                 "预览",
                 "重填数值",
+                "建卡提醒",
                 "确认建卡",
                 "取消建卡",
                 "角色",
                 "准备",
+                "强制全员准备",
                 "阵容",
                 "审核",
                 "选择",
@@ -698,14 +1164,21 @@ class PluginShellTests(unittest.IsolatedAsyncioTestCase):
                 "退出",
                 "顺序",
                 "跳过",
-                "下一位",
+                "强制下一位",
+                "倒计时",
+                "用量",
+                "限额",
+                "删除副本",
                 "帮助",
             },
         )
         self.assertEqual(group.commands["开启"]["alias"], {"启动"})
-        self.assertEqual(group.commands["继续"]["alias"], {"恢复"})
+        self.assertEqual(group.commands["恢复"]["alias"], set())
+        self.assertEqual(group.commands["继续"]["alias"], set())
         self.assertEqual(group.commands["顺序"]["alias"], {"轮次"})
         self.assertEqual(group.commands["副本列表"]["alias"], {"副本"})
+        self.assertEqual(group.commands["建卡提醒"]["alias"], set())
+        self.assertEqual(group.commands["强制下一位"]["alias"], set())
 
     async def test_chat_review_lists_views_and_approves_pending_card(
         self,
@@ -955,6 +1428,92 @@ class PluginShellTests(unittest.IsolatedAsyncioTestCase):
             any(key.startswith("stat_") for key in stored["fields"])
         )
 
+    async def test_private_card_countdown_notice_can_toggle_at_any_time(
+        self,
+    ) -> None:
+        from astrbot_plugin_tavern.tavern.constants import (
+            DEFAULT_WORLD_SLUG,
+            SESSION_PREPARING,
+        )
+
+        session = await self.plugin.database.ensure_session(
+            "qq",
+            "group-card-notice-toggle",
+            "qq:GroupMessage:group-card-notice-toggle",
+            DEFAULT_WORLD_SLUG,
+            "admin-1",
+        )
+        await self.plugin.database.transition_session(
+            session["id"],
+            SESSION_PREPARING,
+            "admin-1",
+        )
+        reserved = await self.plugin.database.reserve_participant(
+            session["id"],
+            "toggle-user",
+            "提示开关玩家",
+        )
+        private_origin = "qq:FriendMessage:toggle-user"
+        await self.plugin.database.bind_card_code(
+            reserved["binding_code"],
+            "toggle-user",
+            private_origin,
+        )
+
+        class Event:
+            unified_msg_origin = private_origin
+            message_obj = SimpleNamespace(group_id="")
+
+            def __init__(self, message: str) -> None:
+                self.message_str = message
+                self.stopped = False
+
+            @staticmethod
+            def get_group_id():
+                return ""
+
+            @staticmethod
+            def get_platform_id():
+                return "qq"
+
+            @staticmethod
+            def get_sender_id():
+                return "toggle-user"
+
+            def get_message_str(self):
+                return self.message_str
+
+            def stop_event(self):
+                self.stopped = True
+
+            @staticmethod
+            def plain_result(value):
+                return value
+
+        event = Event("/酒馆 建卡提醒 关")
+        disabled = [
+            item
+            async for item in self.plugin.tavern_card_timer_notice(event)
+        ][0]
+        self.assertTrue(event.stopped)
+        self.assertIn("建卡倒计时提示已关闭", disabled)
+        self.assertIn("建卡计时仍会继续", disabled)
+
+        event.message_str = "/酒馆 建卡提醒"
+        status = [
+            item
+            async for item in self.plugin.tavern_card_timer_notice(event)
+        ][0]
+        self.assertIn("建卡倒计时提示已关闭", status)
+
+        event.message_str = "／酒馆 建卡提醒 开"
+        enabled = [
+            item
+            async for item in self.plugin.tavern_card_timer_notice(event)
+        ][0]
+        self.assertIn("建卡倒计时提示已开启", enabled)
+        self.assertIn("每 2 分钟私聊提示", enabled)
+
     async def test_native_start_uses_stripped_text_and_real_event_ids(
         self,
     ) -> None:
@@ -1196,4 +1755,185 @@ class PluginShellTests(unittest.IsolatedAsyncioTestCase):
             unified_msg_origin = "qq:group-shell"
             message_obj = SimpleNamespace(group_id="group-shell")
 
-           
+    async def test_jg_choice_uses_active_sends_without_intermediate_yield(
+        self,
+    ) -> None:
+        from astrbot_plugin_tavern.tavern.constants import SESSION_RUNNING
+
+        self.plugin.database.get_session_by_group = AsyncMock(
+            return_value={"id": "session_hotfix", "state": SESSION_RUNNING}
+        )
+        self.plugin.database.active_vote = AsyncMock(return_value=None)
+        self.plugin.engine.process_choice = AsyncMock(
+            return_value=SimpleNamespace(
+                story_text="【故事推进】\n修复后的故事正文。",
+                turn_text="【回合秩序】第1轮结束 · 第2轮：下一位",
+                text="",
+            )
+        )
+
+        class Event:
+            message_str = "jg C"
+            is_at_or_wake_command = False
+            unified_msg_origin = "qq:GroupMessage:group-shell"
+            message_obj = SimpleNamespace(group_id="group-shell")
+
+            def __init__(self) -> None:
+                self.stopped = False
+
+            @staticmethod
+            def get_group_id():
+                return "group-shell"
+
+            @staticmethod
+            def get_platform_id():
+                return "qq"
+
+            @staticmethod
+            def get_sender_id():
+                return "choice-user"
+
+            @staticmethod
+            def get_sender_name():
+                return "选择玩家"
+
+            def stop_event(self):
+                self.stopped = True
+
+            @staticmethod
+            def plain_result(value):
+                return value
+
+        event = Event()
+        yielded = [
+            item async for item in self.plugin.on_group_message(event)
+        ]
+
+        self.assertTrue(event.stopped)
+        self.assertEqual(yielded, [])
+        self.plugin.engine.process_choice.assert_awaited_once()
+        self.assertEqual(len(self.context.sent_messages), 3)
+        texts = [
+            "".join(
+                str(component.text)
+                for component in chain.chain
+                if hasattr(component, "text")
+            )
+            for _, chain in self.context.sent_messages
+        ]
+        self.assertIn("后续内容正在生成中", texts[0])
+        self.assertIn("修复后的故事正文", texts[1])
+        self.assertIn("第2轮", texts[2])
+        self.assertTrue(
+            all(
+                origin == event.unified_msg_origin
+                for origin, _ in self.context.sent_messages
+            )
+        )
+
+    async def test_confirmed_card_notifies_its_bound_group(self) -> None:
+        from astrbot_plugin_tavern.tavern.constants import (
+            DEFAULT_WORLD_SLUG,
+            SESSION_PREPARING,
+        )
+
+        session = await self.plugin.database.ensure_session(
+            "qq",
+            "group-card-created",
+            "qq:GroupMessage:group-card-created",
+            DEFAULT_WORLD_SLUG,
+            "admin-1",
+        )
+        await self.plugin.database.transition_session(
+            session["id"],
+            SESSION_PREPARING,
+            "admin-1",
+        )
+        reserved = await self.plugin.database.reserve_participant(
+            session["id"],
+            "card-created-user",
+            "建卡玩家",
+        )
+        private_origin = "qq:FriendMessage:card-created-user"
+        await self.plugin.database.bind_card_code(
+            reserved["binding_code"],
+            "card-created-user",
+            private_origin,
+        )
+        draft = await self.plugin.database.card_draft_for_private(
+            private_origin
+        )
+        for field in draft["template"]["fields"]:
+            if field["key"] == "name":
+                value = "同步角色"
+            elif field["key"] == "code":
+                value = "SYNC"
+            elif field.get("type") == "integer":
+                value = str(field.get("default", 0))
+            else:
+                value = "角色资料"
+            await self.plugin.database.fill_card_draft(
+                private_origin,
+                value,
+            )
+
+        class Event:
+            message_str = "酒馆 确认建卡"
+            unified_msg_origin = private_origin
+            message_obj = SimpleNamespace(group_id="")
+
+            def __init__(self) -> None:
+                self.stopped = False
+
+            @staticmethod
+            def get_group_id():
+                return ""
+
+            @staticmethod
+            def get_platform_id():
+                return "qq"
+
+            @staticmethod
+            def get_sender_id():
+                return "card-created-user"
+
+            def get_message_str(self):
+                return self.message_str
+
+            def stop_event(self):
+                self.stopped = True
+
+            @staticmethod
+            def plain_result(value):
+                return value
+
+        event = Event()
+        responses = [
+            item async for item in self.plugin.tavern_card_confirm(event)
+        ]
+
+        self.assertTrue(event.stopped)
+        self.assertIn("角色卡已确认", responses[0])
+        self.assertEqual(len(self.context.sent_messages), 1)
+        origin, chain = self.context.sent_messages[0]
+        self.assertEqual(origin, "qq:GroupMessage:group-card-created")
+        text = "".join(
+            str(component.text)
+            for component in chain.chain
+            if hasattr(component, "text")
+        )
+        self.assertEqual(
+            text,
+            "【酒馆】角色卡同步角色已建立，等待审核。",
+        )
+
+    async def test_group_token_quota_has_group_web_routes(self) -> None:
+        paths = {route[0] for route in self.context.routes}
+        self.assertIn(
+            "/astrbot_plugin_tavern/groups/token-usage",
+            paths,
+        )
+        self.assertIn(
+            "/astrbot_plugin_tavern/groups/token-quota",
+            paths,
+        )
