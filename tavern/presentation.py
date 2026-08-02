@@ -50,6 +50,12 @@ from .lifecycle import (
     resolve_profession_stats,
     uses_profession_preset_stats,
 )
+from .stat_generation import (
+    calculate_preset_stack_stats,
+    format_preset_stack_result,
+    stat_generation_config,
+    uses_preset_stack_stats,
+)
 from .security import (
     ParsedCommand,
     parse_story_trigger,
@@ -88,7 +94,7 @@ _INSTANCE_PAGE_PATTERNS = (
 
 
 HELP_TEXT = """\
-【AI 酒馆 v0.9.2｜多人跑团与独立存档】
+【AI 酒馆 v0.9.3｜多人跑团与独立存档】
 主持：/酒馆 开启 <副本> → /酒馆 开演
 恢复：/酒馆 暂停 → /酒馆 恢复 → 全员准备 → /酒馆 继续
 玩家：/酒馆 加入｜角色｜准备｜阵容｜暂离｜返回队列｜退出
@@ -581,6 +587,15 @@ def _format_preset_step_prompt(
 
 
 def format_card_prompt(draft: Mapping[str, Any]) -> str:
+    generated_notice = draft.get("stat_generation_result")
+    if isinstance(generated_notice, Mapping):
+        without_notice = dict(draft)
+        without_notice.pop("stat_generation_result", None)
+        return (
+            format_preset_stack_result(generated_notice)
+            + "\n\n"
+            + format_card_prompt(without_notice)
+        )
     template = draft.get("template") or {}
     fields = template.get("fields") or []
     values = draft.get("fields")
@@ -590,6 +605,30 @@ def format_card_prompt(draft: Mapping[str, Any]) -> str:
     )
     world = draft.get("world") or {}
     preset_mode = uses_profession_preset_stats(template)
+    preset_stack_mode = uses_preset_stack_stats(template)
+    if step >= len(fields) and preset_stack_mode:
+        try:
+            resolved = calculate_preset_stack_stats(
+                template,
+                values,
+                require_complete=True,
+            )
+        except ValueError as exc:
+            return f"【角色卡数值尚未完成】{exc}"
+        assert resolved is not None
+        sources = "、".join(
+            str(item) for item in stat_generation_config(template).get(
+                "bonus_sources", []
+            )
+        )
+        return "\n".join(
+            [
+                format_preset_stack_result(resolved),
+                "",
+                f"属性来源已锁定；如需调整请使用 /酒馆 修改 <字段>（{sources}）。",
+                "发送 /酒馆 预览 检查内容，确认无误后发送 /酒馆 确认建卡。",
+            ]
+        )
     if step >= len(fields) and preset_mode:
         try:
             resolved = resolve_profession_stats(
@@ -744,6 +783,27 @@ def format_card_preview(draft: Mapping[str, Any]) -> str:
         if definition.get("private"):
             value = "（私密字段已保存）" if value else "（未填写）"
         lines.append(f"· {definition.get('label')}：{value or '（未填写）'}")
+    if uses_preset_stack_stats(template):
+        lines.append("")
+        try:
+            resolved = calculate_preset_stack_stats(
+                template,
+                fields,
+                require_complete=True,
+            )
+        except ValueError as exc:
+            lines.append(f"【角色数值｜多预设自动结算】尚未生成：{exc}")
+        else:
+            assert resolved is not None
+            lines.append(format_preset_stack_result(resolved))
+        lines.extend(
+            [
+                "",
+                "确认：/酒馆 确认建卡",
+                "放弃并释放席位：/酒馆 取消建卡",
+            ]
+        )
+        return "\n".join(lines)
     if uses_profession_preset_stats(template):
         lines.append("")
         try:
@@ -965,6 +1025,63 @@ def format_review_card(
             value_text = str(value or "").strip() or "（未填写）"
         lines.append(f"· {definition.get('label')}：{value_text}")
 
+    if uses_preset_stack_stats(template):
+        lines.extend(["", "【角色数值｜多预设自动结算】"])
+        try:
+            resolved = calculate_preset_stack_stats(
+                template,
+                profile,
+                require_complete=True,
+            )
+        except ValueError as exc:
+            lines.append(f"· 校验结果：不通过（{exc}）")
+        else:
+            assert resolved is not None
+            lines.append(
+                "· 基础属性："
+                + "、".join(
+                    f"{resolved['labels'][key]}{value}"
+                    for key, value in resolved["base"].items()
+                )
+            )
+            for source in resolved["sources"]:
+                bonus = "、".join(
+                    f"{resolved['labels'][key]}{value:+d}"
+                    for key, value in source["stat_bonus"].items()
+                )
+                lines.append(f"· {source['option_label']}：{bonus}")
+            lines.append(
+                "· 最终属性："
+                + "、".join(
+                    f"{resolved['labels'][key]}{value}"
+                    f"({resolved['modifiers'][key]:+d})"
+                    for key, value in resolved["raw"].items()
+                )
+            )
+            lines.append(f"· 最终总和：{resolved['effective_total']}")
+            stored_raw = stats.get("raw")
+            stored_raw = stored_raw if isinstance(stored_raw, Mapping) else {}
+            tampered = [
+                resolved["labels"][key]
+                for key, value in resolved["raw"].items()
+                if key not in stored_raw or int(stored_raw[key]) != value
+            ]
+            stored_snapshot = stats.get("stat_generation_snapshot")
+            if tampered:
+                lines.append("· 校验结果：不通过（存档与来源不符：" + "、".join(tampered) + "）")
+            elif not isinstance(stored_snapshot, Mapping):
+                lines.append("· 校验结果：数值正确，但旧卡缺少来源快照，需管理员确认补写")
+            else:
+                lines.append("· 校验结果：通过")
+        lines.extend(
+            [
+                "",
+                "标为私密的字段不会在群聊展开；完整内容仍可在后台“准备与角色”查看。",
+                f"通过：/酒馆 审核 {_review_reference(participant)} 通过 [备注]",
+                f"驳回：/酒馆 审核 {_review_reference(participant)} 驳回 [原因]",
+            ]
+        )
+        return "\n".join(lines)
     if uses_profession_preset_stats(template):
         lines.extend(["", "【角色数值｜职业预设】"])
         try:

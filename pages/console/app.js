@@ -13,12 +13,12 @@ import {
 import { app, viewMeta } from "./core/state.js";
 
 const DEFAULT_CHARACTER_CARD_TEMPLATE = {
-  version: 1,
+  version: 4,
   auto_approve: false,
   edit_requires_review: true,
   fields: [
-    ["name", "角色姓名", true, false, 40],
-    ["code", "副本代号", true, false, 20],
+    ["name", "角色姓名", true, false, 12],
+    ["code", "副本代号", true, false, 12],
     ["appearance", "外貌特征", true, false, 300],
     ["background", "角色背景", true, false, 800],
     ["personality", "性格与行事方式", true, false, 400],
@@ -39,6 +39,7 @@ const DEFAULT_CHARACTER_CARD_TEMPLATE = {
     max_chars,
   })),
   stats: {
+    mode: "manual",
     budget: 10,
     attributes: [
       ["body", "体魄"],
@@ -73,8 +74,8 @@ function validateCharacterCardTemplate(template) {
     if (!keys.includes(required)) throw new Error(`角色卡缺少必需字段 ${required}`);
   }
   const mode = String(template.stats?.mode || "manual").toLowerCase();
-  if (!["none", "manual", "preset"].includes(mode)) {
-    throw new Error("数值模式必须是 none、manual 或 preset");
+  if (!["none", "manual", "preset", "preset_stack"].includes(mode)) {
+    throw new Error("数值模式必须是 none、manual、preset 或 preset_stack");
   }
   const attributes = Array.isArray(template.stats?.attributes)
     ? template.stats.attributes
@@ -83,6 +84,22 @@ function validateCharacterCardTemplate(template) {
     throw new Error("启用数值系统时必须包含 stats.attributes");
   }
   if (mode === "none") return template;
+  if (mode === "preset_stack") {
+    const generation = template.stat_generation;
+    if (!generation || generation.mode !== "preset_stack") {
+      throw new Error("preset_stack 必须声明 character_card.stat_generation");
+    }
+    if (
+      !generation.base_stats ||
+      !Array.isArray(generation.bonus_sources) ||
+      !generation.bonus_sources.length
+    ) {
+      throw new Error("preset_stack 必须声明 base_stats 与 bonus_sources");
+    }
+    if (generation.allow_manual_edit !== false) {
+      throw new Error("v0.9.3 的 preset_stack 必须设置 allow_manual_edit=false");
+    }
+  }
   const minimumBudget = attributes.reduce(
     (sum, item) => sum + Number(item.minimum || 0),
     0,
@@ -233,7 +250,11 @@ function renderCharacterCardFields(profile, template) {
   const knownKeys = new Set(definitions.map((field) => String(field.key || "")));
   const extraFields = Object.entries(profile)
     .filter(
-      ([key]) => !knownKeys.has(key) && !String(key).startsWith("stat_"),
+      ([key]) =>
+        !knownKeys.has(key) &&
+        !String(key).startsWith("stat_") &&
+        !String(key).startsWith("_") &&
+        !["resolved_stat_total", "profession_base_stats"].includes(key),
     )
     .map(([key, value]) => ({
       key,
@@ -312,6 +333,17 @@ function renderCharacterCardStats(profile, stats, template) {
     0,
   );
   const budget = Number(stats?.budget ?? definition.budget ?? 0);
+  const generationSnapshot =
+    stats?.stat_generation_snapshot &&
+    typeof stats.stat_generation_snapshot === "object"
+      ? stats.stat_generation_snapshot
+      : profile?.stat_generation_snapshot &&
+          typeof profile.stat_generation_snapshot === "object"
+        ? profile.stat_generation_snapshot
+        : {};
+  const generationSources = Array.isArray(generationSnapshot.sources)
+    ? generationSnapshot.sources
+    : [];
   if (!values.length) {
     return '<div class="empty-inline">当前模板没有数值属性。</div>';
   }
@@ -343,6 +375,19 @@ function renderCharacterCardStats(profile, stats, template) {
         })
         .join("")}
     </div>
+    ${
+      generationSources.length
+        ? `<div class="character-card-note"><strong>属性来源</strong><span>${generationSources
+            .map((source) => {
+              const bonuses = Object.entries(source.stat_bonus || {})
+                .map(([key, value]) => `${labels[key] || key}${Number(value) >= 0 ? "+" : ""}${value}`)
+                .join("、");
+              return `${source.option_label || source.option_id || source.source_id}：${bonuses}`;
+            })
+            .map((item) => escapeHTML(item))
+            .join("；")}</span></div>`
+        : ""
+    }
   `;
 }
 
@@ -1484,7 +1529,7 @@ function openWorldEditor(world = null) {
         <div class="field">
           <label for="world-stats-mode">角色数值模式</label>
           <select id="world-stats-mode">
-            ${[["none", "无数值"], ["manual", "手动分配"], ["preset", "职业预设"]].map(([value, label]) => `<option value="${value}" ${String(characterCardTemplate.stats?.mode || "manual") === value ? "selected" : ""}>${label}</option>`).join("")}
+            ${[["none", "无数值"], ["manual", "手动分配"], ["preset", "职业预设"], ["preset_stack", "多预设自动结算"]].map(([value, label]) => `<option value="${value}" ${String(characterCardTemplate.stats?.mode || "manual") === value ? "selected" : ""}>${label}</option>`).join("")}
           </select>
         </div>
         <div class="field">
@@ -1578,7 +1623,7 @@ function openWorldEditor(world = null) {
         rules,
         initial_state: parseJSONField("#world-state", "初始世界状态"),
         archived: Boolean(item.archived),
-        world_schema_version: 2,
+        world_schema_version: 3,
         capabilities: {
           character_stats: characterCard.stats.mode !== "none",
           attribute_checks: rules.resolution.mode === "attribute",
@@ -4534,7 +4579,7 @@ $("#export-backup-button").addEventListener("click", async (event) => {
       await bridge.download(
         "backup/export",
         {},
-        "backup_tavern_v0.9.2.zip",
+        "backup_tavern_v0.9.3.zip",
       );
     });
     toast("备份已生成", "success");

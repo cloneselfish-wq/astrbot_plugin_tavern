@@ -3,8 +3,8 @@ display_name: "AI 酒馆 · 多人跑团叙事引擎"
 desc: "AI 主持的多人群聊跑团与互动叙事插件：世界协议、角色卡版本、事务防重、精确急救、脱敏诊断、剧情恢复与独立存档。"
 short_desc: "多人跑团、事务恢复、世界体检与独立副本存档管理。"
 help: "配置管理员 ID 后使用 /酒馆 开启 <副本> 进入准备大厅；新副本使用 /酒馆 开演，已有进度使用 /酒馆 继续。回合使用 /酒馆 选择 A/B/C/D。"
-author: "AI Tavern Project"
-version: v0.9.2
+author: "Ghostberry"
+version: v0.9.3
 astrbot_version: ">=4.26,<5"
 support_platforms:
   - aiocqhttp

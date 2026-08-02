@@ -4,8 +4,9 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 
-WORLD_SCHEMA_VERSION = 2
-STAT_MODES = {"none", "manual", "preset"}
+WORLD_SCHEMA_VERSION = 3
+SUPPORTED_WORLD_SCHEMA_VERSIONS = frozenset({2, 3})
+STAT_MODES = {"none", "manual", "preset", "preset_stack"}
 RESOLUTION_MODES = {"none", "narrative", "dice_only", "attribute"}
 
 DEFAULT_DANGER_LEVELS = (
@@ -37,6 +38,14 @@ DEFAULT_OUTCOME_POLICY = {
 }
 
 
+def _version_tuple(value: Any) -> tuple[int, int, int] | None:
+    text = str(value or "").strip().lower().removeprefix("v")
+    parts = text.split(".")
+    if not 1 <= len(parts) <= 3 or any(not part.isdigit() for part in parts):
+        return None
+    return tuple((int(parts[index]) if index < len(parts) else 0) for index in range(3))
+
+
 def stats_mode(stats: Mapping[str, Any] | None) -> str:
     stats = stats if isinstance(stats, Mapping) else {}
     mode = str(stats.get("mode") or "").strip().lower()
@@ -62,6 +71,14 @@ def world_contract(world: Mapping[str, Any] | None) -> dict[str, Any]:
     card = card if isinstance(card, Mapping) else {}
     stats = card.get("stats")
     stats = stats if isinstance(stats, Mapping) else {}
+    generation = card.get("stat_generation")
+    generation = generation if isinstance(generation, Mapping) else {}
+    if str(generation.get("mode") or "").lower() == "preset_stack":
+        stats = {
+            **dict(stats),
+            "mode": "preset_stack",
+            "stat_generation": dict(generation),
+        }
     try:
         version = int(
             source.get(
@@ -117,6 +134,11 @@ def world_contract(world: Mapping[str, Any] | None) -> dict[str, Any]:
         outcome_policy.update(dict(resolution_raw.get("outcome_policy") or {}))
     return {
         "version": version,
+        "minimum_plugin_version": str(
+            source.get("minimum_plugin_version")
+            or source.get("min_plugin_version")
+            or ""
+        ),
         "stats": {**dict(stats), "mode": stats_mode(stats)},
         "attributes": attributes,
         "resolution": {
@@ -159,13 +181,21 @@ def world_contract(world: Mapping[str, Any] | None) -> dict[str, Any]:
 
 def validate_world_contract(world: Mapping[str, Any]) -> dict[str, Any]:
     contract = world_contract(world)
-    if contract["version"] != WORLD_SCHEMA_VERSION:
+    if contract["version"] not in SUPPORTED_WORLD_SCHEMA_VERSIONS:
         raise ValueError(
-            f"v0.9.2 仅接受世界包协议 v{WORLD_SCHEMA_VERSION}；"
-            f"当前为 v{contract['version']}，不再执行旧协议自动转换"
+            "v0.9.3 仅接受世界包协议 v2 或 v3；"
+            f"当前为 v{contract['version']}"
         )
     stats = contract["stats"]
     mode = stats["mode"]
+    if mode == "preset_stack":
+        if contract["version"] < 3:
+            raise ValueError("preset_stack 必须使用世界包协议 v3")
+        minimum = _version_tuple(contract.get("minimum_plugin_version"))
+        if minimum is None or minimum < (0, 9, 3):
+            raise ValueError(
+                "preset_stack 世界包必须声明 minimum_plugin_version >= 0.9.3"
+            )
     resolution_mode = contract["resolution"]["mode"]
     if mode == "none" and resolution_mode == "attribute":
         raise ValueError("无数值世界不能启用 attribute 属性检定")
@@ -212,3 +242,13 @@ def attribute_lookup(
         if value in {key.casefold(), label.casefold(), f"{label}检定".casefold()}:
             return key, label
     return None
+
+
+__all__ = [
+    "SUPPORTED_WORLD_SCHEMA_VERSIONS",
+    "WORLD_SCHEMA_VERSION",
+    "attribute_lookup",
+    "stats_mode",
+    "validate_world_contract",
+    "world_contract",
+]

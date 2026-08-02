@@ -8,6 +8,10 @@ from .lifecycle import (
     card_template,
     resolve_profession_stats,
 )
+from .stat_generation import (
+    sync_preset_stack_fields,
+    uses_preset_stack_stats,
+)
 
 
 def validate_card_revision(
@@ -29,7 +33,14 @@ def validate_card_revision(
     if missing:
         raise ValueError("尚未填写：" + "、".join(missing))
     mode = str(template["stats"].get("mode") or "manual")
-    if mode == "preset":
+    if uses_preset_stack_stats(template):
+        resolved = sync_preset_stack_fields(
+            template,
+            fields,
+            require_complete=True,
+        )
+        assert resolved is not None
+    elif mode == "preset":
         resolved = resolve_profession_stats(template, fields, require_complete=True)
     elif mode == "manual":
         raw = dict((stats or {}).get("raw") or {})
@@ -68,4 +79,3 @@ def validate_card_revision(
         "template_version": int(template.get("version", 1)),
         "requires_review": bool(template.get("edit_requires_review", True)),
     }
-

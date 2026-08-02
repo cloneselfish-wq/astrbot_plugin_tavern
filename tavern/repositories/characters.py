@@ -1115,6 +1115,15 @@ class CharacterRepositoryMixin:
                 fields, step = repair_profession_preset_draft(
                     template, fields, step
                 )
+                if uses_preset_stack_stats(template):
+                    sync_preset_stack_fields(
+                        template,
+                        fields,
+                        require_complete=False,
+                    )
+                stack_was_resolved = bool(
+                    fields.get(STAT_GENERATION_SNAPSHOT_KEY)
+                )
                 if step >= len(fields_def):
                     raise ValueError("所有字段已填写，请发送 /酒馆 确认建卡")
                 definition = fields_def[step]
@@ -1199,11 +1208,11 @@ class CharacterRepositoryMixin:
                             f"{minimum}—{maximum} 之间{suffix}"
                         )
                 profession_mode = uses_profession_preset_stats(template)
+                preset_stack_mode = uses_preset_stack_stats(template)
                 field_key = str(definition["key"])
-                if profession_mode and field_key.startswith("stat_"):
+                if (profession_mode or preset_stack_mode) and field_key.startswith("stat_"):
                     raise ValueError(
-                        "本世界不使用大项/小项自由分配，"
-                        "请选择主属性+7与副属性+3。"
+                        "本世界的属性由预设自动生成，不支持手动填写。"
                     )
                 previous_value = fields.get(field_key)
                 if previous_value is not None and previous_value != stored_value:
@@ -1217,6 +1226,7 @@ class CharacterRepositoryMixin:
                 fields[field_key] = stored_value
                 if selected_preset:
                     store_preset_snapshot(fields, field_key, selected_preset)
+                stack_resolved = None
                 if profession_mode and field_key == "profession":
                     resolved = resolve_profession_stats(
                         template, fields, require_complete=False
@@ -1247,7 +1257,13 @@ class CharacterRepositoryMixin:
                     for _k, _v in resolved["raw"].items():
                         fields[f"stat_{_k}"] = _v
                     fields["resolved_stat_total"] = int(resolved["effective_total"])
-                if profession_mode:
+                if preset_stack_mode:
+                    stack_resolved = sync_preset_stack_fields(
+                        template,
+                        fields,
+                        require_complete=False,
+                    )
+                if profession_mode or preset_stack_mode:
                     next_step = next_fillable_card_step(
                         template, fields_def, step + 1, fields
                     )
@@ -1306,7 +1322,7 @@ class CharacterRepositoryMixin:
                     },
                 )
                 connection.execute("COMMIT")
-                return {
+                result = {
                     "participant_id": row["id"],
                     "session_id": row["session_id"],
                     "fields": fields,
@@ -1315,6 +1331,15 @@ class CharacterRepositoryMixin:
                     "complete": next_step >= len(fields_def),
                     "world": json_load(row["world_snapshot_json"], {}),
                 }
+                if stack_resolved is not None and (
+                    not stack_was_resolved
+                    or field_key
+                    in stat_generation_config(template).get(
+                        "bonus_sources", []
+                    )
+                ):
+                    result["stat_generation_result"] = stack_resolved
+                return result
             except Exception:
                 connection.execute("ROLLBACK")
                 raise
@@ -1378,6 +1403,15 @@ class CharacterRepositoryMixin:
                 if not isinstance(fields, dict):
                     fields = {}
                 world_obj = json_load(row["world_snapshot_json"], {})
+                if uses_preset_stack_stats(template):
+                    sources = stat_generation_config(template).get(
+                        "bonus_sources", []
+                    )
+                    raise ValueError(
+                        "本世界的属性已由预设锁定；请使用 /酒馆 修改 "
+                        + "、/酒馆 修改 ".join(str(item) for item in sources)
+                        + " 调整属性来源"
+                    )
                 if uses_profession_preset_stats(template):
                     profession_name = str(fields.get("profession") or "")
                     if not profession_name:
@@ -1595,6 +1629,14 @@ class CharacterRepositoryMixin:
                     raise ValueError("该字段在当前角色选择下不需要填写")
                 field_key = str(definition.get("key") or "")
                 clear_field_and_dependents(template, fields, field_key)
+                if (
+                    uses_preset_stack_stats(template)
+                    and field_key
+                    in stat_generation_config(template).get(
+                        "bonus_sources", []
+                    )
+                ):
+                    clear_generated_stats(template, fields)
                 if field_key == "profession":
                     fields.pop("profession_base_stats", None)
                     fields.pop("resolved_stat_total", None)
@@ -1737,7 +1779,26 @@ class CharacterRepositoryMixin:
                 if duplicate:
                     raise ValueError("角色姓名或副本代号已被使用")
                 stat_definition = template["stats"]
-                if uses_profession_preset_stats(template):
+                if uses_preset_stack_stats(template):
+                    calculated_stats = calculate_preset_stack_stats(
+                        template,
+                        fields,
+                        require_complete=True,
+                    )
+                    assert calculated_stats is not None
+                    for key, expected_value in calculated_stats["raw"].items():
+                        field_name = f"stat_{key}"
+                        if field_name in fields and int(fields[field_name]) != expected_value:
+                            raise ValueError(
+                                f"{calculated_stats['labels'][key]}数值与预设来源不一致"
+                            )
+                    resolved_stats = sync_preset_stack_fields(
+                        template,
+                        fields,
+                        require_complete=True,
+                    )
+                    assert resolved_stats is not None
+                elif uses_profession_preset_stats(template):
                     resolved_stats = resolve_profession_stats(
                         template,
                         fields,

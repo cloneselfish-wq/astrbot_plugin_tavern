@@ -45,9 +45,22 @@ from tavern.resolution import CheckRequest, roll_check
 from tavern.world_contract import WORLD_SCHEMA_VERSION, validate_world_contract
 from tavern.world_migration import compare_world_contracts
 from tavern.world_preflight import inspect_world_package
+from tavern.stat_generation import (
+    assess_preset_stack_migration,
+    calculate_preset_stack_stats,
+    format_preset_stack_result,
+    sync_preset_stack_fields,
+    validate_stat_generation_config,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
+TIDE_WORLD_PATH = (
+    ROOT
+    / "tests"
+    / "fixtures"
+    / "where-winds-meet-tideless-script.world.json"
+)
 
 
 class FakeContext:
@@ -63,11 +76,12 @@ class FakeContext:
         return SimpleNamespace(completion_text=self.outputs.pop(0))
 
 
-class V092ContractTests(unittest.TestCase):
+class V093ContractTests(unittest.TestCase):
     def test_versions_are_single_current_baseline(self) -> None:
         metadata = yaml.safe_load((ROOT / "metadata.yaml").read_text("utf-8"))
-        self.assertEqual(PLUGIN_VERSION, "0.9.2")
-        self.assertEqual(metadata["version"], "v0.9.2")
+        self.assertEqual(PLUGIN_VERSION, "0.9.3")
+        self.assertEqual(metadata["version"], "v0.9.3")
+        self.assertEqual(metadata["author"], "Ghostberry")
         self.assertEqual(DATABASE_SCHEMA_VERSION, 8)
 
     def test_builtin_world_passes_strict_preflight(self) -> None:
@@ -111,6 +125,123 @@ class V092ContractTests(unittest.TestCase):
         self.assertTrue(report["compatible"], report["issues"])
         self.assertEqual(report["summary"]["stats_mode"], "manual")
         self.assertEqual(report["summary"]["resolution_mode"], "attribute")
+
+    def test_preset_stack_template_and_tide_world_pass_full_preflight(self) -> None:
+        template_world = json.loads(
+            (
+                ROOT
+                / "templates"
+                / "world-package-preset-stack.template.json"
+            ).read_text("utf-8")
+        )
+        template_report = inspect_world_package(template_world)
+        self.assertTrue(template_report["compatible"], template_report["issues"])
+        self.assertEqual(template_report["summary"]["stats_mode"], "preset_stack")
+        self.assertEqual(
+            validate_stat_generation_config(card_template(template_world))[
+                "combination_count"
+            ],
+            8,
+        )
+
+        tide = json.loads(TIDE_WORLD_PATH.read_text("utf-8"))
+        report = inspect_world_package(tide)
+        self.assertTrue(report["compatible"], report["issues"])
+        self.assertEqual(tide["world_content_version"], "1.1.0")
+        self.assertEqual(tide["minimum_plugin_version"], "0.9.3")
+        self.assertEqual(report["summary"]["schema_version"], 3)
+        self.assertEqual(report["summary"]["stats_mode"], "preset_stack")
+        self.assertEqual(report["summary"]["preset_stack_combinations"], 630)
+        validation = validate_stat_generation_config(card_template(tide))
+        self.assertEqual(validation["combination_count"], 7 * 9 * 10)
+
+    def test_tide_reference_combination_is_exact_and_traceable(self) -> None:
+        tide = json.loads(TIDE_WORLD_PATH.read_text("utf-8"))
+        template = card_template(tide)
+        fields = {
+            "origin_region": "江南",
+            "social_identity": "斥候",
+            "martial_flow": "牵丝·玉",
+        }
+        resolved = calculate_preset_stack_stats(
+            template,
+            fields,
+            require_complete=True,
+        )
+        self.assertEqual(
+            resolved["raw"],
+            {"ti": 5, "yu": 5, "min": 9, "shi": 7, "jin": 5},
+        )
+        self.assertEqual(resolved["effective_total"], 31)
+        self.assertEqual(len(resolved["sources"]), 3)
+        sync_preset_stack_fields(template, fields, require_complete=True)
+        self.assertEqual(fields["stat_min"], 9)
+        self.assertEqual(fields["resolved_stat_total"], 31)
+        self.assertEqual(
+            len(fields["stat_generation_snapshot"]["sources"]), 3
+        )
+
+        fields["martial_flow"] = "鸣金·虹"
+        changed = sync_preset_stack_fields(
+            template,
+            fields,
+            require_complete=True,
+        )
+        self.assertEqual(changed["raw"]["min"], 7)
+        self.assertEqual(changed["raw"]["shi"], 8)
+        self.assertEqual(changed["raw"]["jin"], 6)
+
+    def test_preset_stack_rejects_invalid_bonus_and_never_silently_migrates(self) -> None:
+        tide = json.loads(TIDE_WORLD_PATH.read_text("utf-8"))
+        broken = copy.deepcopy(tide)
+        broken["rules"]["character_card"]["preset_sets"][
+            "origin_regions"
+        ][0]["stat_bonus"] = {"unknown": 2}
+        report = inspect_world_package(broken)
+        self.assertFalse(report["compatible"])
+        self.assertTrue(
+            any("未知属性" in item["message"] for item in report["issues"])
+        )
+
+        template = card_template(tide)
+        profile = {
+            "origin_region": "江南",
+            "social_identity": "斥候",
+            "martial_flow": "牵丝·玉",
+        }
+        safe = assess_preset_stack_migration(
+            template,
+            profile,
+            {"raw": {"ti": 5, "yu": 5, "min": 9, "shi": 7, "jin": 5}},
+        )
+        unsafe = assess_preset_stack_migration(
+            template,
+            profile,
+            {"raw": {"ti": 5, "yu": 5, "min": 8, "shi": 8, "jin": 5}},
+        )
+        self.assertEqual(safe["status"], "snapshot_backfill_safe")
+        self.assertEqual(unsafe["status"], "admin_confirmation_required")
+
+    def test_preset_stack_prompt_skips_manual_stat_pages(self) -> None:
+        tide = json.loads(TIDE_WORLD_PATH.read_text("utf-8"))
+        template = card_template(tide)
+        self.assertFalse(
+            any(str(item.get("key") or "").startswith("stat_") for item in template["fields"])
+        )
+        fields = {
+            "origin_region": "江南",
+            "social_identity": "斥候",
+            "martial_flow": "牵丝·玉",
+        }
+        resolved = sync_preset_stack_fields(
+            template,
+            fields,
+            require_complete=True,
+        )
+        prompt = format_preset_stack_result(resolved)
+        self.assertIn("【角色五维已自动生成】", prompt)
+        self.assertIn("体 5｜御 5｜敏 9｜势 7｜劲 5", prompt)
+        self.assertNotIn("角色数值 1/5", prompt)
 
     def test_npc_template_matches_current_import_contract(self) -> None:
         payload = json.loads(
@@ -240,7 +371,7 @@ class V092ContractTests(unittest.TestCase):
         self.assertNotIn(marker, repaired)
         self.assertLess(len(repaired), 2000)
 
-    def test_v092_low_latency_defaults(self) -> None:
+    def test_low_latency_defaults_remain_current(self) -> None:
         config = TavernConfig.from_mapping({})
         self.assertEqual(config.temperature, 0.5)
         self.assertEqual(config.max_tokens, 1400)
@@ -307,7 +438,7 @@ class V092ContractTests(unittest.TestCase):
             else:
                 world["world_schema_version"] = value
                 world["rules"]["world_schema_version"] = value
-            with self.assertRaisesRegex(ValueError, "仅接受世界包协议 v2"):
+            with self.assertRaisesRegex(ValueError, "仅接受世界包协议 v2 或 v3"):
                 validate_world_contract(world)
 
     def test_world_migration_never_hot_replaces(self) -> None:
@@ -346,8 +477,8 @@ class V092ContractTests(unittest.TestCase):
         html = (ROOT / "pages/console/index.html").read_text("utf-8")
         style = (ROOT / "pages/console/style.css").read_text("utf-8")
         logo = (ROOT / "logo.svg").read_text("utf-8")
-        self.assertIn("style.css?v=0.9.2", html)
-        self.assertIn("app.js?v=0.9.2", html)
+        self.assertIn("style.css?v=0.9.3", html)
+        self.assertIn("app.js?v=0.9.3", html)
         self.assertIn("button-secondary", html)
         self.assertIn(".button-secondary", style)
         self.assertIn("viewBox=\"0 0 256 256\"", logo)
@@ -361,7 +492,7 @@ class V092ContractTests(unittest.TestCase):
             self.assertIn("### 详细更新说明", section)
 
 
-class V092DatabaseTests(unittest.IsolatedAsyncioTestCase):
+class V093DatabaseTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
@@ -402,6 +533,96 @@ class V092DatabaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(first["current_step"], 1)
         self.assertEqual(repeated["current_step"], 1)
         self.assertTrue(repeated["duplicate"])
+
+    async def test_tide_card_auto_generates_and_persists_sources(self) -> None:
+        tide = json.loads(TIDE_WORLD_PATH.read_text("utf-8"))
+        await self.database.save_world(tide, "admin")
+        session = await self.database.ensure_session(
+            "qq",
+            "group-tide-v093",
+            "qq:group-tide-v093",
+            tide["slug"],
+            "admin",
+        )
+        await self.database.transition_session(
+            session["id"], SESSION_PREPARING, "admin"
+        )
+        reserved = await self.database.reserve_participant(
+            session["id"], "user-tide", "潮生"
+        )
+        origin = "private:user-tide"
+        await self.database.bind_card_code(
+            reserved["binding_code"], "user-tide", origin
+        )
+        draft = await self.database.card_draft_for_private(origin)
+        selected = {
+            "name": "潮生",
+            "code": "CS",
+            "origin_region": "江南",
+            "social_identity": "斥候",
+            "martial_flow": "牵丝·玉",
+        }
+        generated_result = None
+        while draft["current_step"] < len(draft["template"]["fields"]):
+            field = draft["template"]["fields"][draft["current_step"]]
+            key = str(field["key"])
+            value = selected.get(key)
+            if value is None:
+                options = preset_options(draft["template"], field, draft["fields"])
+                if options:
+                    option_index = 1 if key == "life_skill_secondary" else 0
+                    value = options[min(option_index, len(options) - 1)]["value"]
+                else:
+                    value = "测试资料"
+            draft = await self.database.fill_card_draft(origin, str(value))
+            generated_result = draft.get("stat_generation_result") or generated_result
+
+        self.assertIsNotNone(generated_result)
+        self.assertEqual(
+            generated_result["raw"],
+            {"ti": 5, "yu": 5, "min": 9, "shi": 7, "jin": 5},
+        )
+        self.assertFalse(
+            any(
+                str(item.get("key") or "").startswith("stat_")
+                for item in draft["template"]["fields"]
+            )
+        )
+        submitted = await self.database.confirm_card_draft(origin)
+        roster = await self.database.list_roster(session["id"])
+        card = next(item for item in roster if item["id"] == submitted["id"])
+        self.assertEqual(card["card_stats"]["raw"]["min"], 9)
+        self.assertEqual(card["card_stats"]["modifiers"]["min"], 2)
+        self.assertEqual(
+            len(card["card_stats"]["stat_generation_snapshot"]["sources"]),
+            3,
+        )
+        modifier = await self.database.authoritative_modifier(
+            session["id"], "user-tide", "敏"
+        )
+        self.assertTrue(modifier["matched"])
+        self.assertEqual(modifier["modifier"], 2)
+        await self.database.review_character_card(
+            session["id"], submitted["id"], True, "admin"
+        )
+        revision = await self.database.request_card_revision(
+            session["id"],
+            submitted["id"],
+            {"martial_flow": "鸣金·虹"},
+            {},
+            "user-tide",
+            "更换主修流派",
+        )
+        await self.database.review_card_revision(
+            revision["id"], True, "admin", "同意重算"
+        )
+        updated_roster = await self.database.list_roster(session["id"])
+        updated = next(
+            item for item in updated_roster if item["id"] == submitted["id"]
+        )
+        self.assertEqual(updated["card_stats"]["raw"]["min"], 7)
+        self.assertEqual(updated["card_stats"]["raw"]["shi"], 8)
+        self.assertEqual(updated["card_stats"]["raw"]["jin"], 6)
 
     async def test_timer_policy_and_play_time_are_off_by_default(self) -> None:
         policy = await self.database.get_timer_policy(self.session["id"])

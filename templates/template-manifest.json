@@ -1,12 +1,13 @@
 {
-  "template_bundle_version": "1.1.0",
-  "compatible_plugin_version": "0.9.2",
-  "world_schema_version": 2,
-  "character_card_template_version": 3,
+  "template_bundle_version": "1.2.0",
+  "compatible_plugin_version": "0.9.3",
+  "world_schema_version": 3,
+  "character_card_template_version": 4,
   "npc_import_template_version": 1,
   "files": {
     "instructions": "templates/README.md",
     "world_package": "templates/world-package.template.json",
+    "preset_stack_world_package": "templates/world-package-preset-stack.template.json",
     "npc_import": "templates/npc-import.template.json"
   },
   "release_policy": {
@@ -19,7 +20,8 @@
       "context_compiler_or_budget_changes",
       "attribute_id_or_display_label_changes",
       "npc_import_contract_changes",
-      "stable_id_or_validation_rules_change"
+      "stable_id_or_validation_rules_change",
+      "stat_generation_or_preset_stack_contract_changes"
     ]
   }
 }

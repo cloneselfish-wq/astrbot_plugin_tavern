@@ -1,10 +1,11 @@
-# v0.9.2 世界包编写说明
+# v0.9.3 世界包编写说明
 
 世界包是可复用模板。新建副本时会复制世界版本、规则与时间规则快照；之后修改模板不会静默改变正在运行的团。
 
 安装包自带可直接复制的通用模板：
 
 - `templates/world-package.template.json`：当前世界协议、建卡向导与机器骰制的最小完整示例。
+- `templates/world-package-preset-stack.template.json`：多个预设共同生成属性的可运行示例。
 - `templates/npc-import.template.json`：可直接通过管理台导入的常驻 NPC 数据示例。
 - `templates/template-manifest.json`：模板兼容的插件、世界协议、角色卡和 NPC 导入版本。
 - `templates/README.md`：面向世界作者与 AI 修改工具的逐项说明和发布维护规则。
@@ -72,7 +73,7 @@
 ```json
 {
   "character_card": {
-    "version": 3,
+    "version": 4,
     "preset_sets": {
       "origin_regions": [
         {
@@ -159,7 +160,7 @@
 ```json
 {
   "character_card": {
-    "version": 1,
+    "version": 4,
     "auto_approve": false,
     "edit_requires_review": true,
     "fields": [
@@ -168,7 +169,7 @@
         "label": "角色姓名",
         "required": true,
         "private": false,
-        "max_chars": 40,
+        "max_chars": 12,
         "type": "text"
       },
       {
@@ -176,7 +177,7 @@
         "label": "副本代号",
         "required": true,
         "private": false,
-        "max_chars": 20,
+        "max_chars": 12,
         "type": "text"
       },
       {
@@ -197,6 +198,7 @@
       }
     ],
     "stats": {
+      "mode": "manual",
       "budget": 10,
       "attributes": [
         {
@@ -235,6 +237,28 @@
 - 属性默认值必须在最小值与最大值之间。
 - 总预算必须介于全部属性最小值之和与最大值之和之间。
 - 插件会为属性自动补充 `stat_<key>` 建卡步骤。
+
+使用 `preset_stack` 时，角色卡模板版本应为 4，世界协议必须为 v3，并声明 `minimum_plugin_version: "0.9.3"`。在 `character_card` 下增加：
+
+```json
+{
+  "stat_generation": {
+    "mode": "preset_stack",
+    "base_stats": {"body": 2, "agility": 2},
+    "bonus_sources": ["origin_region", "profession"],
+    "bonus_source_rules": {
+      "origin_region": {"expected_bonus_total": 1},
+      "profession": {"expected_bonus_total": 1}
+    },
+    "expected_total": 6,
+    "min_per_stat": 2,
+    "max_per_stat": 4,
+    "allow_manual_edit": false
+  }
+}
+```
+
+同时将 `stats.mode` 设为 `preset_stack`，并为每个来源选项写入非空 `stat_bonus`。所有来源选完后插件自动显示最终属性和来源、保存快照并继续后续字段，不创建 `stat_<key>` 手动填写步骤。返回修改来源时从基础值重算。
 
 建议字段包含背景、目标、信念、羁绊、专长、缺陷、弱点、知识边界、私人秘密和内容边界。
 
@@ -345,7 +369,7 @@ DC 只表示成功难度：
 
 模型生成 NPC 必须有名字，并至少满足直接互动、掌握重要线索或写入长期记忆之一。自动 NPC 只能写公开资料、已知事实、误解和运行状态，不能创建系统级私密提示词。
 
-`v0.9.2` 会按用途编译上下文：建卡预设、职业数值、开场选项和事件池不会进入每轮叙事；选项生成只接收当前场景、精简角色、最近事件、允许属性和风险—DC。`context_budget` 应用于新副本的运行快照，数值越高并不等于叙事质量越高；长期事实应进入记忆或故事账本，而不是无限增加最近回合。
+`v0.9.3` 会按用途编译上下文：建卡预设、职业数值、开场选项和事件池不会进入每轮叙事；选项生成只接收当前场景、精简角色、最近事件、允许属性和风险—DC。`context_budget` 应用于新副本的运行快照，数值越高并不等于叙事质量越高；长期事实应进入记忆或故事账本，而不是无限增加最近回合。
 
 ## 开场四选一
 

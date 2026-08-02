@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from typing import Any
 
+from .card_wizard import preset_options
 from .lifecycle import (
     card_stat_allocation,
     card_template,
@@ -12,6 +13,11 @@ from .lifecycle import (
     validate_card_template_config,
 )
 from .world_contract import WORLD_SCHEMA_VERSION, validate_world_contract
+from .stat_generation import (
+    calculate_preset_stack_stats,
+    stat_generation_config,
+    validate_stat_generation_config,
+)
 
 
 def _issue(
@@ -74,6 +80,7 @@ def inspect_world_package(world: Mapping[str, Any]) -> dict[str, Any]:
     tests: list[dict[str, Any]] = []
     contract: dict[str, Any] = {}
     template: dict[str, Any] = {}
+    preset_stack_combinations = 0
 
     if not isinstance(world, Mapping):
         return {
@@ -160,7 +167,56 @@ def inspect_world_package(world: Mapping[str, Any]) -> dict[str, Any]:
 
         minimal = _minimal_fields(template)
         mode = str(template.get("stats", {}).get("mode") or "manual")
-        if mode == "preset" and presets:
+        if mode == "preset_stack":
+            try:
+                validation = validate_stat_generation_config(template)
+                preset_stack_combinations = int(
+                    validation.get("combination_count", 0)
+                )
+                generation = stat_generation_config(template)
+                field_index = {
+                    str(item.get("key") or ""): item
+                    for item in fields
+                    if isinstance(item, Mapping)
+                }
+                for source_id in generation.get("bonus_sources", []):
+                    source_field = field_index.get(str(source_id), {})
+                    options = preset_options(template, source_field, minimal)
+                    if options:
+                        minimal[str(source_id)] = str(
+                            options[0].get("id")
+                            or options[0].get("value")
+                            or ""
+                        )
+                calculate_preset_stack_stats(
+                    template,
+                    minimal,
+                    require_complete=True,
+                )
+                tests.append(
+                    {
+                        "name": "多预设属性全部组合",
+                        "status": "passed",
+                        "detail": {
+                            "combination_count": validation[
+                                "combination_count"
+                            ]
+                        },
+                    }
+                )
+            except Exception as exc:
+                issues.append(
+                    _issue(
+                        "error",
+                        "rules.character_card.stat_generation",
+                        "preset_stack_dry_run_failed",
+                        str(exc),
+                    )
+                )
+                tests.append(
+                    {"name": "多预设属性全部组合", "status": "failed"}
+                )
+        elif mode == "preset" and presets:
             preset = next((x for x in presets if isinstance(x, Mapping)), None)
             if preset:
                 selector = template.get("stats", {}).get("preset_selector", {})
@@ -248,6 +304,10 @@ def inspect_world_package(world: Mapping[str, Any]) -> dict[str, Any]:
             "supported_schema_version": WORLD_SCHEMA_VERSION,
             "field_count": len(template.get("fields", [])) if template else 0,
             "stats_mode": stats.get("mode", "unknown"),
+            "preset_stack_combinations": preset_stack_combinations,
+            "minimum_plugin_version": contract.get(
+                "minimum_plugin_version", ""
+            ),
             "attribute_count": len(contract.get("attributes", [])) if contract else 0,
             "resolution_mode": resolution.get("mode", "unknown"),
             "dice_system": resolution.get("dice_system", "none"),

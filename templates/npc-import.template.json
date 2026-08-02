@@ -1,10 +1,10 @@
 {
   "template_metadata": {
-    "template_bundle_version": "1.1.0",
-    "compatible_plugin_version": "0.9.2",
+    "template_bundle_version": "1.2.0",
+    "compatible_plugin_version": "0.9.3",
     "npc_import_template_version": 1,
     "purpose": "管理台常驻 NPC 批量导入载荷；复制后修改 world_slug 与 items",
-    "merge_rule": "v0.9.2 导入时按同一世界内的 NPC 名称更新，未命中名称则新建"
+    "merge_rule": "v0.9.3 导入时按同一世界内的 NPC 名称更新，未命中名称则新建"
   },
   "world_slug": "generic-world-template",
   "items": [

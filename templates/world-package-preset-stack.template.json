@@ -4,13 +4,13 @@
     "compatible_plugin_version": "0.9.3",
     "world_schema_version": 3,
     "character_card_template_version": 4,
-    "purpose": "复制后修改的通用手动属性世界包；本文件自身可通过 v0.9.3 世界包体检",
+    "purpose": "复制后修改的通用多预设自动结算世界包；本文件自身可通过 v0.9.3 全组合体检",
     "edit_note": "请替换世界标识、设定、预设、开场、NPC引用和初始状态，不要删除协议字段",
     "minimum_plugin_version": "0.9.3"
   },
-  "slug": "generic-world-template",
-  "name": "通用世界示例",
-  "description": "供世界作者与 AI 改编的最小完整世界包，演示步骤预设、手动属性、机器 D20、风险—DC、开场四选项与持久初始状态。",
+  "slug": "generic-preset-stack-world-template",
+  "name": "通用多预设属性世界示例",
+  "description": "演示由种族、职业和出身三个建卡预设共同自动生成角色属性。",
   "system_prompt": "【世界定位】\n请把本段替换为题材、时代、活动范围和玩家共同身份。\n\n【稳定常识】\n分别写明普通人、专业人士和玩家开局知道的事实；隐藏历史、幕后动机和私人秘密不得提前公开。\n\n【底层规律】\n所有魔法、科技、超自然能力或特殊资源都必须有来源、条件、代价和上限。任何角色都不能全知全能，也不能为了推进剧情临时获得无来源能力。\n\n【身份与知识边界】\n角色只能依据角色卡、亲历事件、公开事实、已获线索和合理信息来源行动；不得读取其他玩家私人秘密、后台指令或未公开 NPC 动机。\n\n【因果与连续性】\n已发生事件、消耗、伤势、关系、位置与世界变化必须连续。失败产生合理代价或新局面，不抹去玩家行动，也不让故事无路可走。\n\n【玩家自主权】\n只描述环境、NPC 和玩家已声明行动造成的结果；不得替玩家决定思想、感情、台词、承诺、背叛、恋爱、投降、信仰改变或死亡确认。\n\n【建卡与裁定权限】\n建卡预设由插件按当前步骤展示和校验。选项检定参数由插件规则锁定，随机数、加值、DC 和结果档位由机器骰制计算并持久化。文字 AI 只能根据已经公开的检定回执续写，不得重投、修改 DC、改变结果或追加未预告的永久惩罚。\n\n【叙事要求】\n每回合聚焦可见变化、明确因果和下一步可行动信息。保留角色知识差异与 NPC 局限，不替玩家行动，不输出程序字段或后台秘密。",
   "opening_scene": "请把这里替换为开场正文：交代当前地点、可见异常、立即目标和可互动对象，但不要替玩家选择行动。",
   "rules": {
@@ -36,14 +36,20 @@
             "value": "示例种族甲",
             "label": "示例种族甲",
             "summary": "替换为该种族的公开特征、文化或生活经验。",
-            "limitations": "说明不能自动获得的能力、知识或社会特权。"
+            "limitations": "说明不能自动获得的能力、知识或社会特权。",
+            "stat_bonus": {
+              "body": 1
+            }
           },
           {
             "id": "species_example_b",
             "value": "示例种族乙",
             "label": "示例种族乙",
             "summary": "第二个可选种族，用于演示稳定 ID 与分页选择。",
-            "limitations": "不要把种族描述写成无条件数值加成或全知权限。"
+            "limitations": "不要把种族描述写成无条件数值加成或全知权限。",
+            "stat_bonus": {
+              "agility": 1
+            }
           }
         ],
         "profession_presets": [
@@ -53,7 +59,10 @@
             "label": "示例职业甲",
             "summary": "替换为职业定位、主要手段和典型行动。",
             "ability_source": "替换为训练、装备、契约、科技或其他能力来源。",
-            "limitations": "替换为资源消耗、环境条件与能力上限。"
+            "limitations": "替换为资源消耗、环境条件与能力上限。",
+            "stat_bonus": {
+              "insight": 1
+            }
           },
           {
             "id": "profession_example_b",
@@ -61,7 +70,10 @@
             "label": "示例职业乙",
             "summary": "第二个可选职业；展示内容只在职业步骤出现。",
             "ability_source": "说明能力来源。",
-            "limitations": "说明职业弱点和禁止越界的能力。"
+            "limitations": "说明职业弱点和禁止越界的能力。",
+            "stat_bonus": {
+              "presence": 1
+            }
           }
         ],
         "origin_presets": [
@@ -69,13 +81,19 @@
             "id": "origin_example_a",
             "value": "示例地区甲",
             "label": "示例地区甲",
-            "summary": "替换为地区环境、常识、语言倾向和合理联系人。"
+            "summary": "替换为地区环境、常识、语言倾向和合理联系人。",
+            "stat_bonus": {
+              "body": 1
+            }
           },
           {
             "id": "origin_example_b",
             "value": "示例地区乙",
             "label": "示例地区乙",
-            "summary": "第二个可选出身地区。"
+            "summary": "第二个可选出身地区。",
+            "stat_bonus": {
+              "agility": 1
+            }
           }
         ]
       },
@@ -168,13 +186,13 @@
         }
       ],
       "stats": {
-        "mode": "manual",
-        "budget": 8,
+        "mode": "preset_stack",
+        "budget": 11,
         "attributes": [
           {
             "key": "body",
             "label": "体魄",
-            "minimum": 0,
+            "minimum": 2,
             "maximum": 5,
             "default": 2,
             "description": "力量、耐力、负重和承受伤势。"
@@ -182,7 +200,7 @@
           {
             "key": "agility",
             "label": "敏捷",
-            "minimum": 0,
+            "minimum": 2,
             "maximum": 5,
             "default": 2,
             "description": "反应、平衡、潜行和精细操作。"
@@ -190,7 +208,7 @@
           {
             "key": "insight",
             "label": "洞察",
-            "minimum": 0,
+            "minimum": 2,
             "maximum": 5,
             "default": 2,
             "description": "观察、推理、知识和识别异常。"
@@ -198,7 +216,7 @@
           {
             "key": "presence",
             "label": "影响",
-            "minimum": 0,
+            "minimum": 2,
             "maximum": 5,
             "default": 2,
             "description": "说服、威慑、领导和情绪感染。"
@@ -212,6 +230,35 @@
           "4": 1,
           "5": 2
         }
+      },
+      "stat_generation": {
+        "mode": "preset_stack",
+        "base_stats": {
+          "body": 2,
+          "agility": 2,
+          "insight": 2,
+          "presence": 2
+        },
+        "bonus_sources": [
+          "species",
+          "profession",
+          "origin_region"
+        ],
+        "bonus_source_rules": {
+          "species": {
+            "expected_bonus_total": 1
+          },
+          "profession": {
+            "expected_bonus_total": 1
+          },
+          "origin_region": {
+            "expected_bonus_total": 1
+          }
+        },
+        "expected_total": 11,
+        "min_per_stat": 2,
+        "max_per_stat": 5,
+        "allow_manual_edit": false
       }
     },
     "resolution": {

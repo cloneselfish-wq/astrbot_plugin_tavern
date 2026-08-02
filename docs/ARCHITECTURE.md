@@ -1,4 +1,4 @@
-# AI 酒馆 v0.9.2 架构与扩展接口
+# AI 酒馆 v0.9.3 架构与扩展接口
 
 ## 依赖方向
 
@@ -25,7 +25,8 @@ tavern/database.py            SQLite 连接、当前 Schema 与仓库组合入�
 tavern/engine.py              回合、模型调用、质量守卫和原子提交
 tavern/prompts.py             分用途上下文编译、精简投影与修复提示
 tavern/presentation.py        群聊展示与角色卡格式化
-tavern/world_contract.py      世界协议 v2 运行契约
+tavern/stat_generation.py     多预设属性结算、快照、全组合校验与迁移评估
+tavern/world_contract.py      世界协议 v2/v3 运行契约
 tavern/world_preflight.py     导入前结构化体检
 tavern/narrative_quality.py   通用叙事质量检查
 tavern/emergency.py           管理员精确急救
@@ -59,6 +60,12 @@ pages/console/                页面入口与统一设计系统
 
 模型可见的属性同时包含稳定 ID 与中文标签；存档以稳定 ID 为权威，展示以冻结世界快照的标签为权威。上下文裁剪不能修改世界状态、检定回执或事务边界。
 
+## 多预设属性结算
+
+`stat_generation.py` 是 `preset_stack` 的唯一权威算法。建卡、恢复、字段修改、角色卡修订、确认、审核与世界体检都从 `base_stats` 重新计算，不在当前属性上累加。角色卡持久化最终 `raw/modifiers` 和 `stat_generation_snapshot`；检定仍只读取已确认角色卡中的最终修正，不在每次投骰时复算世界预设。
+
+协议 v3 世界包必须声明最低插件版本，并通过全部合法组合体检。协议 v2 继续支持旧 `none/manual/preset` 世界，不执行新模式的静默降级。
+
 ## 公共扩展接口
 
 可信 Python 扩展从 `tavern.api` 使用：
@@ -70,6 +77,11 @@ plugin.hooks.subscribe("story_generated", on_story_generated)
 
 session = await plugin.public_api.get_current_session(platform_id, group_id)
 turn = await plugin.public_api.get_turn_context(session["id"])
+
+from tavern.api import (
+    calculate_preset_stack_stats,
+    validate_stat_generation_config,
+)
 ```
 
 可注册类型：
@@ -106,4 +118,4 @@ turn = await plugin.public_api.get_turn_context(session["id"])
 
 ## 版本边界
 
-v0.9.x 使用 Schema 8、世界协议 v2 和独立数据库 `catalog_v090.sqlite3`。本版本不包含 Schema 1—7、旧世界协议或旧存档目录迁移代码。
+v0.9.x 使用 Schema 8 和独立数据库 `catalog_v090.sqlite3`。v0.9.3 同时接受世界协议 v2 与 v3；v3 专用于需要 `preset_stack` 等新契约的世界。Schema 1—7 与世界协议 v1 仍不受支持。

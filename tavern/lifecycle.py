@@ -8,6 +8,12 @@ from typing import Any
 
 from .card_wizard import field_visible, preset_options
 from .security import clean_text
+from .stat_generation import (
+    calculate_preset_stack_stats,
+    stat_generation_config,
+    uses_preset_stack_stats,
+    validate_stat_generation_config,
+)
 from .world_contract import attribute_lookup, stats_mode, world_contract
 
 
@@ -639,7 +645,20 @@ def card_template(world: Mapping[str, Any]) -> dict[str, Any]:
             )
     stats_raw = raw.get("stats")
     stats_raw = stats_raw if isinstance(stats_raw, Mapping) else {}
-    mode = stats_mode(stats_raw)
+    generation_raw = raw.get("stat_generation")
+    if not isinstance(generation_raw, Mapping):
+        nested_generation = stats_raw.get("stat_generation")
+        generation_raw = (
+            nested_generation
+            if isinstance(nested_generation, Mapping)
+            else {}
+        )
+    mode = (
+        "preset_stack"
+        if str(generation_raw.get("mode") or "").lower()
+        == "preset_stack"
+        else stats_mode(stats_raw)
+    )
     attributes_raw = stats_raw.get("attributes")
     attributes: list[dict[str, Any]] = []
     if isinstance(attributes_raw, Sequence) and not isinstance(
@@ -790,6 +809,24 @@ def card_template(world: Mapping[str, Any]) -> dict[str, Any]:
             "total_validation": dict(stats_raw.get("total_validation") or {}),
             "preset_selector": dict(stats_raw.get("preset_selector") or {}),
             "bonus_choices": list(stats_raw.get("bonus_choices") or []),
+            "stat_generation": {
+                "mode": str(generation_raw.get("mode") or mode).lower(),
+                "base_stats": dict(generation_raw.get("base_stats") or {}),
+                "bonus_sources": list(
+                    generation_raw.get("bonus_sources") or []
+                ),
+                "bonus_source_rules": dict(
+                    generation_raw.get("bonus_source_rules") or {}
+                ),
+                "expected_total": generation_raw.get(
+                    "expected_total", budget
+                ),
+                "min_per_stat": generation_raw.get("min_per_stat"),
+                "max_per_stat": generation_raw.get("max_per_stat"),
+                "allow_manual_edit": bool(
+                    generation_raw.get("allow_manual_edit", False)
+                ),
+            },
         },
         "profession_presets": profession_presets,
         "origin_region_presets": origin_region_presets,
@@ -810,6 +847,27 @@ def card_stat_allocation(
     mode = stats_mode(stats_config)
     if mode == "none":
         return {"mode": "none", "stat_fields": [], "current": None, "values": {}, "used": 0, "budget": 0, "remaining": 0, "complete": True}
+    if uses_preset_stack_stats(template):
+        safe_fields = fields if isinstance(fields, Mapping) else {}
+        resolved = calculate_preset_stack_stats(
+            template,
+            safe_fields,
+            require_complete=False,
+        )
+        config = stat_generation_config(template)
+        budget = int(config.get("expected_total") or 0)
+        return {
+            "mode": "preset_stack",
+            "stat_fields": [],
+            "current": None,
+            "values": resolved["raw"] if resolved else {},
+            "base_values": resolved["base"] if resolved else dict(config.get("base_stats") or {}),
+            "used": resolved["effective_total"] if resolved else 0,
+            "budget": budget,
+            "remaining": 0 if resolved else budget,
+            "complete": resolved is not None,
+            "resolved": resolved,
+        }
     if uses_profession_preset_stats(template):
         # Profession-preset mode: stats are derived, never manually allocated.
         safe_fields = fields if isinstance(fields, Mapping) else {}
@@ -1135,7 +1193,7 @@ def next_fillable_card_step(
             step += 1
             continue
         if (
-            uses_profession_preset_stats(template)
+            (uses_profession_preset_stats(template) or uses_preset_stack_stats(template))
             and (
                 key.startswith("stat_")
                 or definition.get("skip_manual_prompt")
@@ -1285,6 +1343,8 @@ def validate_card_template_config(value: Any) -> None:
     stats = value.get("stats")
     stats = stats if isinstance(stats, Mapping) else {"mode": "none"}
     mode = stats_mode(stats)
+    if uses_preset_stack_stats(normalized_template):
+        mode = "preset_stack"
     attributes = stats.get("attributes")
     if not isinstance(attributes, Sequence) or isinstance(
         attributes,
@@ -1327,6 +1387,9 @@ def validate_card_template_config(value: Any) -> None:
         )
 
     # Preset stat mode. Totals and bonuses come from the world package.
+    if mode == "preset_stack":
+        validate_stat_generation_config(normalized_template)
+
     if mode == "preset":
         field_keys = {
             str(item.get("key") or "")

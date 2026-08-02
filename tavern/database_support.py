@@ -61,6 +61,14 @@ from .lifecycle import (
     world_session_modules,
     world_time_rules,
 )
+from .stat_generation import (
+    STAT_GENERATION_SNAPSHOT_KEY,
+    calculate_preset_stack_stats,
+    clear_generated_stats,
+    stat_generation_config,
+    sync_preset_stack_fields,
+    uses_preset_stack_stats,
+)
 from .resolution import memory_fingerprint
 from .world_contract import validate_world_contract
 from .security import clean_text, validate_platform_id, validate_slug

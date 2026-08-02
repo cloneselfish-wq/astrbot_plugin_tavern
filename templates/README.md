@@ -1,13 +1,14 @@
 # 通用世界包与 NPC 模板
 
-本目录随 AI 酒馆 `v0.9.2` 发布，模板包版本为 `1.1.0`。这里的文件既供人工复制填写，也供 AI 在明确字段边界下生成或修改世界内容。
+本目录随 AI 酒馆 `v0.9.3` 发布，模板包版本为 `1.2.0`。这里的文件既供人工复制填写，也供 AI 在明确字段边界下生成或修改世界内容。
 
 ## 文件说明
 
 | 文件 | 用途 | 当前接口 |
 |---|---|---|
-| `template-manifest.json` | 机器可读的兼容清单与发布同步规则 | 插件 0.9.2 |
-| `world-package.template.json` | 可直接通过严格体检的最小完整世界包 | 世界协议 v2、角色卡模板 v3 |
+| `template-manifest.json` | 机器可读的兼容清单与发布同步规则 | 插件 0.9.3 |
+| `world-package.template.json` | 可直接通过严格体检的手动属性世界包 | 世界协议 v3、角色卡模板 v4 |
+| `world-package-preset-stack.template.json` | 多个建卡预设共同生成属性的完整示例 | `preset_stack`、全组合体检 |
 | `npc-import.template.json` | 可直接提交到常驻 NPC 导入入口的载荷 | NPC 导入模板 v1 |
 
 模板文件只包含声明式 JSON，不能放入 Python、JavaScript、模板表达式、网络请求或任何可执行代码。
@@ -30,13 +31,38 @@
 - `world_content_version`：只表示该世界内容的版本，不等于插件版本或世界协议版本。
 - `preset_sets`：为种族、职业、地区、身份、阵营、学院等预设分配不重复的稳定 `id`。建卡只会在进入对应字段时展示该预设源。
 - `fields`：每个字段的 `key` 必须唯一；选择字段使用 `preset_source` 或内联 `options`，不要把完整选项名单塞进标题或提示词。
-- `stats`：选择 `none`、`manual` 或 `preset`。修改属性时同步更新检定允许属性、修正表、预算和相关选项。
+- `stats`：选择 `none`、`manual`、`preset` 或 `preset_stack`。修改属性时同步更新检定允许属性、修正表、预算和相关选项。
 - `resolution`：骰制必须已经注册；风险通过 `difficulty_policy` 映射 DC；结果档位由 `outcome_policy` 固定计算。
 - `opening_choices`：必须提供 A—D。需要检定的选项必须在展示前拥有有效属性、风险、检定类型和已知后果。
 - `initial_state`：写清地点、时间、场景摘要、公开事实、队伍物品、关系和已知修正来源。
 - `capabilities`：顶层与 `rules.capabilities` 应保持一致，并与数值及裁定模式相符。
 
 模板采用 `manual` 四属性作为容易改写的通用示例。若改为职业固定基础值与主/副属性加成，应参考内置阿尔维恩世界包的 `preset` 结构，并确保职业预设基础总值、加成选择和最终总值全部通过体检。
+
+## 多预设属性自动结算（preset_stack）
+
+需要由地区、身份、流派等多个选择共同生成属性时，请复制 `world-package-preset-stack.template.json`。规范配置位于 `rules.character_card.stat_generation`：
+
+```json
+{
+  "mode": "preset_stack",
+  "base_stats": {"body": 2, "agility": 2, "insight": 2, "presence": 2},
+  "bonus_sources": ["species", "profession", "origin_region"],
+  "bonus_source_rules": {
+    "species": {"expected_bonus_total": 1},
+    "profession": {"expected_bonus_total": 1},
+    "origin_region": {"expected_bonus_total": 1}
+  },
+  "expected_total": 11,
+  "min_per_stat": 2,
+  "max_per_stat": 5,
+  "allow_manual_edit": false
+}
+```
+
+每个来源选项必须提供机器可读的 `stat_bonus`，例如 `{"stat_bonus":{"agility":1}}`。插件会从 `base_stats` 重新计算，绝不会在角色当前数值上继续累加；全部来源选完后自动保存最终属性与 `stat_generation_snapshot`，并跳过手动填写。修改任一来源后会清除旧结果并重算。
+
+发布体检会验证来源字段存在且为单选、稳定 ID 不重复、属性 ID 与整数加成合法、每个来源的固定加成总量正确，以及所有合法组合的最终总和和单项范围。组合数超过 100000 会被拒绝，避免导入阶段产生不可控计算量。
 
 ## 步骤预设规则
 
@@ -81,7 +107,7 @@
 
 ## 上下文与生成速度
 
-`v0.9.2` 会自动按任务裁剪上下文：故事生成不携带建卡预设、职业基础属性、开场选项或完整事件池；A—D 选项与选项修复使用独立的精简提示。模板默认采用最近 6 回合、6 条相关记忆、6 名活动 NPC 和 8 条故事账本。世界作者应把稳定事实放进 `system_prompt` 的简明世界常识、记忆或故事账本，不要把同一段设定同时复制到多个规则字段。
+`v0.9.3` 会自动按任务裁剪上下文：故事生成不携带建卡预设、职业基础属性、开场选项或完整事件池；A—D 选项与选项修复使用独立的精简提示。模板默认采用最近 6 回合、6 条相关记忆、6 名活动 NPC 和 8 条故事账本。世界作者应把稳定事实放进 `system_prompt` 的简明世界常识、记忆或故事账本，不要把同一段设定同时复制到多个规则字段。
 
 内部属性键建议继续使用英文或 ASCII 稳定 ID，例如 `charisma`；玩家可见名称使用中文 `label`，例如“魅力”。插件保存稳定 ID，并在选项、骰点与恢复展示时读取中文标签，不要把内部 ID 直接写进选项正文。
 
@@ -107,7 +133,7 @@ NPC 导入文件顶层必须是对象：
 - `limitations`：能力上限、知识盲区与资源条件
 - `private_direction` / `prompt`：隐藏动机、秘密和透露条件
 
-`v0.9.2` 的管理台导入会在目标世界内按 NPC 名称判断更新或新建，因此已有 NPC 改名可能生成新记录。`slug` 当前用于作者侧稳定标记和内置播种参考，不能替代导入时的名称匹配；修改前应先核对目标世界已有 NPC。
+`v0.9.3` 的管理台导入会在目标世界内按 NPC 名称判断更新或新建，因此已有 NPC 改名可能生成新记录。`slug` 当前用于作者侧稳定标记和内置播种参考，不能替代导入时的名称匹配；修改前应先核对目标世界已有 NPC。
 
 ## 交给 AI 修改时的要求
 
