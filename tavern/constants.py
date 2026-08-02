@@ -4,8 +4,11 @@ import json
 from pathlib import Path
 
 PLUGIN_NAME = "astrbot_plugin_tavern"
-PLUGIN_VERSION = "0.9.0"
+PLUGIN_VERSION = "0.9.2"
 DATABASE_SCHEMA_VERSION = 8
+TEMPLATE_BUNDLE_VERSION = "1.1.0"
+CHARACTER_CARD_TEMPLATE_VERSION = 3
+NPC_IMPORT_TEMPLATE_VERSION = 1
 
 SESSION_CLOSED = "closed"
 SESSION_PREPARING = "preparing"
@@ -49,6 +52,9 @@ MANAGEMENT_ACTIONS = {
     "加入": "join",
     "建卡": "card",
     "填写": "card_fill",
+    "上一步": "card_previous",
+    "修改": "card_modify",
+    "当前步骤": "card_current",
     "预览": "card_preview",
     "重填数值": "card_stats_reset",
     "建卡提醒": "card_timer_notice",
@@ -107,6 +113,8 @@ MUTATING_ACTIONS = {
     "join",
     "card",
     "card_fill",
+    "card_previous",
+    "card_modify",
     "card_stats_reset",
     "card_timer_notice",
     "card_confirm",
@@ -141,6 +149,9 @@ PLAYER_ACTIONS = {
     "join",
     "card",
     "card_fill",
+    "card_previous",
+    "card_modify",
+    "card_current",
     "card_stats_reset",
     "card_timer_notice",
     "card_preview",

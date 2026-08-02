@@ -1,0 +1,25 @@
+{
+  "template_bundle_version": "1.1.0",
+  "compatible_plugin_version": "0.9.2",
+  "world_schema_version": 2,
+  "character_card_template_version": 3,
+  "npc_import_template_version": 1,
+  "files": {
+    "instructions": "templates/README.md",
+    "world_package": "templates/world-package.template.json",
+    "npc_import": "templates/npc-import.template.json"
+  },
+  "release_policy": {
+    "validated_in_test_suite": true,
+    "update_together_when": [
+      "plugin_version_changes",
+      "world_schema_changes",
+      "character_card_or_preset_wizard_changes",
+      "resolution_or_dice_contract_changes",
+      "context_compiler_or_budget_changes",
+      "attribute_id_or_display_label_changes",
+      "npc_import_contract_changes",
+      "stable_id_or_validation_rules_change"
+    ]
+  }
+}

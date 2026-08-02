@@ -20,6 +20,22 @@ DEFAULT_DANGER_LEVELS = (
     },
 )
 
+DEFAULT_DIFFICULTY_POLICY = {
+    "safe": None,
+    "controlled": 9,
+    "dangerous": 13,
+    "desperate": 17,
+    "lethal": 21,
+}
+
+DEFAULT_OUTCOME_POLICY = {
+    "natural_20_critical": True,
+    "natural_1_critical": True,
+    "critical_success_margin": 10,
+    "cost_success_min_margin": -4,
+    "failure_min_margin": -9,
+}
+
 
 def stats_mode(stats: Mapping[str, Any] | None) -> str:
     stats = stats if isinstance(stats, Mapping) else {}
@@ -91,6 +107,14 @@ def world_contract(world: Mapping[str, Any] | None) -> dict[str, Any]:
     )
     annotation = presentation.get("annotation")
     annotation = annotation if isinstance(annotation, Mapping) else {}
+    difficulty_policy = dict(DEFAULT_DIFFICULTY_POLICY)
+    if isinstance(resolution_raw.get("difficulty_policy"), Mapping):
+        difficulty_policy.update(
+            dict(resolution_raw.get("difficulty_policy") or {})
+        )
+    outcome_policy = dict(DEFAULT_OUTCOME_POLICY)
+    if isinstance(resolution_raw.get("outcome_policy"), Mapping):
+        outcome_policy.update(dict(resolution_raw.get("outcome_policy") or {}))
     return {
         "version": version,
         "stats": {**dict(stats), "mode": stats_mode(stats)},
@@ -107,6 +131,8 @@ def world_contract(world: Mapping[str, Any] | None) -> dict[str, Any]:
                 resolution_raw.get("generic_check") or {}
             ),
             "allowed_attributes": [str(item) for item in allowed],
+            "difficulty_policy": difficulty_policy,
+            "outcome_policy": outcome_policy,
         },
         "danger_levels": [
             dict(item)
@@ -135,7 +161,7 @@ def validate_world_contract(world: Mapping[str, Any]) -> dict[str, Any]:
     contract = world_contract(world)
     if contract["version"] != WORLD_SCHEMA_VERSION:
         raise ValueError(
-            f"v0.9.0 仅接受世界包协议 v{WORLD_SCHEMA_VERSION}；"
+            f"v0.9.2 仅接受世界包协议 v{WORLD_SCHEMA_VERSION}；"
             f"当前为 v{contract['version']}，不再执行旧协议自动转换"
         )
     stats = contract["stats"]
@@ -145,6 +171,24 @@ def validate_world_contract(world: Mapping[str, Any]) -> dict[str, Any]:
         raise ValueError("无数值世界不能启用 attribute 属性检定")
     if mode == "none" and contract["attributes"]:
         raise ValueError("stats.mode=none 时不得声明角色属性")
+    for risk, raw_dc in contract["resolution"]["difficulty_policy"].items():
+        if raw_dc is None and risk == "safe":
+            continue
+        try:
+            dc = int(raw_dc)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"difficulty_policy.{risk} 必须是整数") from exc
+        if not 5 <= dc <= 25:
+            raise ValueError(f"difficulty_policy.{risk} 必须介于 5—25")
+    outcome_policy = contract["resolution"]["outcome_policy"]
+    try:
+        critical_margin = int(outcome_policy["critical_success_margin"])
+        cost_floor = int(outcome_policy["cost_success_min_margin"])
+        failure_floor = int(outcome_policy["failure_min_margin"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("outcome_policy 的结果档位必须是整数") from exc
+    if critical_margin < 1 or not failure_floor < cost_floor < 0:
+        raise ValueError("outcome_policy 的结果档位顺序无效")
     capabilities = contract["capabilities"]
     expected = {
         "character_stats": mode != "none",

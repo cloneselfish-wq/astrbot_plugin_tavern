@@ -1,4 +1,4 @@
-# AI 酒馆 v0.9.0 架构与扩展接口
+# AI 酒馆 v0.9.2 架构与扩展接口
 
 ## 依赖方向
 
@@ -23,6 +23,7 @@ tavern/api/                   公共服务、事件钩子与注册式扩展
 tavern/repositories/          按领域拆分的数据访问方法
 tavern/database.py            SQLite 连接、当前 Schema 与仓库组合入口
 tavern/engine.py              回合、模型调用、质量守卫和原子提交
+tavern/prompts.py             分用途上下文编译、精简投影与修复提示
 tavern/presentation.py        群聊展示与角色卡格式化
 tavern/world_contract.py      世界协议 v2 运行契约
 tavern/world_preflight.py     导入前结构化体检
@@ -52,6 +53,12 @@ pages/console/                页面入口与统一设计系统
 
 仓库 mixin 仅供数据库组合入口使用，不是公共扩展接口。
 
+## 上下文编译
+
+叙事模型不直接接收数据库行或完整世界包。`prompts.py` 按任务编译三种上下文：故事裁定、权威检定后续写、A—D 选项。编译层会移除建卡预设、作者界面配置、开场选项、事件池、时间戳、绑定码和重复角色档案，并将 NPC 合并为一次运行投影。结构修复只接收无效输出与校验错误，不嵌套原始大提示。
+
+模型可见的属性同时包含稳定 ID 与中文标签；存档以稳定 ID 为权威，展示以冻结世界快照的标签为权威。上下文裁剪不能修改世界状态、检定回执或事务边界。
+
 ## 公共扩展接口
 
 可信 Python 扩展从 `tavern.api` 使用：
@@ -73,6 +80,8 @@ turn = await plugin.public_api.get_turn_context(session["id"])
 - `narrative_guard`
 - `summary_provider`
 - `admin_action`
+
+骰制提供器使用关键字参数 `check`、`check_type`、`actors` 与 `outcome_policy`，返回 `DiceResult` 或可等待的 `DiceResult`。世界包声明的 `resolution.dice_system` 必须能在开演前解析到已注册提供器；不存在时拒绝开演，不会回退到 D20。
 
 可观察事件：
 
@@ -97,4 +106,4 @@ turn = await plugin.public_api.get_turn_context(session["id"])
 
 ## 版本边界
 
-v0.9.0 使用 Schema 8、世界协议 v2 和独立数据库 `catalog_v090.sqlite3`。本版本不包含 Schema 1—7、旧世界协议或旧存档目录迁移代码。
+v0.9.x 使用 Schema 8、世界协议 v2 和独立数据库 `catalog_v090.sqlite3`。本版本不包含 Schema 1—7、旧世界协议或旧存档目录迁移代码。

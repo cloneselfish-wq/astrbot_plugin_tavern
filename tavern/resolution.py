@@ -519,7 +519,40 @@ def validate_resolution(payload: Mapping[str, Any]) -> Resolution:
     )
 
 
-def roll_check(check: CheckRequest) -> DiceResult:
+def _outcome_for_roll(
+    die: int,
+    margin: int,
+    policy: Mapping[str, Any] | None = None,
+) -> tuple[str, str | None]:
+    policy = policy if isinstance(policy, Mapping) else {}
+    natural_20 = bool(policy.get("natural_20_critical", True))
+    natural_1 = bool(policy.get("natural_1_critical", True))
+    critical_margin = _int(
+        policy.get("critical_success_margin"), 10, 1, 100
+    )
+    cost_floor = _int(policy.get("cost_success_min_margin"), -4, -100, -1)
+    failure_floor = _int(
+        policy.get("failure_min_margin"), -9, -100, cost_floor - 1
+    )
+    if natural_20 and die == 20:
+        return "critical_success", "critical_success"
+    if natural_1 and die == 1:
+        return "critical_failure", "critical_failure"
+    if margin >= critical_margin:
+        return "critical_success", None
+    if margin >= 0:
+        return "success", None
+    if margin >= cost_floor:
+        return "success_with_cost", None
+    if margin >= failure_floor:
+        return "failure", None
+    return "critical_failure", None
+
+
+def roll_check(
+    check: CheckRequest,
+    outcome_policy: Mapping[str, Any] | None = None,
+) -> DiceResult:
     advantages = tuple(dict.fromkeys(check.advantage_sources))
     disadvantages = tuple(dict.fromkeys(check.disadvantage_sources))
     if check.inspiration_mode == "advantage":
@@ -551,23 +584,7 @@ def roll_check(check: CheckRequest) -> DiceResult:
         die = rolls[0]
     total = die + check.modifier
     margin = total - check.difficulty
-    critical: str | None = None
-    if die == 20:
-        critical = "critical_success"
-        outcome = "critical_success"
-    elif die == 1:
-        critical = "critical_failure"
-        outcome = "critical_failure"
-    elif margin >= 10:
-        outcome = "critical_success"
-    elif margin >= 0:
-        outcome = "success"
-    elif margin >= -4:
-        outcome = "success_with_cost"
-    elif margin >= -9:
-        outcome = "failure"
-    else:
-        outcome = "critical_failure"
+    outcome, critical = _outcome_for_roll(die, margin, outcome_policy)
     return DiceResult(
         die=die,
         modifier=check.modifier,
@@ -593,6 +610,7 @@ def roll_check(check: CheckRequest) -> DiceResult:
 def roll_group_check(
     check: CheckRequest,
     actors: list[Mapping[str, Any]],
+    outcome_policy: Mapping[str, Any] | None = None,
 ) -> DiceResult:
     """Resolve a majority group check without waiting for manual roll commands."""
 
@@ -614,7 +632,7 @@ def roll_group_check(
             ),
             visibility=check.visibility,
         )
-        rolled = roll_check(member_check)
+        rolled = roll_check(member_check, outcome_policy)
         succeeded = rolled.outcome in {
             "critical_success",
             "success",
@@ -662,14 +680,22 @@ def roll_opposed_check(
     *,
     defender_id: str = "",
     defender_name: str = "防守方",
+    outcome_policy: Mapping[str, Any] | None = None,
 ) -> DiceResult:
     """Resolve an active opposed check; ties favor the defender."""
 
-    attacker = roll_check(check)
+    attacker = roll_check(check, outcome_policy)
     defender_die = secrets.randbelow(20) + 1
     defender_total = defender_die + check.opponent_modifier
     margin = attacker.total - defender_total
-    outcome = "success" if margin > 0 else "failure"
+    critical_margin = _int(
+        (outcome_policy or {}).get("critical_success_margin"), 10, 1, 100
+    )
+    outcome = (
+        "critical_success"
+        if margin >= critical_margin
+        else "success" if margin > 0 else "failure"
+    )
     if attacker.die == 20 and defender_die != 20:
         outcome = "critical_success"
     elif attacker.die == 1 and defender_die != 1:

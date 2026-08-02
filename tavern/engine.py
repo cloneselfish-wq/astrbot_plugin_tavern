@@ -15,6 +15,7 @@ from .database import (
     TavernDatabase,
 )
 from .events import EventBroker
+from .api.registry import ExtensionRegistry
 from .lifecycle import (
     fallback_choices,
     format_choices,
@@ -22,6 +23,9 @@ from .lifecycle import (
 )
 from .prompts import (
     checked_resolution_prompt,
+    choice_generation_prompt,
+    choice_repair_prompt,
+    choice_system_prompt,
     planning_prompt,
     repair_prompt,
     system_prompt,
@@ -44,6 +48,20 @@ from .narrative_quality import inspect_narrative
 
 
 logger = logging.getLogger(__name__)
+
+
+def _builtin_d20_provider(
+    *,
+    check: CheckRequest,
+    check_type: str,
+    actors: list[Mapping[str, Any]] | None = None,
+    outcome_policy: Mapping[str, Any] | None = None,
+) -> DiceResult:
+    if check_type in {"group", "resistance"}:
+        return roll_group_check(check, list(actors or []), outcome_policy)
+    if check_type == "opposed":
+        return roll_opposed_check(check, outcome_policy=outcome_policy)
+    return roll_check(check, outcome_policy)
 
 
 class TavernEngineError(RuntimeError):
@@ -90,14 +108,71 @@ class TavernEngine:
         database: TavernDatabase,
         config_provider: Callable[[], TavernConfig],
         broker: EventBroker,
+        extensions: ExtensionRegistry | None = None,
     ) -> None:
         self.context = context
         self.database = database
         self.config_provider = config_provider
         self.broker = broker
+        self.extensions = extensions or ExtensionRegistry()
+        if self.extensions.resolve("dice_system", "d20") is None:
+            self.extensions.register_dice_system("d20", _builtin_d20_provider)
         self.rate_limiter = RateLimiter()
         self._locks: dict[str, asyncio.Lock] = {}
         self._locks_guard = asyncio.Lock()
+
+    @staticmethod
+    async def _emit_progress(
+        callback: Callable[[str], Any] | None,
+        message: str,
+    ) -> None:
+        if callback is None:
+            return
+        result = callback(message)
+        if inspect.isawaitable(result):
+            await result
+
+    async def _roll_with_registered_system(
+        self,
+        world: Mapping[str, Any],
+        check: CheckRequest,
+        *,
+        actors: list[Mapping[str, Any]] | None = None,
+    ) -> DiceResult:
+        contract = world_contract(world)
+        system_name = str(
+            contract["resolution"].get("dice_system") or ""
+        ).strip().lower()
+        provider = self.extensions.resolve("dice_system", system_name)
+        if provider is None:
+            raise TavernEngineError(
+                f"世界要求骰制“{system_name}”，但运行时没有注册该骰制"
+            )
+        result = provider(
+            check=check,
+            check_type=check.check_type,
+            actors=list(actors or []),
+            outcome_policy=contract["resolution"].get("outcome_policy") or {},
+        )
+        if inspect.isawaitable(result):
+            result = await result
+        if not isinstance(result, DiceResult):
+            raise TavernEngineError(
+                f"骰制“{system_name}”没有返回合法 DiceResult"
+            )
+        return result
+
+    def validate_world_runtime(self, world: Mapping[str, Any]) -> None:
+        contract = world_contract(world)
+        if contract["resolution"]["mode"] not in {"dice_only", "attribute"}:
+            return
+        system_name = str(
+            contract["resolution"].get("dice_system") or ""
+        ).strip().lower()
+        if self.extensions.resolve("dice_system", system_name) is None:
+            raise TavernEngineError(
+                f"世界要求骰制“{system_name}”，但运行时没有注册该骰制"
+            )
 
     async def _session_lock(self, session_id: str) -> asyncio.Lock:
         async with self._locks_guard:
@@ -558,6 +633,20 @@ class TavernEngine:
                 header += "\n" + "\n".join(source_lines)
         return header
 
+    async def _publish_locked_check_progress(
+        self,
+        callback: Callable[[str], Any] | None,
+        dice: DiceResult,
+        stat: str,
+    ) -> None:
+        dice_text = self._format_dice_result(dice, stat)
+        if dice_text:
+            await self._emit_progress(callback, dice_text)
+        await self._emit_progress(
+            callback,
+            "【酒馆】已收到你的选择，后续内容正在生成中……",
+        )
+
     async def _story_providers(
         self,
         event: Any,
@@ -786,6 +875,7 @@ class TavernEngine:
         choice_key: str,
         flavor_text: str = "",
         inspiration_mode: str = "",
+        progress: Callable[[str], Any] | None = None,
     ) -> EngineReply:
         choice_set = await self.database.active_choice_set(session_id)
         if not choice_set:
@@ -856,6 +946,7 @@ class TavernEngine:
                 "controller_user_id": sender_id,
                 "control_mode": control["mode"],
             },
+            progress=progress,
         )
 
     async def reroll_choices(
@@ -932,6 +1023,7 @@ class TavernEngine:
         sender_name: str,
         content: str,
         workflow: Mapping[str, Any] | None = None,
+        progress: Callable[[str], Any] | None = None,
     ) -> EngineReply:
         config = self.config_provider()
         text = clean_text(content, max_chars=config.max_input_chars)
@@ -1143,7 +1235,7 @@ class TavernEngine:
             )
             ledger_limit = max(
                 0,
-                min(100, int(context_budget.get("ledger_items", 16))),
+                min(100, int(context_budget.get("ledger_items", 8))),
             )
             session["story_ledger"] = (
                 await self.database.list_story_ledger(session_id)
@@ -1208,8 +1300,18 @@ class TavernEngine:
                     result={"retry": True},
                 )
 
-            system = system_prompt(world)
+            allow_unlocked_check = bool(
+                not workflow
+                and config.two_phase_checks
+                and world_contract(world)["resolution"]["mode"]
+                in {"dice_only", "attribute"}
+            )
+            system = system_prompt(
+                world,
+                allow_check=allow_unlocked_check,
+            )
             first_prompt = planning_prompt(
+                world=world,
                 session=session,
                 player=player,
                 player_input=player_input,
@@ -1218,32 +1320,62 @@ class TavernEngine:
                 allow_checks=(config.two_phase_checks and world_contract(world)["resolution"]["mode"] in {"dice_only", "attribute"}),
                 workflow=workflow,
             )
-            try:
-                resolution, used_provider_id = await self._generate_resolution(
-                    session_id=session_id,
-                    request_type="story_plan",
-                    world=world,
-                    provider_ids=provider_ids,
-                    system=system,
-                    prompt=first_prompt,
-                    config=config,
-                    expected_actor=session["next_actor"],
-                    roster=roster,
-                    enforce_mobile_limits=bool(
-                        workflow and config.enforce_mobile_output
-                    ),
-                )
-            except Exception as exc:
-                await self.database.update_operation(
-                    turn_operation_id,
-                    status="failed",
-                    phase="story_plan_failed",
-                    result={
-                        "error_type": type(exc).__name__,
-                        "error": clean_text(str(exc), max_chars=500),
+            generation_notice_sent = False
+            if workflow and workflow.get("requires_check"):
+                locked_check = self._check_request_from_locked_choice(workflow)
+                resolution = Resolution(
+                    mode="check",
+                    narrative="",
+                    check=locked_check,
+                    state_patch={},
+                    memories=(),
+                    next_choices=(),
+                    group_decision=None,
+                    return_progress=None,
+                    npc_ops=(),
+                    clock_ops=(),
+                    ledger_ops=(),
+                    status_ops=(),
+                    assist_ops=(),
+                    director_note="",
+                    raw={
+                        "mode": "check",
+                        "source": "plugin_locked_choice",
                     },
                 )
-                raise
+                used_provider_id = ""
+            else:
+                await self._emit_progress(
+                    progress,
+                    "【酒馆】已收到你的选择，后续内容正在生成中……",
+                )
+                generation_notice_sent = True
+                try:
+                    resolution, used_provider_id = await self._generate_resolution(
+                        session_id=session_id,
+                        request_type="story_plan",
+                        world=world,
+                        provider_ids=provider_ids,
+                        system=system,
+                        prompt=first_prompt,
+                        config=config,
+                        expected_actor=session["next_actor"],
+                        roster=roster,
+                        enforce_mobile_limits=bool(
+                            workflow and config.enforce_mobile_output
+                        ),
+                    )
+                except Exception as exc:
+                    await self.database.update_operation(
+                        turn_operation_id,
+                        status="failed",
+                        phase="story_plan_failed",
+                        result={
+                            "error_type": type(exc).__name__,
+                            "error": clean_text(str(exc), max_chars=500),
+                        },
+                    )
+                    raise
             await self.database.update_operation(
                 turn_operation_id,
                 phase="story_plan_generated",
@@ -1478,11 +1610,13 @@ class TavernEngine:
                             raise TavernEngineError(
                                 "集体检定没有有效参与角色"
                             )
-                        dice = roll_group_check(check_request, actors)
-                    elif check_type == "opposed":
-                        dice = roll_opposed_check(check_request)
+                        dice = await self._roll_with_registered_system(
+                            world, check_request, actors=actors
+                        )
                     else:
-                        dice = roll_check(check_request)
+                        dice = await self._roll_with_registered_system(
+                            world, check_request
+                        )
                     receipt = await self.database.lock_check_result(
                         operation_id,
                         session_id,
@@ -1495,7 +1629,40 @@ class TavernEngine:
                     dice = self._dice_result_from_payload(
                         receipt["result"]
                     )
+                await self.database.update_operation(
+                    turn_operation_id,
+                    phase="dice_locked",
+                    status="pending",
+                    result={
+                        "dice_operation_id": operation_id,
+                        "outcome": dice.outcome,
+                    },
+                )
+                await self.broker.publish(
+                    {
+                        "type": "check",
+                        "hook": "check_completed",
+                        "session_id": session_id,
+                        "actor": sender_name,
+                        "stat": check_request.stat,
+                        "outcome": dice.outcome,
+                        "total": dice.total,
+                        "difficulty": dice.difficulty,
+                    }
+                )
+                if not generation_notice_sent:
+                    await self._publish_locked_check_progress(
+                        progress, dice, check_request.stat
+                    )
+                    generation_notice_sent = True
+                else:
+                    dice_text = self._format_dice_result(
+                        dice, check_request.stat
+                    )
+                    if dice_text:
+                        await self._emit_progress(progress, dice_text)
                 check_prompt = checked_resolution_prompt(
+                    world=world,
                     session=session,
                     player=player,
                     player_input=player_input,
@@ -1514,7 +1681,7 @@ class TavernEngine:
                         request_type="story_checked",
                         world=world,
                         provider_ids=second_stage_providers,
-                        system=system,
+                        system=system_prompt(world, allow_check=False),
                         prompt=check_prompt,
                         config=config,
                         expected_actor=session["next_actor"],
@@ -1717,18 +1884,6 @@ class TavernEngine:
             next_turn = await self.database.get_turn_status(session_id)
             story_body = self._format_story_paragraphs(narrative)
             story_output = "📖 【故事推进】\n\n" + story_body
-            if dice:
-                stat = (
-                    check_payload.get("stat", "通用")
-                    if check_payload
-                    else "通用"
-                )
-                dice_text = self._format_dice_result(dice, stat)
-                story_output = (
-                    f"{dice_text}\n\n📖 【故事推进】\n\n{story_body}"
-                    if dice_text
-                    else f"📖 【故事推进】\n\n{story_body}"
-                )
             current_name = (
                 next_turn["current_name"]
                 or next_turn["current_user_id"]
@@ -1931,70 +2086,16 @@ class TavernEngine:
         validation_error: str = "",
         story_context: str = "",
     ) -> list[dict[str, Any]]:
-        contract = world_contract(world)
-        resolution_mode = str(contract["resolution"]["mode"])
-        if resolution_mode in {"none", "narrative"}:
-            check_rule = (
-                "当前世界不启用程序检定；四项 check 必须全部为 null，"
-                "不得生成检定属性、难度或骰点请求；"
-            )
-            checked_example = '"check":null'
-        elif resolution_mode == "dice_only":
-            check_rule = (
-                "当前世界使用纯骰检定；需要检定时提交结构化 check，"
-                "attribute_id 必须为空；"
-            )
-            checked_example = (
-                '"check":{"required":true,"attribute_id":"",'
-                '"type":"standard","difficulty":12}'
-            )
-        else:
-            attribute_lines = "、".join(
-                f"{item.get('key')}={item.get('label')}"
-                for item in contract["attributes"]
-            )
-            check_rule = (
-                "需要检定时提交结构化 check，其 attribute_id 只能使用："
-                f"{attribute_lines}；"
-            )
-            checked_example = (
-                '"check":{"required":true,"attribute_id":"perception",'
-                '"type":"standard","difficulty":12,'
-                '"known_consequences":"可能错过最佳时机"}'
-            )
-        prompt = (
-            "只生成当前角色在当前场景可选的四个行动意图。"
-            "返回单个 JSON 对象，字段名 choices。"
-            "必须恰好包含 A、B、C、D，至少一个 safe 风险；"
-            "每项必须填写 actor_id，且必须等于 acting_character.id；"
-            "每个选项正文最多 50 字，正文禁止自带风险或检定括号；只能描述当前角色本人"
-            "能够尝试的行为，不得替其他玩家角色说话、移动、使用能力、"
-            "消耗物品、同意或决定；"
-            "不得预设成功，不得添加角色没有的能力、物品或知识；"
-            "风险使用 safe/controlled/dangerous/desperate/lethal；"
-            "危险度与是否检定相互独立；"
-            f"{check_rule}"
-            "致命风险必须明确可能后果，同一原因不能同时提高 DC 和造成劣势；"
-            "影响全队的转场、主线分支、共有资源或不可逆决定，"
-            "只能标记 collective=true，不能替队伍决定。\n\n"
-            f"<world_rules>{world.get('rules', {})}</world_rules>\n"
-            f"<runtime_state>{session.get('world_state', {})}</runtime_state>\n"
-            f"<acting_character>{dict(participant)}</acting_character>\n"
-            f"<recent_history>{list(events)[-12:]}</recent_history>\n"
-            f"<avoid_repeating>{list(avoid)}</avoid_repeating>\n"
-            f"<resolved_story>{story_context}</resolved_story>\n"
-            f"<previous_choice_error>{validation_error}</previous_choice_error>\n"
-            "格式示例："
-            '{"choices":[{"key":"A","actor_id":"...",'
-            '"text":"...","danger_id":"safe","check":null,'
-            '"collective":false},{"key":"B","actor_id":"...",'
-            '"text":"...","danger_id":"controlled",'
-            f'{checked_example},"collective":false}},'
-            '{"key":"C","actor_id":"...","text":"...",'
-            '"danger_id":"controlled","check":null,"collective":false},'
-            '{"key":"D","actor_id":"...","text":"...",'
-            '"danger_id":"safe","check":null,"collective":false}]}'
+        prompt = choice_generation_prompt(
+            world=world,
+            session=session,
+            participant=participant,
+            events=events,
+            avoid=avoid,
+            validation_error=validation_error,
+            story_context=story_context,
         )
+        choice_system = choice_system_prompt(world)
         failures: list[str] = []
         attempts = config.json_repair_attempts + 1
         for provider_id in provider_ids:
@@ -2013,7 +2114,7 @@ class TavernEngine:
                             ),
                             provider_id=provider_id,
                             prompt=current_prompt,
-                            system_prompt_value=system_prompt(world),
+                            system_prompt_value=choice_system,
                             temperature=config.temperature,
                             max_tokens=min(config.max_tokens, 1200),
                         ),
@@ -2064,10 +2165,11 @@ class TavernEngine:
                     last_error = str(exc)
                     if attempt + 1 >= attempts:
                         break
-                    current_prompt = repair_prompt(
+                    current_prompt = choice_repair_prompt(
                         raw,
                         last_error,
-                        prompt,
+                        world=world,
+                        participant=participant,
                     )
             if not timed_out:
                 failures.append(

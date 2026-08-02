@@ -1844,7 +1844,7 @@ class TavernWebConsole:
                 raise ValueError("缺少备份文件")
             filename = str(upload.filename or "").lower()
             if not filename.endswith((".json", ".zip")):
-                raise ValueError("只接受 v0.9.0 Schema 8 的 JSON 或 ZIP 备份")
+                raise ValueError("只接受 v0.9.x Schema 8 的 JSON 或 ZIP 备份")
             temp_dir = self.data_dir / "imports"
             temp_dir.mkdir(parents=True, exist_ok=True)
             suffix = ".zip" if filename.endswith(".zip") else ".json"

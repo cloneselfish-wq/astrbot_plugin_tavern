@@ -41,6 +41,7 @@ def build_runtime(
         database=database,
         config_provider=config_provider,
         broker=broker,
+        extensions=extensions,
     )
     web_console = TavernWebConsole(
         context=context,

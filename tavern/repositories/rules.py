@@ -314,7 +314,7 @@ class RuleRepositoryMixin:
                     rules["context_budget_json"] if rules else "",
                     {},
                 )
-                limit = bounded_int(budget.get("active_npcs"), 12, 0, 40)
+                limit = bounded_int(budget.get("active_npcs"), 6, 0, 40)
             clauses = ["sc.session_id = ?"]
             params: list[Any] = [session_id]
             if not include_archived or context_only:

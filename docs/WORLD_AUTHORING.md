@@ -1,6 +1,15 @@
-# v0.9.0 世界包编写说明
+# v0.9.2 世界包编写说明
 
 世界包是可复用模板。新建副本时会复制世界版本、规则与时间规则快照；之后修改模板不会静默改变正在运行的团。
+
+安装包自带可直接复制的通用模板：
+
+- `templates/world-package.template.json`：当前世界协议、建卡向导与机器骰制的最小完整示例。
+- `templates/npc-import.template.json`：可直接通过管理台导入的常驻 NPC 数据示例。
+- `templates/template-manifest.json`：模板兼容的插件、世界协议、角色卡和 NPC 导入版本。
+- `templates/README.md`：面向世界作者与 AI 修改工具的逐项说明和发布维护规则。
+
+不要直接修改模板原件后覆盖发布包；应复制并重命名，再替换世界标识、稳定 ID、显示文案和实际设定。
 
 ## 顶层字段
 
@@ -18,10 +27,24 @@
 
 ```json
 {
-  "resolution": "d20",
-  "default_difficulty": 12,
-  "difficulty_min": 5,
-  "difficulty_max": 25,
+  "resolution": {
+    "mode": "attribute",
+    "dice_system": "d20",
+    "difficulty_policy": {
+      "safe": null,
+      "controlled": 9,
+      "dangerous": 13,
+      "desperate": 17,
+      "lethal": 21
+    },
+    "outcome_policy": {
+      "natural_20_critical": true,
+      "natural_1_critical": true,
+      "critical_success_margin": 10,
+      "cost_success_min_margin": -4,
+      "failure_min_margin": -9
+    }
+  },
   "strict_choices": true,
   "check_density": "standard",
   "player_limits": {},
@@ -41,6 +64,72 @@
 ```
 
 世界 JSON 是声明式数据，不能包含脚本或可执行表达式。
+
+## 步骤驱动预设
+
+预设属于角色卡结构化数据，不要把可选名单写进 `system_prompt` 或字段标题。插件只在建卡进入当前字段时解析和展示该字段的预设。
+
+```json
+{
+  "character_card": {
+    "version": 3,
+    "preset_sets": {
+      "origin_regions": [
+        {
+          "id": "northern_kingdom",
+          "value": "北境王国",
+          "label": "北境王国",
+          "summary": "王国腹地、农庄与边境堡垒。"
+        }
+      ]
+    },
+    "fields": [
+      {
+        "key": "origin_region",
+        "label": "选择出身地区",
+        "type": "preset_select",
+        "preset_source": "origin_regions",
+        "page_size": 5,
+        "required": true,
+        "max_chars": 20
+      }
+    ]
+  }
+}
+```
+
+玩家可回复当前页序号、`id`、`value`、`label` 或别名。角色卡保存展示值，并在 `_preset_refs` 中保存稳定 ID 与当时效果快照。`page_size` 范围为 `1..10`。
+
+条件字段可使用：
+
+```json
+{
+  "key": "contract_source",
+  "label": "选择契约来源",
+  "type": "preset_select",
+  "preset_source": "warlock_contracts",
+  "visible_when": {"profession": ["术士"]},
+  "required": true
+}
+```
+
+字段还可声明：
+
+- `clear_on_change`：当前字段修改后需要清理的后续字段 key。
+- `must_differ_from`：当前选择不得与指定字段相同。
+- `options_source`：兼容既有世界包的预设源名称；新包优先使用 `preset_source`。
+
+导入体检会拒绝不存在的预设源、必填字段无有效选项、非法字段引用与条件循环依赖。
+
+## 机器骰制与 DC 权限
+
+世界包只声明骰制名称和确定性策略。随机数、加值、DC 映射及成功档位由插件执行，文字 AI 没有重投或修改权限。
+
+- `dice_system` 必须对应运行时已注册骰制；找不到时直接拒绝裁定。
+- `difficulty_policy` 把风险等级映射为 DC，选项或模型给出的任意 DC 不会覆盖它。
+- `outcome_policy` 决定大成功、成功、代价成功、失败和大失败的边界。
+- 必检选项必须在展示给玩家之前带有属性、风险、类型和已知后果。
+- 骰点先锁定并公开，再调用文字模型续写；模型重试复用同一回执。
 
 ## 人数
 
@@ -246,15 +335,17 @@ DC 只表示成功难度：
     "archive_after_inactive_rounds": 12
   },
   "context_budget": {
-    "recent_turns": 12,
-    "memories": 10,
-    "active_npcs": 12,
-    "ledger_items": 16
+    "recent_turns": 6,
+    "memories": 6,
+    "active_npcs": 6,
+    "ledger_items": 8
   }
 }
 ```
 
 模型生成 NPC 必须有名字，并至少满足直接互动、掌握重要线索或写入长期记忆之一。自动 NPC 只能写公开资料、已知事实、误解和运行状态，不能创建系统级私密提示词。
+
+`v0.9.2` 会按用途编译上下文：建卡预设、职业数值、开场选项和事件池不会进入每轮叙事；选项生成只接收当前场景、精简角色、最近事件、允许属性和风险—DC。`context_budget` 应用于新副本的运行快照，数值越高并不等于叙事质量越高；长期事实应进入记忆或故事账本，而不是无限增加最近回合。
 
 ## 开场四选一
 

@@ -9,7 +9,13 @@ from .world_contract import world_contract
 
 
 def _json(value: Any) -> str:
-    return json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True)
+    # Prompt payloads are machine-readable; whitespace only consumes context.
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
 
 
 RESOLUTION_SCHEMA = {
@@ -167,44 +173,81 @@ RESOLUTION_SCHEMA = {
 }
 
 
-def system_prompt(world: Mapping[str, Any]) -> str:
-    world_prompt = str(world.get("system_prompt", "")).strip()
-    rules = world.get("rules", {})
-    rules = rules if isinstance(rules, Mapping) else {}
-    narrative_rules = {key: value for key, value in rules.items() if key not in {"character_card", "option_presentation", "danger_levels", "capabilities", "world_schema_version"}}
-    contract = world_contract(world)
+_NON_NARRATIVE_RULE_KEYS = {
+    "capabilities",
+    "character_card",
+    "context_budget",
+    "danger_levels",
+    "default_difficulty",
+    "difficulty_max",
+    "difficulty_min",
+    "event_pool",
+    "opening_choices",
+    "option_presentation",
+    "world_schema_version",
+}
+
+_CARD_ONLY_SETTING_KEYS = {
+    "attribute_progression",
+    "origin_regions",
+    "professions",
+    "social_identities",
+}
+
+
+def compact_world_rules(world: Mapping[str, Any]) -> dict[str, Any]:
+    """Compile only rules useful to narration; omit authoring/card payloads."""
+    raw = world.get("rules", {})
+    rules = raw if isinstance(raw, Mapping) else {}
+    result = {
+        key: value
+        for key, value in rules.items()
+        if key not in _NON_NARRATIVE_RULE_KEYS and key != "setting_modules"
+    }
+    setting_modules = rules.get("setting_modules")
+    if isinstance(setting_modules, Mapping):
+        compact_modules = {
+            key: value
+            for key, value in setting_modules.items()
+            if key not in _CARD_ONLY_SETTING_KEYS
+        }
+        if compact_modules:
+            result["setting_modules"] = compact_modules
+    return result
+
+
+def _schema_for(*, allow_check: bool) -> dict[str, Any]:
     schema = json.loads(json.dumps(RESOLUTION_SCHEMA, ensure_ascii=False))
-    if contract["resolution"]["mode"] in {"none", "narrative"}:
+    if not allow_check:
         schema["mode"] = "resolve"
         schema.pop("check", None)
-        schema["next_choices"][0]["check"] = None
-    characters = world.get("characters", [])
-    character_text = []
-    for character in characters:
-        if not character.get("enabled", True):
-            continue
-        character_text.append(
-            {
-                "id": character.get("id"),
-                "name": character.get("name"),
-                "role": character.get("role"),
-                "profile": character.get("profile", {}),
-                "private_direction": character.get("prompt", ""),
-            }
+        schema["next_choices"][0]["check"] = (
+            "null 或下一回合预先声明的检定；safe 必须为 null"
         )
+    return schema
+
+
+def system_prompt(
+    world: Mapping[str, Any],
+    *,
+    allow_check: bool = True,
+) -> str:
+    """Purpose-built narrative system prompt without card-authoring duplication."""
+    contract = world_contract(world)
+    effective_allow_check = allow_check and contract["resolution"]["mode"] in {
+        "dice_only",
+        "attribute",
+    }
     return (
         f"{CORE_NARRATOR_RULES}\n\n"
         "<world_definition>\n"
-        f"{world_prompt}\n"
+        f"{str(world.get('system_prompt', '')).strip()}\n"
         "</world_definition>\n\n"
-        "<world_rules>\n"
-        f"{_json(narrative_rules)}\n"
-        "</world_rules>\n\n"
-        "<resident_characters>\n"
-        f"{_json(character_text)}\n"
-        "</resident_characters>\n\n"
+        "<narrative_world_rules>\n"
+        f"{_json(compact_world_rules(world))}\n"
+        "</narrative_world_rules>\n\n"
         "<required_output_schema>\n"
-        f"{_json(schema)}\n"
+        f"{_json(_schema_for(allow_check=effective_allow_check))}\n"
         "</required_output_schema>\n"
     )
 
@@ -251,8 +294,156 @@ def _party(roster: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
     return result
 
 
+def _character_projection(value: Mapping[str, Any]) -> dict[str, Any]:
+    profile = value.get("profile")
+    if not isinstance(profile, Mapping):
+        profile = value.get("card_profile")
+    stats = value.get("stats")
+    if not isinstance(stats, Mapping):
+        stats = value.get("card_stats")
+    runtime = value.get("runtime_state")
+    runtime = runtime if isinstance(runtime, Mapping) else {}
+    return {
+        "participant_id": value.get("participant_id") or value.get("id"),
+        "character_name": value.get("character_name"),
+        "character_code": value.get("character_code"),
+        "display_name": value.get("display_name"),
+        "profile": dict(profile) if isinstance(profile, Mapping) else {},
+        "stats": dict(stats) if isinstance(stats, Mapping) else {},
+        "runtime_state": dict(runtime),
+        "participation_status": value.get("participation_status"),
+    }
+
+
+def compact_character(value: Mapping[str, Any]) -> dict[str, Any]:
+    """Public helper for dedicated option prompts and context-size tests."""
+    return _character_projection(value)
+
+
+def _npc_projection(
+    characters: Sequence[Mapping[str, Any]],
+    world: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    presets: dict[str, Mapping[str, Any]] = {}
+    for item in world.get("characters", []):
+        if not isinstance(item, Mapping) or not item.get("enabled", True):
+            continue
+        for key in (item.get("id"), item.get("slug"), item.get("name")):
+            if key:
+                presets[str(key)] = item
+    result: list[dict[str, Any]] = []
+    for item in characters:
+        if not isinstance(item, Mapping):
+            continue
+        preset = presets.get(str(item.get("stable_key") or "")) or presets.get(
+            str(item.get("name") or "")
+        )
+        profile = item.get("public_profile")
+        if not isinstance(profile, Mapping) and isinstance(preset, Mapping):
+            profile = preset.get("profile")
+        row = {
+            "npc_id": item.get("id"),
+            "stable_key": item.get("stable_key"),
+            "name": item.get("name"),
+            "aliases": item.get("aliases", []),
+            "role_type": item.get("role_type"),
+            "public_profile": dict(profile) if isinstance(profile, Mapping) else {},
+            "known_facts": item.get("known_facts", []),
+            "misconceptions": item.get("misconceptions", []),
+            "runtime_state": item.get("state", {}),
+        }
+        if isinstance(preset, Mapping) and preset.get("prompt"):
+            row["private_direction"] = preset.get("prompt")
+        result.append(row)
+    return result
+
+
+def _memory_projection(memories: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    keys = (
+        "id",
+        "scope",
+        "scope_id",
+        "kind",
+        "content",
+        "importance",
+        "tags",
+        "visibility",
+        "locked",
+        "pinned",
+    )
+    return [{key: item.get(key) for key in keys if key in item} for item in memories]
+
+
+def _ledger_projection(items: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    keys = ("id", "stable_key", "kind", "title", "description", "status", "visibility")
+    return [{key: item.get(key) for key in keys if key in item} for item in items]
+
+
+def _runtime_sections(
+    *,
+    world: Mapping[str, Any],
+    session: Mapping[str, Any],
+    player: Mapping[str, Any],
+    events: Sequence[Mapping[str, Any]],
+    memories: Sequence[Mapping[str, Any]],
+) -> str:
+    acting = _character_projection(player)
+    next_actor = _character_projection(
+        session.get("next_actor", {})
+        if isinstance(session.get("next_actor"), Mapping)
+        else {}
+    )
+    if (
+        acting.get("participant_id")
+        and acting.get("participant_id") == next_actor.get("participant_id")
+    ):
+        next_actor = {
+            "participant_id": acting["participant_id"],
+            "same_as_acting_player": True,
+        }
+    return (
+        '<runtime_state trust="untrusted-data">\n'
+        f"{_json(session.get('world_state', {}))}\n"
+        "</runtime_state>\n\n"
+        '<turn_context trust="untrusted-data">\n'
+        f"{_json(session.get('turn_status', {}))}\n"
+        "</turn_context>\n\n"
+        '<active_party trust="untrusted-data">\n'
+        f"{_json(_party(session.get('roster', [])))}\n"
+        "</active_party>\n\n"
+        '<acting_player trust="untrusted-data">\n'
+        f"{_json(acting)}\n"
+        "</acting_player>\n\n"
+        '<next_actor trust="plugin-authoritative">\n'
+        f"{_json(next_actor)}\n"
+        "</next_actor>\n\n"
+        '<relevant_memories trust="untrusted-data">\n'
+        f"{_json(_memory_projection(memories))}\n"
+        "</relevant_memories>\n\n"
+        '<recent_history trust="untrusted-data">\n'
+        f"{_json(_history(events))}\n"
+        "</recent_history>\n\n"
+        '<active_return_requests trust="untrusted-data">\n'
+        f"{_json(session.get('return_requests', []))}\n"
+        "</active_return_requests>\n\n"
+        '<active_npcs trust="untrusted-data">\n'
+        f"{_json(_npc_projection(session.get('session_characters', []), world))}\n"
+        "</active_npcs>\n\n"
+        '<story_ledger trust="untrusted-data">\n'
+        f"{_json(_ledger_projection(session.get('story_ledger', [])))}\n"
+        "</story_ledger>\n\n"
+        '<scene_clocks trust="untrusted-data">\n'
+        f"{_json(session.get('scene_clocks', []))}\n"
+        "</scene_clocks>\n\n"
+        '<content_boundaries trust="trusted-policy">\n'
+        f"{_json(session.get('content_boundaries', {}))}\n"
+        "</content_boundaries>\n"
+    )
+
+
 def planning_prompt(
     *,
+    world: Mapping[str, Any],
     session: Mapping[str, Any],
     player: Mapping[str, Any],
     player_input: str,
@@ -340,52 +531,11 @@ def planning_prompt(
         "全队撤退或返场支线，必须填写 group_decision，"
         "不要让个人选项直接替全队决定。生成 group_decision 时，"
         "state_patch 不得提前写入尚未表决通过的集体结果。\n\n"
-        '<runtime_state trust="untrusted-data">\n'
-        f"{_json(session.get('world_state', {}))}\n"
-        "</runtime_state>\n\n"
-        '<turn_context trust="untrusted-data">\n'
-        f"{_json(session.get('turn_status', {}))}\n"
-        "</turn_context>\n\n"
-        '<active_party trust="untrusted-data">\n'
-        f"{_json(_party(session.get('roster', [])))}\n"
-        "</active_party>\n\n"
-        '<next_actor trust="plugin-authoritative">\n'
-        f"{_json(session.get('next_actor', {}))}\n"
-        "</next_actor>\n\n"
-        '<relevant_memories trust="untrusted-data">\n'
-        f"{_json(list(memories))}\n"
-        "</relevant_memories>\n\n"
-        '<recent_history trust="untrusted-data">\n'
-        f"{_json(_history(events))}\n"
-        "</recent_history>\n\n"
-        '<active_return_requests trust="untrusted-data">\n'
-        f"{_json(session.get('return_requests', []))}\n"
-        "</active_return_requests>\n\n"
-        '<active_npcs trust="untrusted-data">\n'
-        f"{_json(session.get('session_characters', []))}\n"
-        "</active_npcs>\n\n"
-        '<story_ledger trust="untrusted-data">\n'
-        f"{_json(session.get('story_ledger', []))}\n"
-        "</story_ledger>\n\n"
-        '<scene_clocks trust="untrusted-data">\n'
-        f"{_json(session.get('scene_clocks', []))}\n"
-        "</scene_clocks>\n\n"
-        '<content_boundaries trust="trusted-policy">\n'
-        f"{_json(session.get('content_boundaries', {}))}\n"
-        "</content_boundaries>\n\n"
+        f"{_runtime_sections(world=world, session=session, player=player, events=events, memories=memories)}\n\n"
         '<selected_choice_contract trust="untrusted-data" '
         'enforced_by="plugin">\n'
         f"{_json(choice_contract)}\n"
         "</selected_choice_contract>\n\n"
-        '<acting_player trust="untrusted-data">\n'
-        f"{_json({
-            'player_id': player.get('id'),
-            'platform_user_id': player.get('user_id'),
-            'display_name': player.get('display_name'),
-            'character_name': player.get('character_name'),
-            'profile': player.get('profile', {}),
-        })}\n"
-        "</acting_player>\n\n"
         "<player_input trust=\"untrusted\">\n"
         f"{_json(player_input)}\n"
         "</player_input>\n"
@@ -394,6 +544,7 @@ def planning_prompt(
 
 def checked_resolution_prompt(
     *,
+    world: Mapping[str, Any],
     session: Mapping[str, Any],
     player: Mapping[str, Any],
     player_input: str,
@@ -421,48 +572,7 @@ def checked_resolution_prompt(
         "同时必须生成恰好四个合规 next_choices；"
         "关键集体节点使用 group_decision；生成表决时，state_patch "
         "不得提前写入尚未通过的集体结果。\n\n"
-        '<runtime_state trust="untrusted-data">\n'
-        f"{_json(session.get('world_state', {}))}\n"
-        "</runtime_state>\n\n"
-        '<turn_context trust="untrusted-data">\n'
-        f"{_json(session.get('turn_status', {}))}\n"
-        "</turn_context>\n\n"
-        '<active_party trust="untrusted-data">\n'
-        f"{_json(_party(session.get('roster', [])))}\n"
-        "</active_party>\n\n"
-        '<next_actor trust="plugin-authoritative">\n'
-        f"{_json(session.get('next_actor', {}))}\n"
-        "</next_actor>\n\n"
-        '<relevant_memories trust="untrusted-data">\n'
-        f"{_json(list(memories))}\n"
-        "</relevant_memories>\n\n"
-        '<recent_history trust="untrusted-data">\n'
-        f"{_json(_history(events))}\n"
-        "</recent_history>\n\n"
-        '<active_return_requests trust="untrusted-data">\n'
-        f"{_json(session.get('return_requests', []))}\n"
-        "</active_return_requests>\n\n"
-        '<active_npcs trust="untrusted-data">\n'
-        f"{_json(session.get('session_characters', []))}\n"
-        "</active_npcs>\n\n"
-        '<story_ledger trust="untrusted-data">\n'
-        f"{_json(session.get('story_ledger', []))}\n"
-        "</story_ledger>\n\n"
-        '<scene_clocks trust="untrusted-data">\n'
-        f"{_json(session.get('scene_clocks', []))}\n"
-        "</scene_clocks>\n\n"
-        '<content_boundaries trust="trusted-policy">\n'
-        f"{_json(session.get('content_boundaries', {}))}\n"
-        "</content_boundaries>\n\n"
-        '<acting_player trust="untrusted-data">\n'
-        f"{_json({
-            'player_id': player.get('id'),
-            'platform_user_id': player.get('user_id'),
-            'display_name': player.get('display_name'),
-            'character_name': player.get('character_name'),
-            'profile': player.get('profile', {}),
-        })}\n"
-        "</acting_player>\n\n"
+        f"{_runtime_sections(world=world, session=session, player=player, events=events, memories=memories)}\n\n"
         "<player_input trust=\"untrusted\">\n"
         f"{_json(player_input)}\n"
         "</player_input>\n\n"
@@ -477,19 +587,151 @@ def repair_prompt(
     error: str,
     original_prompt: str,
 ) -> str:
+    # The system prompt already contains the trusted world context and schema.
+    # Repeating the original task here used to double large prompts on repair.
+    del original_prompt
     return (
         "上一份输出无法通过校验。只修复 JSON 结构、字段类型、正文长度、"
         "选项长度与行动角色归属；可以在不改变已发生事实的前提下压缩或"
         "补足叙事，并重写越权选项。不得改变检定结论、世界状态变化、代价"
         "或记忆事实，也不要解释错误。返回单个 JSON 对象。\n\n"
-        "<original_task_context>\n"
-        f"{original_prompt}\n"
-        "</original_task_context>\n\n"
         f"<validation_error>{json.dumps(error, ensure_ascii=False)}</validation_error>\n"
         "<invalid_output>\n"
         f"{raw_output[:12000]}\n"
-        "</invalid_output>\n\n"
+        "</invalid_output>\n"
+    )
+
+
+_CHOICE_SCHEMA = {
+    "choices": [
+        {
+            "key": "A | B | C | D",
+            "actor_id": "插件提供的 participant_id",
+            "text": "不预设结果的行动意图，最多 50 字",
+            "danger_id": "safe | controlled | dangerous | desperate | lethal",
+            "check": {
+                "required": True,
+                "attribute_id": "世界属性稳定 ID；纯骰或免检留空",
+                "type": "standard | leader | group | resistance | opposed",
+                "difficulty": "由插件按 danger_id 覆盖",
+                "known_consequences": "玩家当前可预见的失败后果",
+                "advantage_sources": ["已经成立的优势来源"],
+                "disadvantage_sources": ["已经成立的劣势来源"],
+            },
+            "collective": False,
+        }
+    ]
+}
+
+
+def choice_system_prompt(world: Mapping[str, Any]) -> str:
+    """Small system prompt used only for A-D generation and repair."""
+    return (
+        f"{CORE_NARRATOR_RULES}\n\n"
+        "你的当前任务仅是生成下一位角色的 A、B、C、D 四个行动选项。"
+        "不要续写故事，不要输出状态补丁、记忆或骰点结果。\n\n"
         "<required_output_schema>\n"
-        f"{_json(RESOLUTION_SCHEMA)}\n"
+        f"{_json(_CHOICE_SCHEMA)}\n"
         "</required_output_schema>\n"
+    )
+
+
+def choice_generation_prompt(
+    *,
+    world: Mapping[str, Any],
+    session: Mapping[str, Any],
+    participant: Mapping[str, Any],
+    events: Sequence[Mapping[str, Any]],
+    avoid: Sequence[Mapping[str, Any]] = (),
+    validation_error: str = "",
+    story_context: str = "",
+) -> str:
+    contract = world_contract(world)
+    resolution_mode = str(contract["resolution"]["mode"])
+    risk_policy = contract["resolution"]["difficulty_policy"]
+    if resolution_mode in {"none", "narrative"}:
+        check_rule = "当前世界不启用检定，四项 check 必须全部为 null。"
+    elif resolution_mode == "dice_only":
+        check_rule = (
+            "当前世界使用纯骰检定；需要检定时 attribute_id 留空。"
+        )
+    else:
+        attributes = "、".join(
+            f"{item.get('key')}={item.get('label')}"
+            for item in contract["attributes"]
+        )
+        check_rule = f"需要检定时 attribute_id 只能使用：{attributes}。"
+    return (
+        "只生成当前角色在当前场景可选的四个行动意图。"
+        "必须恰好包含 A、B、C、D，至少一个 safe；actor_id 必须等于"
+        " acting_character.participant_id。每项正文最多 50 字且不得自带"
+        "风险或检定括号；不得预设成功，不得添加角色没有的能力、物品或知识。"
+        "safe 代表没有显著风险与不确定性，check 必须为 null；"
+        "controlled、dangerous、desperate、lethal 仅在结果确有不确定性时"
+        "才可配置 check。DC 由插件按风险映射，模型填写值不具权威性。"
+        f"{check_rule}"
+        "致命风险必须明确已知后果；同一原因不能同时提高 DC 和造成劣势。"
+        "只能描述当前角色本人能够尝试的行为，不得替其他玩家角色行动或决定。"
+        "影响全队的转场、主线分支、共有资源或不可逆决定只能标记"
+        " collective=true。返回单个 JSON 对象，不要解释。\n\n"
+        "<world_definition>\n"
+        f"{str(world.get('system_prompt', '')).strip()}\n"
+        "</world_definition>\n\n"
+        "<relevant_world_rules>\n"
+        f"{_json(compact_world_rules(world))}\n"
+        "</relevant_world_rules>\n\n"
+        "<risk_dc_policy trust=\"plugin-authoritative\">\n"
+        f"{_json(risk_policy)}\n"
+        "</risk_dc_policy>\n\n"
+        "<runtime_state>\n"
+        f"{_json(session.get('world_state', {}))}\n"
+        "</runtime_state>\n\n"
+        "<acting_character>\n"
+        f"{_json(_character_projection(participant))}\n"
+        "</acting_character>\n\n"
+        "<recent_history>\n"
+        f"{_json(_history(list(events)[-8:]))}\n"
+        "</recent_history>\n\n"
+        "<avoid_repeating>\n"
+        f"{_json([dict(item) for item in list(avoid)[-4:]])}\n"
+        "</avoid_repeating>\n\n"
+        "<resolved_story>\n"
+        f"{str(story_context or '')[:3000]}\n"
+        "</resolved_story>\n\n"
+        "<previous_choice_error>\n"
+        f"{str(validation_error or '')[:500]}\n"
+        "</previous_choice_error>\n"
+    )
+
+
+def choice_repair_prompt(
+    raw_output: str,
+    error: str,
+    *,
+    world: Mapping[str, Any],
+    participant: Mapping[str, Any],
+) -> str:
+    contract = world_contract(world)
+    attributes = [
+        {"id": item.get("key"), "label": item.get("label")}
+        for item in contract["attributes"]
+    ]
+    return (
+        "上一组选项未通过校验。只修复四个选项，不续写故事。"
+        "必须保留 A、B、C、D；safe 的 check 必须为 null；"
+        "actor_id 必须使用下面的权威 ID；属性只用稳定 ID。"
+        "返回单个 JSON 对象，不要解释。\n\n"
+        "<actor_id>"
+        f"{_character_projection(participant).get('participant_id')}"
+        "</actor_id>\n"
+        "<allowed_attributes>"
+        f"{_json(attributes)}"
+        "</allowed_attributes>\n"
+        "<risk_dc_policy>"
+        f"{_json(contract['resolution']['difficulty_policy'])}"
+        "</risk_dc_policy>\n"
+        f"<validation_error>{json.dumps(error, ensure_ascii=False)}</validation_error>\n"
+        "<invalid_output>\n"
+        f"{raw_output[:8000]}\n"
+        "</invalid_output>\n"
     )

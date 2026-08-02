@@ -37,6 +37,7 @@ from .tavern.engine import (
 from .tavern.bootstrap import build_runtime
 from .tavern.help_topics import contextual_help
 from .tavern.recaps import build_recap
+from .tavern.operations import transport_event_id
 from .tavern.lifecycle import (
     attribute_maps,
     card_stat_allocation,
@@ -70,6 +71,9 @@ PRIVATE_CARD_ACTIONS = frozenset(
     {
         "card",
         "card_fill",
+        "card_previous",
+        "card_modify",
+        "card_current",
         "card_stats_reset",
         "card_timer_notice",
         "card_preview",
@@ -86,11 +90,11 @@ _INSTANCE_PAGE_PATTERNS = (
 
 
 HELP_TEXT = """\
-【AI 酒馆 v0.9.0｜多人跑团与独立存档】
+【AI 酒馆 v0.9.2｜多人跑团与独立存档】
 主持：/酒馆 开启 <副本> → /酒馆 开演
 恢复：/酒馆 暂停 → /酒馆 恢复 → 全员准备 → /酒馆 继续
 玩家：/酒馆 加入｜角色｜准备｜阵容｜暂离｜返回队列｜退出
-建卡：私聊 /酒馆 建卡 <验证码>｜重填数值｜建卡提醒 开/关
+建卡：私聊 /酒馆 建卡 <验证码>｜当前步骤｜上一步｜修改 <字段>｜重填数值
 回合：jg A｜/酒馆 选择 A｜/酒馆 重整选项
 裁定：/酒馆 灵感｜/酒馆 灵感 A 优势｜/酒馆 灵感重投 A
 集体：/酒馆 投票 A（不消耗个人行动）
@@ -529,6 +533,25 @@ class TavernPlugin(Star):
             if command.matched and command.action == "card_preview":
                 preview = await self.database.preview_card_draft(origin)
                 return format_card_preview(preview)
+            if command.matched and command.action == "card_current":
+                current = await self.database.card_draft_for_private(origin)
+                if not current:
+                    raise DatabaseNotFoundError(
+                        "当前私聊没有进行中的角色卡"
+                    )
+                return format_card_prompt(current)
+            if command.matched and command.action == "card_previous":
+                previous = await self.database.previous_card_step(origin)
+                return "【已返回上一步】\n" + format_card_prompt(previous)
+            if command.matched and command.action == "card_modify":
+                if not command.argument:
+                    raise ValueError(
+                        "请发送 /酒馆 修改 <字段名称或稳定key>"
+                    )
+                modified = await self.database.modify_card_field(
+                    origin, command.argument
+                )
+                return "【已进入字段修改】\n" + format_card_prompt(modified)
             if command.matched and command.action == "card_stats_reset":
                 reset = await self.database.reset_card_draft_stats(origin)
                 if reset.get("profession_reset"):
@@ -597,11 +620,18 @@ class TavernPlugin(Star):
             elif command.matched:
                 return (
                     "【私聊建卡】可用：建卡、填写、预览、"
-                    "重填数值、建卡提醒、确认建卡、取消建卡。"
+                    "上一步、修改、当前步骤、重填数值、建卡提醒、"
+                    "确认建卡、取消建卡。"
                 )
             else:
                 value = message
-            result = await self.database.fill_card_draft(origin, value)
+            result = await self.database.fill_card_draft(
+                origin,
+                value,
+                source_event_id=transport_event_id(event),
+            )
+            if result.get("duplicate"):
+                return "【私聊建卡】这条消息已经处理过，当前步骤未重复推进。\n" + format_card_prompt(result)
             return format_card_prompt(result)
         except (DatabaseNotFoundError, PermissionError, ValueError) as exc:
             return f"【私聊建卡】{exc}"
@@ -827,6 +857,30 @@ class TavernPlugin(Star):
         if response:
             yield await self._rich_result(event, response)
 
+    @tavern.command("上一步", priority=200)
+    async def tavern_card_previous(self, event: AstrMessageEvent):
+        """返回并重新填写上一个可见建卡字段。"""
+
+        response = await self._run_native_command(event, "card_previous")
+        if response:
+            yield await self._rich_result(event, response)
+
+    @tavern.command("修改", priority=200)
+    async def tavern_card_modify(self, event: AstrMessageEvent):
+        """按字段名称或稳定 key 修改已有角色卡字段。"""
+
+        response = await self._run_native_command(event, "card_modify")
+        if response:
+            yield await self._rich_result(event, response)
+
+    @tavern.command("当前步骤", priority=200)
+    async def tavern_card_current(self, event: AstrMessageEvent):
+        """重新显示当前建卡步骤与对应预设。"""
+
+        response = await self._run_native_command(event, "card_current")
+        if response:
+            yield await self._rich_result(event, response)
+
     @tavern.command("预览", priority=200)
     async def tavern_card_preview(self, event: AstrMessageEvent):
         """在私聊中预览完整角色卡。"""
@@ -917,10 +971,6 @@ class TavernPlugin(Star):
     async def tavern_choose(self, event: AstrMessageEvent):
         """选择当前回合的 A/B/C/D 行动。"""
 
-        await self._send_event_text(
-            event,
-            "【酒馆】已收到你的选择，后续内容正在生成中……"
-        )
         response = await self._run_native_command(event, "choose")
         if response:
             unsent = await self._send_event_parts(
@@ -951,11 +1001,6 @@ class TavernPlugin(Star):
             getter() if callable(getter) else getattr(event, "message_str", "")
         )
         choosing = len(raw_message.strip().split()) >= 3
-        if choosing:
-            await self._send_event_text(
-                event,
-                "【酒馆】已收到你的选择，后续内容正在生成中……"
-            )
         response = await self._run_native_command(event, "inspiration")
         if response:
             if choosing:
@@ -972,10 +1017,6 @@ class TavernPlugin(Star):
     async def tavern_inspiration_reroll(self, event: AstrMessageEvent):
         """选择检定选项并消耗一点灵感重投完整骰池。"""
 
-        await self._send_event_text(
-            event,
-            "【酒馆】已收到你的选择，后续内容正在生成中……"
-        )
         response = await self._run_native_command(
             event,
             "inspiration_reroll",
@@ -1472,10 +1513,6 @@ class TavernPlugin(Star):
                 )
                 return
             choice_key, flavor_text = parse_choice_input(content)
-            await self._send_event_text(
-                event,
-                "【酒馆】已收到你的选择，后续内容正在生成中……"
-            )
             reply = await self.engine.process_choice(
                 event=event,
                 session_id=session["id"],
@@ -1483,6 +1520,7 @@ class TavernPlugin(Star):
                 sender_name=str(event.get_sender_name() or sender_id),
                 choice_key=choice_key,
                 flavor_text=flavor_text,
+                progress=lambda text: self._send_event_text(event, text),
             )
             reply_parts: list[str] = []
             if reply.story_text:
@@ -2152,6 +2190,12 @@ class TavernPlugin(Star):
                     )
                 )
             if command.action == "perform":
+                instance_config = await self.database.get_instance_config(
+                    session["id"]
+                )
+                self.engine.validate_world_runtime(
+                    instance_config["world_snapshot"]
+                )
                 result = await self.database.activate_story(
                     session["id"],
                     sender_id,
@@ -2193,6 +2237,7 @@ class TavernPlugin(Star):
                     sender_name=str(event.get_sender_name() or sender_id),
                     choice_key=key,
                     flavor_text=flavor,
+                    progress=lambda text: self._send_event_text(event, text),
                 )
                 return reply.text
             if command.action in {"inspiration", "inspiration_reroll"}:
@@ -2239,6 +2284,7 @@ class TavernPlugin(Star):
                     choice_key=key,
                     flavor_text=flavor,
                     inspiration_mode=mode,
+                    progress=lambda text: self._send_event_text(event, text),
                 )
                 return reply.text
             if command.action == "reroll":
@@ -2897,6 +2943,12 @@ class TavernPlugin(Star):
                         "【酒馆】该副本尚未产生剧情，"
                         "新故事请使用 /酒馆 开演。"
                     )
+                instance_config = await self.database.get_instance_config(
+                    session["id"]
+                )
+                self.engine.validate_world_runtime(
+                    instance_config["world_snapshot"]
+                )
                 result = await self.database.activate_story(
                     session["id"],
                     sender_id,

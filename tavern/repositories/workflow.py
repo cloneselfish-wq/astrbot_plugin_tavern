@@ -479,6 +479,27 @@ class WorkflowRepositoryMixin:
             if not row:
                 return None
             result = self._choice_set(row)
+            snapshot_row = connection.execute(
+                """
+                SELECT world_snapshot_json FROM instance_configs
+                WHERE session_id = ?
+                """,
+                (session_id,),
+            ).fetchone()
+            if snapshot_row:
+                world_snapshot = json_load(
+                    snapshot_row["world_snapshot_json"],
+                    {},
+                )
+                try:
+                    result["choices"] = normalize_choices(
+                        json_load(row["choices_json"], []),
+                        world_snapshot,
+                    )
+                except ValueError:
+                    # Keep the structurally valid stored projection if the
+                    # frozen snapshot is unavailable or was externally damaged.
+                    pass
             participant = connection.execute(
                 "SELECT * FROM participants WHERE id = ?",
                 (row["participant_id"],),
@@ -2226,4 +2247,3 @@ class WorkflowRepositoryMixin:
             except Exception:
                 connection.execute("ROLLBACK")
                 raise
-

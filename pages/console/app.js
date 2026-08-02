@@ -4534,7 +4534,7 @@ $("#export-backup-button").addEventListener("click", async (event) => {
       await bridge.download(
         "backup/export",
         {},
-        "backup_tavern_v0.9.0.zip",
+        "backup_tavern_v0.9.2.zip",
       );
     });
     toast("备份已生成", "success");

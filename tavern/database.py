@@ -107,7 +107,7 @@ class TavernDatabase(
     def __init__(self, data_dir: Path) -> None:
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
-        # v0.9.0 is a deliberate clean baseline. It never opens or mutates
+        # v0.9.x is a deliberate clean baseline. It never opens or mutates
         # catalog.sqlite3/tavern.sqlite3 created by older releases.
         self.path = self.data_dir / "catalog_v090.sqlite3"
         self._schema_lock = threading.Lock()

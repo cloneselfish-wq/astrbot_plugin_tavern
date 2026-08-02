@@ -100,12 +100,14 @@
       "temperature": {
         "description": "叙事随机度",
         "type": "float",
-        "default": 0.7
+        "hint": "建议 0.4—0.5，可减少结构修复与额外模型请求。",
+        "default": 0.5
       },
       "max_tokens": {
         "description": "单次最大输出 Tokens",
         "type": "int",
-        "default": 1800
+        "hint": "100—300 字故事与四组选项通常不需要过高输出上限。",
+        "default": 1400
       },
       "request_timeout_seconds": {
         "description": "模型超时秒数",
@@ -160,12 +162,14 @@
       "recent_turns": {
         "description": "带入最近回合数",
         "type": "int",
-        "default": 12
+        "hint": "默认 6；长期事实由记忆与故事账本补充。",
+        "default": 6
       },
       "memory_limit": {
         "description": "每轮检索记忆数",
         "type": "int",
-        "default": 10
+        "hint": "默认 6；锁定事实仍按世界策略优先进入上下文。",
+        "default": 6
       },
       "user_cooldown_seconds": {
         "description": "同一玩家冷却秒数",

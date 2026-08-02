@@ -6,6 +6,7 @@ from collections.abc import Mapping, Sequence
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from .card_wizard import field_visible, preset_options
 from .security import clean_text
 from .world_contract import attribute_lookup, stats_mode, world_contract
 
@@ -268,10 +269,10 @@ DEFAULT_NPC_POLICY: dict[str, Any] = {
 }
 
 DEFAULT_CONTEXT_BUDGET: dict[str, Any] = {
-    "recent_turns": 12,
-    "memories": 10,
-    "active_npcs": 12,
-    "ledger_items": 16,
+    "recent_turns": 6,
+    "memories": 6,
+    "active_npcs": 6,
+    "ledger_items": 8,
     "locked_facts_always_include": True,
 }
 
@@ -470,10 +471,10 @@ def world_session_modules(world: Mapping[str, Any]) -> dict[str, Any]:
     if isinstance(rules.get("context_budget"), Mapping):
         context_budget.update(dict(rules["context_budget"]))
     for key, default, maximum in (
-        ("recent_turns", 12, 50),
-        ("memories", 10, 40),
-        ("active_npcs", 12, 40),
-        ("ledger_items", 16, 100),
+        ("recent_turns", 6, 50),
+        ("memories", 6, 40),
+        ("active_npcs", 6, 40),
+        ("ledger_items", 8, 100),
     ):
         context_budget[key] = _bounded_int(
             context_budget.get(key),
@@ -587,7 +588,8 @@ def card_template(world: Mapping[str, Any]) -> dict[str, Any]:
                         str(item.get("type") or "text").lower()
                         if str(item.get("type") or "text").lower()
                         in {"text", "textarea", "integer", "select",
-                            "multi_select", "boolean", "derived"}
+                            "preset_select", "multi_select", "boolean",
+                            "derived"}
                         else "text"
                     ),
                     **({"options": list(item.get("options") or [])}
@@ -598,6 +600,21 @@ def card_template(world: Mapping[str, Any]) -> dict[str, Any]:
                        if item.get("value_field") else {}),
                     **({"label_field": str(item.get("label_field"))}
                        if item.get("label_field") else {}),
+                    **({"preset_source": str(item.get("preset_source"))}
+                       if item.get("preset_source") else {}),
+                    **({"description_field": str(item.get("description_field"))}
+                       if item.get("description_field") else {}),
+                    **({"page_size": _bounded_int(
+                        item.get("page_size"), 5, 1, 10
+                    )} if item.get("page_size") is not None else {}),
+                    **({"visible_when": dict(item.get("visible_when") or {})}
+                       if isinstance(item.get("visible_when"), Mapping) else {}),
+                    **({"clear_on_change": list(item.get("clear_on_change") or [])}
+                       if isinstance(item.get("clear_on_change"), Sequence)
+                       and not isinstance(item.get("clear_on_change"), (str, bytes))
+                       else {}),
+                    **({"must_differ_from": str(item.get("must_differ_from"))}
+                       if item.get("must_differ_from") else {}),
                 }
             )
     if not fields:
@@ -727,6 +744,26 @@ def card_template(world: Mapping[str, Any]) -> dict[str, Any]:
                 "stat_key": attribute["key"],
             }
         )
+    preset_sets_raw = raw.get("preset_sets")
+    preset_sets = (
+        {
+            str(key): list(value)
+            for key, value in preset_sets_raw.items()
+            if isinstance(value, Sequence)
+            and not isinstance(value, (str, bytes))
+        }
+        if isinstance(preset_sets_raw, Mapping)
+        else {}
+    )
+    profession_presets = list(raw.get("profession_presets") or [])
+    origin_region_presets = list(raw.get("origin_region_presets") or [])
+    social_identity_presets = list(raw.get("social_identity_presets") or [])
+    if profession_presets:
+        preset_sets.setdefault("profession_presets", profession_presets)
+    if origin_region_presets:
+        preset_sets.setdefault("origin_region_presets", origin_region_presets)
+    if social_identity_presets:
+        preset_sets.setdefault("social_identity_presets", social_identity_presets)
     return {
         "version": _bounded_int(raw.get("version"), 1, 1, 100000),
         "auto_approve": bool(raw.get("auto_approve", False)),
@@ -754,7 +791,10 @@ def card_template(world: Mapping[str, Any]) -> dict[str, Any]:
             "preset_selector": dict(stats_raw.get("preset_selector") or {}),
             "bonus_choices": list(stats_raw.get("bonus_choices") or []),
         },
-        "profession_presets": list(raw.get("profession_presets") or []),
+        "profession_presets": profession_presets,
+        "origin_region_presets": origin_region_presets,
+        "social_identity_presets": social_identity_presets,
+        "preset_sets": preset_sets,
         "profession_mode": profession_mode,
     }
 
@@ -1082,6 +1122,7 @@ def next_fillable_card_step(
     template: Mapping[str, Any],
     fields_def: list[Mapping[str, Any]],
     start_step: int,
+    values: Mapping[str, Any] | None = None,
 ) -> int:
     step = start_step
     while step < len(fields_def):
@@ -1090,6 +1131,9 @@ def next_fillable_card_step(
             step += 1
             continue
         key = str(definition.get("key") or "")
+        if not field_visible(definition, values):
+            step += 1
+            continue
         if (
             uses_profession_preset_stats(template)
             and (
@@ -1127,7 +1171,7 @@ def repair_profession_preset_draft(
         fields[f"stat_{key}"] = value
     fields_def = template["fields"]
     repaired_step = next_fillable_card_step(
-        template, fields_def, current_step
+        template, fields_def, current_step, fields
     )
     return fields, repaired_step
 
@@ -1173,6 +1217,70 @@ def validate_card_template_config(value: Any) -> None:
             raise ValueError(
                 "角色姓名与副本代号最多只能设置为 12 个字符"
             )
+
+    normalized_template = card_template(
+        {"rules": {"character_card": dict(value)}}
+    )
+    normalized_fields = normalized_template.get("fields") or []
+    field_key_set = {
+        str(item.get("key") or "")
+        for item in normalized_fields
+        if isinstance(item, Mapping)
+    }
+    dependency_graph: dict[str, set[str]] = {key: set() for key in field_key_set}
+    for field in normalized_fields:
+        if not isinstance(field, Mapping):
+            continue
+        key = str(field.get("key") or "")
+        condition = field.get("visible_when")
+        if isinstance(condition, Mapping):
+            for dependency in condition:
+                dependency_key = str(dependency)
+                if dependency_key not in field_key_set:
+                    raise ValueError(
+                        f"字段 {key} 的 visible_when 引用了不存在的字段："
+                        f"{dependency_key}"
+                    )
+                dependency_graph[key].add(dependency_key)
+        different = str(field.get("must_differ_from") or "")
+        if different and different not in field_key_set:
+            raise ValueError(
+                f"字段 {key} 的 must_differ_from 引用了不存在的字段："
+                f"{different}"
+            )
+        for target in field.get("clear_on_change") or []:
+            target_key = str(target)
+            if target_key not in field_key_set:
+                raise ValueError(
+                    f"字段 {key} 的 clear_on_change 引用了不存在的字段："
+                    f"{target_key}"
+                )
+        if str(field.get("type") or "") in {"select", "preset_select"}:
+            source_field = dict(field)
+            source_field.pop("visible_when", None)
+            options = preset_options(normalized_template, source_field, {})
+            if field.get("required") and not options:
+                raise ValueError(f"必填预设字段 {key} 没有任何有效选项")
+            ids = [str(item.get("id") or "").casefold() for item in options]
+            if len(ids) != len(set(ids)):
+                raise ValueError(f"预设字段 {key} 存在重复的稳定 ID")
+
+    visiting: set[str] = set()
+    visited: set[str] = set()
+
+    def visit(node: str) -> None:
+        if node in visiting:
+            raise ValueError(f"角色卡条件字段形成循环依赖：{node}")
+        if node in visited:
+            return
+        visiting.add(node)
+        for dependency in dependency_graph.get(node, set()):
+            visit(dependency)
+        visiting.remove(node)
+        visited.add(node)
+
+    for field_key in dependency_graph:
+        visit(field_key)
 
     stats = value.get("stats")
     stats = stats if isinstance(stats, Mapping) else {"mode": "none"}
@@ -1325,7 +1433,13 @@ def normalize_choices(value: Any, world: Mapping[str, Any] | None = None) -> lis
         check = item.get("check"); check = check if isinstance(check, Mapping) else {}
         required = bool(check.get("required", item.get("requires_check", False)))
         stat = clean_text(check.get("attribute_id", item.get("check_stat")), max_chars=40)
-        label = stat
+        label = clean_text(
+            check.get(
+                "attribute_label",
+                item.get("check_label", stat),
+            ),
+            max_chars=40,
+        ) or stat
         consequence = clean_text(check.get("known_consequences", item.get("known_consequences")), max_chars=300)
         risk_label = {"safe":"安全","controlled":"可控","dangerous":"危险","desperate":"绝境","lethal":"致命"}.get(risk, risk)
         if contract is not None:
@@ -1346,10 +1460,25 @@ def normalize_choices(value: Any, world: Mapping[str, Any] | None = None) -> lis
             elif required and mode == "dice_only": stat=label=""
         check_type=str(check.get("type",item.get("check_type","standard")) or "standard").lower()
         if check_type not in {"standard","leader","group","resistance","opposed"}: check_type="standard"
-        difficulty=_bounded_int(check.get("difficulty",item.get("difficulty")),12,5,25)
+        declared_difficulty = check.get("difficulty", item.get("difficulty"))
+        if contract is not None and required:
+            mapped_difficulty = contract["resolution"]["difficulty_policy"].get(risk)
+            if mapped_difficulty is None:
+                if risk == "safe":
+                    # safe 是插件定义的免检路径。模型误附 check 时直接
+                    # 规范化为免检，避免为一个可确定修复的问题再请求模型。
+                    required = False
+                    stat = label = ""
+                    difficulty = _bounded_int(declared_difficulty, 12, 5, 25)
+                else:
+                    raise ValueError(f"危险度 {risk} 不允许配置检定")
+            else:
+                difficulty = _bounded_int(mapped_difficulty, 12, 5, 25)
+        else:
+            difficulty=_bounded_int(declared_difficulty,12,5,25)
         adv=check.get("advantage_sources",item.get("advantage_sources")); dis=check.get("disadvantage_sources",item.get("disadvantage_sources"))
         row={"key":key,"text":text,"actor_id":clean_text(item.get("actor_id"),max_chars=128),"risk":risk,"danger_id":risk,"risk_label":risk_label,"requires_check":required,"collective":bool(item.get("collective",False)),"check_type":check_type,"check_stat":stat,"check_label":label,"difficulty":difficulty,"known_consequences":consequence,"advantage_sources":[clean_text(x,max_chars=120) for x in (adv if isinstance(adv,list) else [])[:8] if clean_text(x,max_chars=120)],"disadvantage_sources":[clean_text(x,max_chars=120) for x in (dis if isinstance(dis,list) else [])[:8] if clean_text(x,max_chars=120)]}
-        row["check"]={"required":True,"attribute_id":stat,"type":check_type,"difficulty":difficulty,"known_consequences":consequence} if required else None
+        row["check"]={"required":True,"attribute_id":stat,"attribute_label":label,"type":check_type,"difficulty":difficulty,"known_consequences":consequence} if required else None
         by_key[key]=row
     if set(by_key)!=set(CHOICE_KEYS): raise ValueError("每回合必须提供 A、B、C、D 四个有效选项")
     result=[by_key[k] for k in CHOICE_KEYS]
@@ -1470,10 +1599,15 @@ def format_choices(character_name: str, choices: Sequence[Mapping[str, Any]], *,
     for item in choices:
         annotations=[str(item.get("risk_label") or defaults.get(str(item.get("risk")),"可控"))]
         if item.get("requires_check"):
-            label=str(item.get("check_label") or item.get("check_stat") or "").strip(); annotations.append(f'需“{label}”检定' if label else "需检定")
+            label=str(item.get("check_label") or item.get("check_stat") or "").strip()
+            try: dc=int(item.get("difficulty"))
+            except (TypeError,ValueError): dc=0
+            check_text=(f'需“{label}”检定' if label else "需检定")
+            if dc: check_text += f" DC{dc}"
+            annotations.append(check_text)
         key=str(item.get("key") or ""); letter=_CHOICE_LETTER_EMOJI.get(key.upper(),key)
         lines.extend(["",f"{letter} {item.get('text')}（{' · '.join(annotations)}）"] )
-        if str(item.get("risk"))=="lethal" and item.get("known_consequences"): lines.append(f"⚠️ 已知后果：{item.get('known_consequences')}")
+        if str(item.get("risk")) in {"dangerous","desperate","lethal"} and item.get("known_consequences"): lines.append(f"⚠️ 已知后果：{item.get('known_consequences')}")
     lines.extend(["","","💬 发送：jg A","📝 也可：/酒馆 选择 A 语气尽量温和",f"♻️ 本回合剩余重整次数：{max(0,rerolls_left)}"] )
     return "\n".join(lines)
 

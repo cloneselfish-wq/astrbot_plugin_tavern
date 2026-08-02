@@ -6,6 +6,7 @@ import json
 import sqlite3
 import tempfile
 import unittest
+from unittest.mock import patch
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -14,13 +15,17 @@ import yaml
 
 from tavern.api import ExtensionRegistry, HookRegistry, TavernPublicAPI
 from tavern.config import TavernConfig
+from tavern.card_wizard import choose_option, paged_options, preset_options
 from tavern.constants import (
+    CHARACTER_CARD_TEMPLATE_VERSION,
     DATABASE_SCHEMA_VERSION,
     DEFAULT_WORLD,
     DEFAULT_WORLD_SLUG,
+    NPC_IMPORT_TEMPLATE_VERSION,
     PLUGIN_VERSION,
     SESSION_PREPARING,
     SESSION_RUNNING,
+    TEMPLATE_BUNDLE_VERSION,
 )
 from tavern.database import TavernDatabase
 from tavern.diagnostics import build_diagnostic_report
@@ -28,7 +33,16 @@ from tavern.engine import TavernBusyError, TavernEngine
 from tavern.events import EventBroker
 from tavern.narrative_quality import inspect_narrative
 from tavern.operations import operation_key, recovery_summary
-from tavern.world_contract import validate_world_contract
+from tavern.lifecycle import card_template, format_choices, normalize_choices
+from tavern.prompts import (
+    choice_generation_prompt,
+    choice_repair_prompt,
+    choice_system_prompt,
+    repair_prompt,
+    system_prompt,
+)
+from tavern.resolution import CheckRequest, roll_check
+from tavern.world_contract import WORLD_SCHEMA_VERSION, validate_world_contract
 from tavern.world_migration import compare_world_contracts
 from tavern.world_preflight import inspect_world_package
 
@@ -49,19 +63,240 @@ class FakeContext:
         return SimpleNamespace(completion_text=self.outputs.pop(0))
 
 
-class V090ContractTests(unittest.TestCase):
+class V092ContractTests(unittest.TestCase):
     def test_versions_are_single_current_baseline(self) -> None:
         metadata = yaml.safe_load((ROOT / "metadata.yaml").read_text("utf-8"))
-        self.assertEqual(PLUGIN_VERSION, "0.9.0")
-        self.assertEqual(metadata["version"], "v0.9.0")
+        self.assertEqual(PLUGIN_VERSION, "0.9.2")
+        self.assertEqual(metadata["version"], "v0.9.2")
         self.assertEqual(DATABASE_SCHEMA_VERSION, 8)
 
     def test_builtin_world_passes_strict_preflight(self) -> None:
         report = inspect_world_package(DEFAULT_WORLD)
         self.assertTrue(report["compatible"])
+        self.assertEqual(DEFAULT_WORLD["world_content_version"], "1.2.0")
         self.assertEqual(report["summary"]["schema_version"], 2)
         self.assertEqual(report["summary"]["stats_mode"], "preset")
         self.assertEqual(report["summary"]["migrations"], 0)
+
+    def test_template_manifest_tracks_runtime_interfaces(self) -> None:
+        manifest = json.loads(
+            (ROOT / "templates/template-manifest.json").read_text("utf-8")
+        )
+        self.assertEqual(manifest["template_bundle_version"], TEMPLATE_BUNDLE_VERSION)
+        self.assertEqual(manifest["compatible_plugin_version"], PLUGIN_VERSION)
+        self.assertEqual(manifest["world_schema_version"], WORLD_SCHEMA_VERSION)
+        self.assertEqual(
+            manifest["character_card_template_version"],
+            CHARACTER_CARD_TEMPLATE_VERSION,
+        )
+        self.assertEqual(
+            manifest["npc_import_template_version"], NPC_IMPORT_TEMPLATE_VERSION
+        )
+        for relative_path in manifest["files"].values():
+            self.assertTrue((ROOT / relative_path).is_file(), relative_path)
+
+    def test_generic_world_template_passes_current_preflight(self) -> None:
+        world = json.loads(
+            (ROOT / "templates/world-package.template.json").read_text("utf-8")
+        )
+        metadata = world["template_metadata"]
+        self.assertEqual(metadata["template_bundle_version"], TEMPLATE_BUNDLE_VERSION)
+        self.assertEqual(metadata["compatible_plugin_version"], PLUGIN_VERSION)
+        self.assertEqual(world["world_schema_version"], WORLD_SCHEMA_VERSION)
+        self.assertEqual(
+            world["rules"]["character_card"]["version"],
+            CHARACTER_CARD_TEMPLATE_VERSION,
+        )
+        report = inspect_world_package(world)
+        self.assertTrue(report["compatible"], report["issues"])
+        self.assertEqual(report["summary"]["stats_mode"], "manual")
+        self.assertEqual(report["summary"]["resolution_mode"], "attribute")
+
+    def test_npc_template_matches_current_import_contract(self) -> None:
+        payload = json.loads(
+            (ROOT / "templates/npc-import.template.json").read_text("utf-8")
+        )
+        metadata = payload["template_metadata"]
+        self.assertEqual(metadata["template_bundle_version"], TEMPLATE_BUNDLE_VERSION)
+        self.assertEqual(
+            metadata["npc_import_template_version"], NPC_IMPORT_TEMPLATE_VERSION
+        )
+        self.assertTrue(str(payload.get("world_slug") or "").strip())
+        self.assertIsInstance(payload.get("items"), list)
+        self.assertTrue(payload["items"])
+        for item in payload["items"]:
+            self.assertTrue(str(item.get("name") or "").strip())
+            self.assertTrue(str(item.get("role") or "").strip())
+            self.assertIsInstance(item.get("profile"), dict)
+            self.assertIsInstance(item.get("prompt"), str)
+
+    def test_presets_are_revealed_only_at_the_current_step(self) -> None:
+        template = card_template(DEFAULT_WORLD)
+        self.assertEqual(preset_options(template, template["fields"][0], {}), [])
+        species_field = next(
+            item for item in template["fields"] if item["key"] == "species"
+        )
+        species_page = paged_options(template, species_field, {})
+        species_names = {item["label"] for item in species_page["options"]}
+        self.assertEqual(species_page["total_pages"], 2)
+        self.assertIn("人类", species_names)
+        self.assertNotIn("骑士", species_names)
+
+    def test_preset_paging_and_stable_id_selection(self) -> None:
+        template = card_template(DEFAULT_WORLD)
+        profession = next(
+            item for item in template["fields"] if item["key"] == "profession"
+        )
+        page = paged_options(template, profession, {})
+        self.assertEqual(len(page["items"]), 4)
+        selected = choose_option(template, profession, {}, "knight")
+        self.assertEqual(selected["value"], "骑士")
+
+    def test_risk_policy_overrides_model_supplied_dc(self) -> None:
+        choices = copy.deepcopy(DEFAULT_WORLD["rules"]["opening_choices"])
+        choices[1]["difficulty"] = 25
+        choices[1]["check"]["difficulty"] = 25
+        normalized = normalize_choices(choices, DEFAULT_WORLD)
+        self.assertEqual(normalized[1]["difficulty"], 9)
+        self.assertEqual(normalized[2]["difficulty"], 13)
+
+    def test_safe_check_is_deterministically_normalized_without_retry(self) -> None:
+        choices = copy.deepcopy(DEFAULT_WORLD["rules"]["opening_choices"])
+        choices[0]["check"] = {
+            "required": True,
+            "attribute_id": "perception",
+            "difficulty": 25,
+        }
+        choices[0]["requires_check"] = True
+        normalized = normalize_choices(choices, DEFAULT_WORLD)
+        self.assertFalse(normalized[0]["requires_check"])
+        self.assertIsNone(normalized[0]["check"])
+
+    def test_attribute_label_survives_storage_normalization(self) -> None:
+        normalized = normalize_choices(
+            DEFAULT_WORLD["rules"]["opening_choices"], DEFAULT_WORLD
+        )
+        restored = normalize_choices(normalized)
+        checked = next(item for item in restored if item["requires_check"])
+        self.assertNotEqual(checked["check_stat"], checked["check_label"])
+        self.assertIn(
+            f'需“{checked["check_label"]}”检定',
+            format_choices("测试角色", restored),
+        )
+        legacy = copy.deepcopy(normalized)
+        for item in legacy:
+            if not item.get("requires_check"):
+                continue
+            item["check_label"] = item["check_stat"]
+            if item.get("check"):
+                item["check"].pop("attribute_label", None)
+        recovered = normalize_choices(legacy, DEFAULT_WORLD)
+        recovered_checked = next(
+            item for item in recovered if item["requires_check"]
+        )
+        self.assertNotEqual(
+            recovered_checked["check_stat"],
+            recovered_checked["check_label"],
+        )
+
+    def test_context_compiler_omits_authoring_payloads_and_duplicates(self) -> None:
+        narrative_system = system_prompt(DEFAULT_WORLD, allow_check=False)
+        self.assertNotIn('"character_card"', narrative_system)
+        self.assertNotIn('"professions"', narrative_system)
+        self.assertNotIn("<resident_characters>", narrative_system)
+        self.assertLess(len(narrative_system), 18000)
+
+        participant = {
+            "id": "participant-1",
+            "character_name": "测试角色",
+            "card_profile": {"background": "简短背景"},
+            "card_stats": {"perception": 8},
+            "runtime_state": {"statuses": []},
+            "draft_profile": {"should_not_leak": "X" * 5000},
+            "binding_code": "secret-code",
+        }
+        choice_prompt = choice_generation_prompt(
+            world=DEFAULT_WORLD,
+            session={"world_state": {"location": "鸦渡镇"}},
+            participant=participant,
+            events=[],
+        )
+        self.assertNotIn("should_not_leak", choice_prompt)
+        self.assertNotIn("secret-code", choice_prompt)
+        self.assertNotIn('"character_card"', choice_prompt)
+        choice_system = choice_system_prompt(DEFAULT_WORLD)
+        self.assertLess(len(choice_system) + len(choice_prompt), 18000)
+        worst_repair = choice_repair_prompt(
+            "X" * 8000,
+            "选项结构错误",
+            world=DEFAULT_WORLD,
+            participant=participant,
+        )
+        self.assertLess(len(choice_system) + len(worst_repair), 11000)
+
+    def test_repair_prompt_does_not_repeat_original_context(self) -> None:
+        marker = "DO_NOT_REPEAT_CONTEXT"
+        repaired = repair_prompt("{bad}", "字段错误", marker * 10000)
+        self.assertNotIn(marker, repaired)
+        self.assertLess(len(repaired), 2000)
+
+    def test_v092_low_latency_defaults(self) -> None:
+        config = TavernConfig.from_mapping({})
+        self.assertEqual(config.temperature, 0.5)
+        self.assertEqual(config.max_tokens, 1400)
+        self.assertEqual(config.recent_turns, 6)
+        self.assertEqual(config.memory_limit, 6)
+        budget = DEFAULT_WORLD["rules"]["context_budget"]
+        self.assertEqual(
+            {key: budget[key] for key in ("recent_turns", "memories", "active_npcs", "ledger_items")},
+            {"recent_turns": 6, "memories": 6, "active_npcs": 6, "ledger_items": 8},
+        )
+
+    def test_machine_roll_format_matches_public_receipt(self) -> None:
+        request = CheckRequest(
+            stat="魅力",
+            reason="交涉",
+            difficulty=9,
+            modifier=1,
+        )
+        with patch("tavern.resolution.secrets.randbelow", return_value=17):
+            dice = roll_check(request)
+        text = TavernEngine._format_dice_result(dice, "魅力")
+        self.assertEqual(
+            text,
+            "🎲【魅力检定】［常规］18 +1 → 19 / DC 9 · 大成功",
+        )
+
+    def test_builtin_d20_is_registered_in_runtime_engine(self) -> None:
+        registry = ExtensionRegistry()
+        engine = TavernEngine(
+            context=FakeContext([]),
+            database=object(),
+            config_provider=lambda: TavernConfig.from_mapping({}),
+            broker=EventBroker(),
+            extensions=registry,
+        )
+        self.assertIsNotNone(registry.resolve("dice_system", "d20"))
+        unavailable = copy.deepcopy(DEFAULT_WORLD)
+        unavailable["rules"]["resolution"]["dice_system"] = "percentile"
+        with self.assertRaisesRegex(Exception, "没有注册该骰制"):
+            engine.validate_world_runtime(unavailable)
+        request = CheckRequest(
+            stat="魅力", reason="交涉", difficulty=9, modifier=1
+        )
+        with patch("tavern.resolution.secrets.randbelow", return_value=17):
+            dice = roll_check(request)
+        notices: list[str] = []
+        asyncio.run(
+            engine._publish_locked_check_progress(notices.append, dice, "魅力")
+        )
+        self.assertEqual(
+            notices,
+            [
+                "🎲【魅力检定】［常规］18 +1 → 19 / DC 9 · 大成功",
+                "【酒馆】已收到你的选择，后续内容正在生成中……",
+            ],
+        )
 
     def test_old_or_missing_world_protocol_is_rejected(self) -> None:
         for value in (None, 1):
@@ -111,8 +346,8 @@ class V090ContractTests(unittest.TestCase):
         html = (ROOT / "pages/console/index.html").read_text("utf-8")
         style = (ROOT / "pages/console/style.css").read_text("utf-8")
         logo = (ROOT / "logo.svg").read_text("utf-8")
-        self.assertIn("style.css?v=0.9.0", html)
-        self.assertIn("app.js?v=0.9.0", html)
+        self.assertIn("style.css?v=0.9.2", html)
+        self.assertIn("app.js?v=0.9.2", html)
         self.assertIn("button-secondary", html)
         self.assertIn(".button-secondary", style)
         self.assertIn("viewBox=\"0 0 256 256\"", logo)
@@ -126,7 +361,7 @@ class V090ContractTests(unittest.TestCase):
             self.assertIn("### 详细更新说明", section)
 
 
-class V090DatabaseTests(unittest.IsolatedAsyncioTestCase):
+class V092DatabaseTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
@@ -146,6 +381,27 @@ class V090DatabaseTests(unittest.IsolatedAsyncioTestCase):
                 "SELECT value FROM tavern_meta WHERE key='schema_version'"
             ).fetchone()[0]
         self.assertEqual(int(schema), 8)
+
+    async def test_private_card_message_is_consumed_once(self) -> None:
+        await self.database.transition_session(
+            self.session["id"], SESSION_PREPARING, "admin"
+        )
+        reserved = await self.database.reserve_participant(
+            self.session["id"], "user-idempotent", "测试玩家"
+        )
+        origin = "private:user-idempotent"
+        await self.database.bind_card_code(
+            reserved["binding_code"], "user-idempotent", origin
+        )
+        first = await self.database.fill_card_draft(
+            origin, "灰鸦", source_event_id="private-message-1"
+        )
+        repeated = await self.database.fill_card_draft(
+            origin, "灰鸦", source_event_id="private-message-1"
+        )
+        self.assertEqual(first["current_step"], 1)
+        self.assertEqual(repeated["current_step"], 1)
+        self.assertTrue(repeated["duplicate"])
 
     async def test_timer_policy_and_play_time_are_off_by_default(self) -> None:
         policy = await self.database.get_timer_policy(self.session["id"])
@@ -267,9 +523,10 @@ class V090DatabaseTests(unittest.IsolatedAsyncioTestCase):
         for field in draft["template"]["fields"]:
             key = field["key"]
             value = values.get(key)
-            if value is None and field.get("options"):
-                first = field["options"][0]
-                value = first.get("value") if isinstance(first, dict) else first
+            if value is None:
+                options = preset_options(draft["template"], field, {})
+                if options:
+                    value = options[0]["value"]
             if value is None:
                 value = "原始资料"
             await self.database.fill_card_draft(origin, str(value))

@@ -1,5 +1,14 @@
 """Domain repository methods extracted from the SQLite store."""
 
+from ..card_wizard import (
+    LAST_MESSAGE_KEY,
+    choose_option,
+    clear_field_and_dependents,
+    field_visible,
+    navigate_page,
+    preset_options,
+    store_preset_snapshot,
+)
 from ..database_support import *
 
 
@@ -1012,11 +1021,13 @@ class CharacterRepositoryMixin:
         self,
         private_origin: str,
         value: str,
+        source_event_id: str = "",
     ) -> dict[str, Any]:
         return await self._run(
             self._fill_card_draft,
             private_origin,
             value,
+            source_event_id,
         )
 
     def _allowed_option_values(
@@ -1037,6 +1048,7 @@ class CharacterRepositoryMixin:
         self,
         private_origin: str,
         value: str,
+        source_event_id: str = "",
     ) -> dict[str, Any]:
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -1080,6 +1092,23 @@ class CharacterRepositoryMixin:
                 fields = json_load(row["fields_json"], {})
                 if not isinstance(fields, dict):
                     fields = {}
+                source_event_id = clean_text(source_event_id, max_chars=160)
+                if (
+                    source_event_id
+                    and str(fields.get(LAST_MESSAGE_KEY) or "")
+                    == source_event_id
+                ):
+                    connection.execute("COMMIT")
+                    return {
+                        "participant_id": row["id"],
+                        "session_id": row["session_id"],
+                        "fields": fields,
+                        "template": template,
+                        "current_step": step,
+                        "complete": step >= len(fields_def),
+                        "world": json_load(row["world_snapshot_json"], {}),
+                        "duplicate": True,
+                    }
                 # Repair legacy drafts that still carry hand-filled stat_* fields
                 # (doc §7): recompute from profession + primary/secondary and fix
                 # the cursor to the first non-attribute field.
@@ -1089,8 +1118,43 @@ class CharacterRepositoryMixin:
                 if step >= len(fields_def):
                     raise ValueError("所有字段已填写，请发送 /酒馆 确认建卡")
                 definition = fields_def[step]
-                text = clean_card_field(
+                options = preset_options(template, definition, fields)
+                if options and navigate_page(
+                    fields,
+                    definition,
                     value,
+                    total_options=len(options),
+                ):
+                    if source_event_id:
+                        fields[LAST_MESSAGE_KEY] = source_event_id
+                    connection.execute(
+                        """
+                        UPDATE character_card_drafts
+                        SET fields_json = ?, updated_at = ? WHERE id = ?
+                        """,
+                        (json_dump(fields), now, row["draft_id"]),
+                    )
+                    connection.execute("COMMIT")
+                    return {
+                        "participant_id": row["id"],
+                        "session_id": row["session_id"],
+                        "fields": fields,
+                        "template": template,
+                        "current_step": step,
+                        "complete": False,
+                        "world": json_load(row["world_snapshot_json"], {}),
+                        "page_changed": True,
+                    }
+                selected_preset = (
+                    choose_option(template, definition, fields, value)
+                    if options
+                    else None
+                )
+                raw_value = (
+                    selected_preset["value"] if selected_preset else value
+                )
+                text = clean_card_field(
+                    raw_value,
                     label=str(definition["label"]),
                     max_chars=int(definition["max_chars"]),
                 )
@@ -1134,11 +1198,6 @@ class CharacterRepositoryMixin:
                             f"{definition['label']}当前必须在 "
                             f"{minimum}—{maximum} 之间{suffix}"
                         )
-                _allowed = self._allowed_option_values(definition)
-                if _allowed and str(stored_value) not in _allowed:
-                    raise ValueError(
-                        f"{definition['label']}必须从提示中的预设项选择"
-                    )
                 profession_mode = uses_profession_preset_stats(template)
                 field_key = str(definition["key"])
                 if profession_mode and field_key.startswith("stat_"):
@@ -1146,7 +1205,18 @@ class CharacterRepositoryMixin:
                         "本世界不使用大项/小项自由分配，"
                         "请选择主属性+7与副属性+3。"
                     )
-                fields[definition["key"]] = stored_value
+                previous_value = fields.get(field_key)
+                if previous_value is not None and previous_value != stored_value:
+                    clear_field_and_dependents(template, fields, field_key)
+                different_from = str(definition.get("must_differ_from") or "")
+                if different_from and fields.get(different_from) == stored_value:
+                    raise ValueError(
+                        f"{definition['label']}不能与"
+                        f"{next((item.get('label') for item in fields_def if item.get('key') == different_from), different_from)}相同"
+                    )
+                fields[field_key] = stored_value
+                if selected_preset:
+                    store_preset_snapshot(fields, field_key, selected_preset)
                 if profession_mode and field_key == "profession":
                     resolved = resolve_profession_stats(
                         template, fields, require_complete=False
@@ -1179,7 +1249,7 @@ class CharacterRepositoryMixin:
                     fields["resolved_stat_total"] = int(resolved["effective_total"])
                 if profession_mode:
                     next_step = next_fillable_card_step(
-                        template, fields_def, step + 1
+                        template, fields_def, step + 1, fields
                     )
                 else:
                     stat_values = [
@@ -1198,7 +1268,11 @@ class CharacterRepositoryMixin:
                             f"{template['stats']['budget']}，"
                             "请重新建卡或调整模板"
                         )
-                    next_step = step + 1
+                    next_step = next_fillable_card_step(
+                        template, fields_def, step + 1, fields
+                    )
+                if source_event_id:
+                    fields[LAST_MESSAGE_KEY] = source_event_id
                 connection.execute(
                     """
                     UPDATE character_card_drafts SET
@@ -1440,6 +1514,128 @@ class CharacterRepositoryMixin:
             raise DatabaseNotFoundError("当前私聊没有进行中的角色卡")
         return draft
 
+    async def previous_card_step(
+        self, private_origin: str
+    ) -> dict[str, Any]:
+        return await self._run(
+            self._reposition_card_draft, private_origin, ""
+        )
+
+    async def modify_card_field(
+        self, private_origin: str, field_reference: str
+    ) -> dict[str, Any]:
+        return await self._run(
+            self._reposition_card_draft,
+            private_origin,
+            field_reference,
+        )
+
+    def _reposition_card_draft(
+        self, private_origin: str, field_reference: str
+    ) -> dict[str, Any]:
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                row = connection.execute(
+                    """
+                    SELECT pt.*, d.id AS draft_id, d.fields_json,
+                           d.current_step, ic.world_snapshot_json
+                    FROM participants pt
+                    JOIN character_card_drafts d ON d.participant_id = pt.id
+                    JOIN instance_configs ic ON ic.session_id = pt.session_id
+                    JOIN sessions s ON s.id = pt.session_id
+                    WHERE pt.private_origin = ? AND d.status = 'active'
+                      AND s.state <> 'finished'
+                    ORDER BY d.updated_at DESC LIMIT 1
+                    """,
+                    (private_origin,),
+                ).fetchone()
+                if not row:
+                    raise DatabaseNotFoundError(
+                        "当前私聊没有进行中的角色卡"
+                    )
+                world = json_load(row["world_snapshot_json"], {})
+                template = card_template(world)
+                definitions = template["fields"]
+                fields = json_load(row["fields_json"], {})
+                fields = fields if isinstance(fields, dict) else {}
+                reference = str(field_reference or "").strip().casefold()
+                if reference:
+                    candidates = [
+                        (index, item)
+                        for index, item in enumerate(definitions)
+                        if reference
+                        in {
+                            str(item.get("key") or "").casefold(),
+                            str(item.get("label") or "").casefold(),
+                            str(item.get("label") or "")
+                            .removeprefix("选择")
+                            .split("（", 1)[0]
+                            .casefold(),
+                        }
+                    ]
+                    if len(candidates) != 1:
+                        raise ValueError(
+                            "未找到唯一字段，请使用字段名称或稳定 key"
+                        )
+                    target_step, definition = candidates[0]
+                else:
+                    current = min(
+                        max(0, int(row["current_step"])), len(definitions)
+                    )
+                    candidates = [
+                        (index, item)
+                        for index, item in enumerate(definitions[:current])
+                        if field_visible(item, fields)
+                    ]
+                    if not candidates:
+                        raise ValueError("已经是第一个建卡步骤")
+                    target_step, definition = candidates[-1]
+                if not field_visible(definition, fields):
+                    raise ValueError("该字段在当前角色选择下不需要填写")
+                field_key = str(definition.get("key") or "")
+                clear_field_and_dependents(template, fields, field_key)
+                if field_key == "profession":
+                    fields.pop("profession_base_stats", None)
+                    fields.pop("resolved_stat_total", None)
+                    for attribute in template.get("stats", {}).get(
+                        "attributes", []
+                    ):
+                        fields.pop(f"stat_{attribute.get('key')}", None)
+                    fields.pop("primary_attribute", None)
+                    fields.pop("secondary_attribute", None)
+                fields.pop(LAST_MESSAGE_KEY, None)
+                now = utc_now()
+                connection.execute(
+                    """
+                    UPDATE character_card_drafts
+                    SET fields_json = ?, current_step = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (json_dump(fields), target_step, now, row["draft_id"]),
+                )
+                self._insert_audit(
+                    connection,
+                    row["session_id"],
+                    row["private_user_id"],
+                    "card.step_reposition",
+                    row["id"],
+                    {"field": field_key, "step": target_step},
+                )
+                connection.execute("COMMIT")
+                return {
+                    "participant_id": row["id"],
+                    "session_id": row["session_id"],
+                    "fields": fields,
+                    "template": template,
+                    "current_step": target_step,
+                    "complete": False,
+                    "world": world,
+                }
+            except Exception:
+                connection.execute("ROLLBACK")
+                raise
+
     async def confirm_card_draft(
         self,
         private_origin: str,
@@ -1482,6 +1678,8 @@ class CharacterRepositoryMixin:
                 if not isinstance(fields, dict):
                     fields = {}
                 fields.pop("_alloc", None)
+                fields.pop("_wizard_pages", None)
+                fields.pop(LAST_MESSAGE_KEY, None)
                 for definition in template["fields"]:
                     key = str(definition["key"])
                     if key not in fields:
@@ -1498,7 +1696,9 @@ class CharacterRepositoryMixin:
                 missing = [
                     item["label"]
                     for item in template["fields"]
-                    if item["required"] and not str(
+                    if item["required"]
+                    and field_visible(item, fields)
+                    and not str(
                         fields.get(item["key"], "")
                     ).strip()
                 ]

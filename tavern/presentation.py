@@ -12,6 +12,7 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, StarTools
 
 from .config import TavernConfig
+from .card_wizard import paged_options
 from .constants import (
     PLAYER_ACTIONS,
     PLUGIN_NAME,
@@ -87,11 +88,11 @@ _INSTANCE_PAGE_PATTERNS = (
 
 
 HELP_TEXT = """\
-【AI 酒馆 v0.9.0｜多人跑团与独立存档】
+【AI 酒馆 v0.9.2｜多人跑团与独立存档】
 主持：/酒馆 开启 <副本> → /酒馆 开演
 恢复：/酒馆 暂停 → /酒馆 恢复 → 全员准备 → /酒馆 继续
 玩家：/酒馆 加入｜角色｜准备｜阵容｜暂离｜返回队列｜退出
-建卡：私聊 /酒馆 建卡 <验证码>｜重填数值｜建卡提醒 开/关
+建卡：私聊 /酒馆 建卡 <验证码>｜当前步骤｜上一步｜修改 <字段>｜重填数值
 回合：jg A｜/酒馆 选择 A｜/酒馆 重整选项
 裁定：/酒馆 灵感｜/酒馆 灵感 A 优势｜/酒馆 灵感重投 A
 集体：/酒馆 投票 A（不消耗个人行动）
@@ -534,6 +535,51 @@ def _format_profession_step_prompt(
     )
 
 
+def _format_preset_step_prompt(
+    template: Mapping[str, Any],
+    values: Mapping[str, Any],
+    field: Mapping[str, Any],
+    step: int,
+    total_fields: int,
+) -> str:
+    page = paged_options(template, field, values)
+    if not page["options"]:
+        return ""
+    label = str(field.get("label") or field.get("key") or "预设")
+    lines = [
+        f"【角色卡 {step + 1}/{total_fields}｜{label}】",
+        f"预设选项 · 第 {page['page_number']}/{page['total_pages']} 页",
+        "",
+    ]
+    _, key_to_label = attribute_maps(template)
+    for index, option in enumerate(page["items"], start=1):
+        source = option.get("source")
+        source = source if isinstance(source, Mapping) else {}
+        lines.append(f"{index}. {option['label']}")
+        description = str(option.get("description") or "").strip()
+        if description:
+            lines.append(f"   {description}")
+        base = source.get("base_attributes") or source.get("attributes")
+        if isinstance(base, Mapping) and base:
+            stat_text = "｜".join(
+                f"{key_to_label.get(str(key), key)}{value}"
+                for key, value in base.items()
+            )
+            lines.append(f"   基础属性：{stat_text}")
+        limitation = str(source.get("limitations") or "").strip()
+        if limitation:
+            lines.append(f"   限制：{limitation}")
+    lines.extend(
+        [
+            "",
+            "回复本页序号、名称或稳定 ID 进行选择。",
+        ]
+    )
+    if page["total_pages"] > 1:
+        lines.append("发送“下一页”或“上一页”翻页，不会推进建卡步骤。")
+    return "\n".join(lines)
+
+
 def format_card_prompt(draft: Mapping[str, Any]) -> str:
     template = draft.get("template") or {}
     fields = template.get("fields") or []
@@ -603,8 +649,26 @@ def format_card_prompt(draft: Mapping[str, Any]) -> str:
         )
         return "\n".join(lines)
     field = fields[step]
-    if preset_mode:
+    if preset_mode and str(field.get("key") or "") in {
+        "primary_attribute",
+        "secondary_attribute",
+    }:
         preset_prompt = _format_profession_step_prompt(
+            template,
+            values,
+            field,
+            step,
+            len(fields),
+        )
+        if preset_prompt:
+            return preset_prompt
+    if (
+        str(field.get("type") or "") in {"select", "preset_select"}
+        or field.get("options")
+        or field.get("options_source")
+        or field.get("preset_source")
+    ):
+        preset_prompt = _format_preset_step_prompt(
             template,
             values,
             field,
@@ -660,21 +724,9 @@ def format_card_prompt(draft: Mapping[str, Any]) -> str:
             ]
         )
         return "\n".join(lines)
-    preset_prefix = ""
-    field_key = str(field.get("key") or "")
-    if world:
-        if step == 0:
-            brief = world_preset_brief(world)
-            if brief:
-                preset_prefix = brief + "\n\n"
-        elif field_key == "profession":
-            brief = world_preset_brief(world, focus="profession")
-            if brief:
-                preset_prefix = brief + "\n\n"
     required = "必填" if field.get("required") else "选填"
     return (
-        preset_prefix
-        + f"【角色卡 {step + 1}/{len(fields)}】"
+        f"【角色卡 {step + 1}/{len(fields)}】"
         f"{field.get('label')}（{required}，最多 {field.get('max_chars')} 字）\n"
         "字段内容不得包含空格、全角空格、换行或制表符。\n"
         "直接回复内容，或发送：/酒馆 填写 <内容>"

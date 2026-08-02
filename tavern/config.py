@@ -70,8 +70,8 @@ class TavernConfig:
         "人物姿态和可见文字有关的信息。不要猜测看不见的事实。"
     )
     max_images_per_turn: int = 4
-    temperature: float = 0.7
-    max_tokens: int = 1800
+    temperature: float = 0.5
+    max_tokens: int = 1400
     request_timeout_seconds: int = 120
     json_repair_attempts: int = 1
 
@@ -81,8 +81,8 @@ class TavernConfig:
     max_input_chars: int = 2000
     max_output_chars: int = 5000
     enforce_mobile_output: bool = False
-    recent_turns: int = 12
-    memory_limit: int = 10
+    recent_turns: int = 6
+    memory_limit: int = 6
     user_cooldown_seconds: float = 1.5
     auto_snapshot_interval: int = 5
     ooc_prefixes: tuple[str, ...] = ("【OOC】", "[OOC]", "OOC:")
@@ -172,10 +172,10 @@ class TavernConfig:
                 model.get("max_images_per_turn"), 4, 1, 8
             ),
             temperature=_bounded_float(
-                model.get("temperature"), 0.7, 0.0, 2.0
+                model.get("temperature"), 0.5, 0.0, 2.0
             ),
             max_tokens=_bounded_int(
-                model.get("max_tokens"), 1800, 256, 16000
+                model.get("max_tokens"), 1400, 256, 16000
             ),
             request_timeout_seconds=_bounded_int(
                 model.get("request_timeout_seconds"), 120, 15, 600
@@ -205,10 +205,10 @@ class TavernConfig:
                 runtime.get("enforce_mobile_output", True)
             ),
             recent_turns=_bounded_int(
-                runtime.get("recent_turns"), 12, 2, 50
+                runtime.get("recent_turns"), 6, 2, 50
             ),
             memory_limit=_bounded_int(
-                runtime.get("memory_limit"), 10, 0, 40
+                runtime.get("memory_limit"), 6, 0, 40
             ),
             user_cooldown_seconds=_bounded_float(
                 runtime.get("user_cooldown_seconds"), 1.5, 0.0, 60.0

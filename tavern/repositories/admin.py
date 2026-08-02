@@ -796,7 +796,7 @@ class AdminRepositoryMixin:
             raise ValueError("备份数据库版本无效") from exc
         if schema_version != DATABASE_SCHEMA_VERSION:
             raise ValueError(
-                f"v0.9.0 仅接受 Schema {DATABASE_SCHEMA_VERSION} 备份；"
+                f"v0.9.x 仅接受 Schema {DATABASE_SCHEMA_VERSION} 备份；"
                 f"当前为 Schema {schema_version}，不再执行旧数据迁移"
             )
         data = bundle.get("data")
