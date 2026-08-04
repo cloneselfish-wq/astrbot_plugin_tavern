@@ -2236,6 +2236,39 @@ class RuleRepositoryMixin:
                 for row in rows
             ]
 
+    async def revoke_operation_receipt(
+        self,
+        operation_id: str,
+    ) -> bool:
+        """0.11.3：作废一个已锁定的操作回执（如本轮未提交时的骰值）。
+
+        幂等：回执不存在时返回 False，不抛错。
+        """
+        return await self._run(
+            self._revoke_operation_receipt,
+            operation_id,
+        )
+
+    def _revoke_operation_receipt(
+        self,
+        operation_id: str,
+    ) -> bool:
+        operation_id = clean_text(operation_id, max_chars=240)
+        if not operation_id:
+            return False
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = connection.execute(
+                    "DELETE FROM operation_receipts WHERE operation_id = ?",
+                    (operation_id,),
+                )
+                connection.execute("COMMIT")
+                return cursor.rowcount > 0
+            except Exception:
+                connection.execute("ROLLBACK")
+                raise
+
     async def lock_check_result(
         self,
         operation_id: str,

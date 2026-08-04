@@ -939,31 +939,12 @@ class TavernEngine:
             # 0.11.2：全队行动选项 → 由引擎直接发起集体表决，
             # 不再依赖叙事模型自行生成 group_decision（模型未生成时
             # 旧逻辑会把整轮判为“未提交”，玩家陷入死胡同）。
-            await self.database.create_group_vote(
-                session_id,
-                group_decision={
-                    "question": (
-                        f"是否执行全队行动：{selected['text']}"
-                        + (f"\n补充说明：{flavor}" if flavor else "")
-                    ),
-                    "options": [
-                        {"key": "A", "text": "同意执行（推进）"},
-                        {"key": "B", "text": "暂缓，先处理当前局面"},
-                    ],
-                },
-                suspended_user_id=acting_user_id,
-                actor_id=sender_id,
-            )
-            return EngineReply(
-                text=(
-                    "🌐 【集体表决】已发起全员投票，等待全体成员表决。\n"
-                    f"表决事项：{selected['text']}\n\n"
-                    "💬 请全体成员发送：/酒馆 投票 A（同意执行）"
-                    "或 B（暂缓）。\n"
-                    "投票不消耗个人行动机会。"
-                ),
-                session=await self.database.get_session(session_id),
-                turn=await self.database.get_turn_status(session_id),
+            return await self._start_team_vote(
+                session_id=session_id,
+                participant=participant,
+                selected=selected,
+                sender_id=sender_id,
+                flavor=flavor,
             )
         content = f"选择 {key}：{selected['text']}"
         if flavor:
@@ -1045,22 +1026,165 @@ class TavernEngine:
             if not winning_text:
                 winning_text = winner_key
             vote_input = f"队伍已表决通过：{winning_text}"
+            # 0.11.4：全队行动若在投票时声明了检定（如 魔力 DC17），
+            # 表决通过后先执行该检定，再把结果作为权威输入生成落实叙事。
+            check_definition: dict[str, Any] | None = None
+            for option in (vote.get("options") or []):
+                if (
+                    isinstance(option, Mapping)
+                    and isinstance(option.get("check"), Mapping)
+                ):
+                    check_definition = dict(option["check"])
+                    break
+            vote_check: CheckRequest | None = None
+            vote_dice: DiceResult | None = None
+            if check_definition:
+                vote_check = self._check_request_from_payload(
+                    check_definition
+                )
+                acting_user_id = str(
+                    vote.get("suspended_user_id") or ""
+                )
+                check_type = str(
+                    vote_check.check_type or "standard"
+                ).lower()
+                if check_type in {"group", "resistance"}:
+                    actors: list[dict[str, Any]] = []
+                    for member in roster:
+                        if (
+                            member.get("participation_status") != "active"
+                            or member.get("card_status") != "approved"
+                        ):
+                            continue
+                        member_user_id = str(
+                            member.get("group_user_id") or ""
+                        )
+                        member_modifier = (
+                            await self.database.authoritative_modifier(
+                                session_id,
+                                member_user_id,
+                                vote_check.stat,
+                            )
+                        )
+                        member_context = (
+                            await self.database.check_context(
+                                session_id,
+                                member_user_id,
+                                str(member_modifier["stat"]),
+                                proposed_advantages=(
+                                    vote_check.advantage_sources
+                                ),
+                                proposed_disadvantages=(
+                                    vote_check.disadvantage_sources
+                                ),
+                            )
+                        )
+                        actors.append(
+                            {
+                                "actor_id": member["id"],
+                                "name": (
+                                    member.get("character_name")
+                                    or member.get("display_name")
+                                    or member_user_id
+                                ),
+                                "modifier": member_modifier["modifier"],
+                                "advantage_sources": member_context[
+                                    "advantages"
+                                ],
+                                "disadvantage_sources": member_context[
+                                    "disadvantages"
+                                ],
+                            }
+                        )
+                    if not actors:
+                        raise TavernEngineError(
+                            "集体检定没有有效参与角色"
+                        )
+                    vote_dice = await self._roll_with_registered_system(
+                        world, vote_check, actors=actors
+                    )
+                else:
+                    if not acting_user_id:
+                        raise TavernEngineError("表决检定缺少执行玩家")
+                    authoritative = (
+                        await self.database.authoritative_modifier(
+                            session_id,
+                            acting_user_id,
+                            vote_check.stat,
+                        )
+                    )
+                    if (
+                        not authoritative.get("matched")
+                        and world_contract(world)["resolution"]["mode"]
+                        == "attribute"
+                    ):
+                        raise TavernEngineError(
+                            f"检定属性“{vote_check.stat}”不属于当前"
+                            "世界或角色卡，表决检定无法执行"
+                        )
+                    await self.database.check_context(
+                        session_id,
+                        acting_user_id,
+                        str(authoritative["stat"]),
+                        proposed_advantages=(
+                            vote_check.advantage_sources
+                        ),
+                        proposed_disadvantages=(
+                            vote_check.disadvantage_sources
+                        ),
+                    )
+                    vote_dice = await self._roll_with_registered_system(
+                        world, vote_check
+                    )
+                # 检定凭证落库（幂等，可回放）
+                dice_op_id = operation_key(
+                    session_id,
+                    "dice",
+                    turn_no=int(session.get("turn_no") or 0) + 1,
+                    actor_id=acting_user_id,
+                    source_id=str(vote.get("id") or ""),
+                    payload={
+                        "selected_key": "team",
+                        "stat": str(vote_check.stat or "").casefold(),
+                        "check_type": str(
+                            vote_check.check_type or ""
+                        ).casefold(),
+                    },
+                )
+                await self.database.lock_check_result(
+                    dice_op_id,
+                    session_id,
+                    asdict(vote_check),
+                    asdict(vote_dice),
+                )
             providers = await self._story_providers(event, config)
             system = system_prompt(
                 world,
                 allow_check=False,
                 capability_projection=[],
             )
-            prompt = planning_prompt(
-                world=world,
-                session=session,
-                player={},
-                player_input=vote_input,
-                events=events,
-                memories=memories,
-                allow_checks=False,
-                workflow={},
-            )
+            if vote_check is not None and vote_dice is not None:
+                prompt = checked_resolution_prompt(
+                    world=world,
+                    session=session,
+                    player={},
+                    player_input=vote_input,
+                    events=events,
+                    memories=memories,
+                    check=asdict(vote_check),
+                    dice=asdict(vote_dice),
+                )
+            else:
+                prompt = planning_prompt(
+                    world=world,
+                    session=session,
+                    player={},
+                    player_input=vote_input,
+                    events=events,
+                    memories=memories,
+                    allow_checks=False,
+                    workflow={},
+                )
             resolution, used_provider_id = await self._generate_resolution(
                 session_id=session_id,
                 request_type="vote_resolution",
@@ -1125,6 +1249,12 @@ class TavernEngine:
             )
             story_body = self._format_story_paragraphs(narrative)
             story_output = f"🌐 【集体决定】\n\n{story_body}"
+            if vote_dice is not None and vote_check is not None:
+                dice_line = self._format_dice_result(
+                    vote_dice, vote_check.stat
+                )
+                if dice_line:
+                    story_output = f"{dice_line}\n\n{story_output}"
             next_turn = await self.database.get_turn_status(session_id)
             next_name = (
                 str(next_turn.get("current_name") or "")
@@ -1146,10 +1276,142 @@ class TavernEngine:
             return EngineReply(
                 text=f"{story_output}\n\n{turn_output}",
                 session=updated,
+                dice=vote_dice,
                 turn=next_turn,
                 story_text=story_output,
                 turn_text=turn_output,
             )
+
+    async def process_team_proposal(
+        self,
+        *,
+        event: Any,
+        session_id: str,
+        sender_id: str,
+        sender_name: str,
+        index: int = 0,
+    ) -> EngineReply:
+        """0.11.3：通过 jg 全队 / /酒馆 全队 便捷指令发起全队行动表决。
+
+        全队行动不再占用个人选项的 A—D 字母，玩家用独立指令选择；
+        本方法与 process_choice 的 collective 分支共用同一发起逻辑。
+        """
+        choice_set = await self.database.active_choice_set(session_id)
+        if not choice_set:
+            raise TavernEngineError("当前没有可选择的行动选项")
+        participant = choice_set.get("participant")
+        if not participant:
+            raise TavernEngineError("当前选项没有有效的行动角色")
+        team_choices = [
+            item
+            for item in choice_set["choices"]
+            if bool(item.get("collective"))
+        ]
+        if not team_choices:
+            raise TavernEngineError("当前没有全队行动候选项")
+        if index < 0 or index >= len(team_choices):
+            raise TavernEngineError(
+                f"全队行动编号无效，当前有 {len(team_choices)} 项"
+            )
+        control = await self.database.authorize_participant_control(
+            session_id,
+            participant["id"],
+            sender_id,
+            "choose",
+        )
+        if not control["authorized"]:
+            owner = (
+                participant.get("character_name")
+                or participant.get("display_name")
+                or participant.get("group_user_id")
+            )
+            raise TavernTurnOrderError(
+                f"当前行动属于 {owner}，本条内容未记录。",
+                turn=await self.database.get_turn_status(session_id),
+            )
+        selected = team_choices[index]
+        return await self._start_team_vote(
+            session_id=session_id,
+            participant=participant,
+            selected=selected,
+            sender_id=sender_id,
+        )
+
+    async def _start_team_vote(
+        self,
+        *,
+        session_id: str,
+        participant: Mapping[str, Any],
+        selected: Mapping[str, Any],
+        sender_id: str,
+        flavor: str = "",
+    ) -> EngineReply:
+        """发起「全队行动」的集体表决，不经过模型、不消耗行动机会。"""
+        # 0.11.4：若该全队行动声明需要检定（如 魔力 DC17），把检定定义
+        # 随「同意执行」选项写入投票，表决通过后据此执行检定。
+        team_options: list[dict[str, Any]] = [
+            {"key": "A", "text": "同意执行（推进）"}
+        ]
+        if selected.get("requires_check") and isinstance(
+            selected.get("check"), Mapping
+        ):
+            chk = selected["check"]
+            team_options[0]["check"] = {
+                "stat": str(
+                    chk.get("attribute_label")
+                    or chk.get("attribute_id")
+                    or chk.get("stat")
+                    or "通用"
+                ),
+                "reason": str(
+                    chk.get("reason") or "全队行动存在不确定性"
+                ),
+                "difficulty": chk.get("difficulty") or 12,
+                "risk": str(selected.get("risk") or "controlled"),
+                "check_type": str(chk.get("type") or "standard"),
+                "advantage_sources": list(
+                    chk.get("advantage_sources") or []
+                ),
+                "disadvantage_sources": list(
+                    chk.get("disadvantage_sources") or []
+                ),
+                "known_consequences": str(
+                    chk.get("known_consequences") or ""
+                ),
+            }
+        team_options.append({"key": "B", "text": "暂缓，先处理当前局面"})
+        await self.database.create_group_vote(
+            session_id,
+            group_decision={
+                "question": (
+                    f"是否执行全队行动：{selected['text']}"
+                    + (f"\n补充说明：{flavor}" if flavor else "")
+                ),
+                "options": team_options,
+            },
+            suspended_user_id=str(participant["group_user_id"]),
+            actor_id=sender_id,
+        )
+        check_note = ""
+        if team_options[0].get("check"):
+            chk = team_options[0]["check"]
+            stat = str(chk.get("stat") or "通用")
+            dc = chk.get("difficulty")
+            check_note = (
+                f"\n⚠️ 表决通过后将执行检定：{stat}检定"
+                + (f" DC{dc}" if dc else "")
+            )
+        return EngineReply(
+            text=(
+                "🌐 【集体表决】已发起全员投票，等待全体成员表决。\n"
+                f"表决事项：{selected['text']}{check_note}\n\n"
+                "💬 请全体成员发送：/酒馆 投票 A（同意执行）"
+                "或 B（暂缓）。\n"
+                "投票不消耗个人行动机会。"
+            ),
+            session=await self.database.get_session(session_id),
+            turn=await self.database.get_turn_status(session_id),
+        )
 
     async def process_dm_beat(
         self,
@@ -1728,6 +1990,8 @@ class TavernEngine:
                 if resolution.check is None:
                     raise TavernEngineError("模型检定结构缺失")
                 check_request = resolution.check
+                # 0.11.3：记录骰值锁定键，用于“本轮未提交”时作废已锁骰值。
+                operation_id: str | None = None
                 selected_choice = (
                     dict(workflow.get("selected_choice") or {})
                     if workflow
@@ -2058,6 +2322,14 @@ class TavernEngine:
                     workflow.get("collective")
                     and not resolution.group_decision
                 ):
+                    # 0.11.3：本轮未提交 → 作废已锁骰值，避免重试复用旧骰。
+                    if operation_id:
+                        try:
+                            await self.database.revoke_operation_receipt(
+                                operation_id
+                            )
+                        except Exception:
+                            pass
                     raise TavernEngineError(
                         "该选项影响全队，但模型没有生成集体表决；"
                         "为避免单人越权，本轮没有提交"

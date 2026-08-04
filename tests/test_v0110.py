@@ -36,8 +36,8 @@ class V011ContractTests(unittest.TestCase):
     def test_release_versions_are_synchronized(self) -> None:
         metadata = yaml.safe_load((ROOT / "metadata.yaml").read_text(encoding="utf-8"))
         manifest = load_json("templates/template-manifest.json")
-        self.assertEqual(PLUGIN_VERSION, "0.11.2")
-        self.assertEqual(metadata["version"], "v0.11.2")
+        self.assertEqual(PLUGIN_VERSION, "0.11.4")
+        self.assertEqual(metadata["version"], "v0.11.4")
         self.assertEqual(DATABASE_SCHEMA_VERSION, 10)
         self.assertEqual(TEMPLATE_BUNDLE_VERSION, "3.0.0")
         self.assertEqual(CHARACTER_CARD_TEMPLATE_VERSION, 6)

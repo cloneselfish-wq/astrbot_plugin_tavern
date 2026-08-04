@@ -1,6 +1,6 @@
 {
   "template_bundle_version": "3.0.0",
-  "compatible_plugin_version": "0.11.2",
+  "compatible_plugin_version": "0.11.4",
   "world_schema_versions": [
     2,
     3,

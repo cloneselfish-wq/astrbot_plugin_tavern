@@ -237,7 +237,7 @@ def validate_world_contract(world: Mapping[str, Any]) -> dict[str, Any]:
     contract = world_contract(world)
     if contract["version"] not in SUPPORTED_WORLD_SCHEMA_VERSIONS:
         raise ValueError(
-            "v0.11.2 仅接受世界包协议 v2、v3、v4 或 v5；"
+            "v0.11.4 仅接受世界包协议 v2、v3、v4 或 v5；"
             f"当前为 v{contract['version']}"
         )
     stats = contract["stats"]

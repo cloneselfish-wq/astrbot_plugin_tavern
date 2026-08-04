@@ -4700,7 +4700,7 @@ $("#export-backup-button").addEventListener("click", async (event) => {
       await bridge.download(
         "backup/export",
         {},
-        "backup_tavern_v0.11.2.zip",
+        "backup_tavern_v0.11.4.zip",
       );
     });
     toast("备份已生成", "success");

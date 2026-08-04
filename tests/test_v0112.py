@@ -61,10 +61,12 @@ class V0112FormatTests(unittest.TestCase):
             ],
         )
         self.assertIn("🌐 【全队行动 · 需集体表决】", text)
-        self.assertIn("选择后将进入全员投票，不消耗个人行动机会", text)
-        # 全队行动选项仍保留，且独立于个人选项顺序之后
+        self.assertIn("发送 jg 全队 选择", text)
+        self.assertIn("不消耗个人行动机会", text)
+        # 个人选项在前；全队行动不再占用个人 A—D 字母（0.11.3）。
         self.assertLess(text.index("🅱️"), text.index("🌐"))
-        self.assertLess(text.index("🌐"), text.index("🅳️"))
+        self.assertNotIn("🅳️", text)
+        self.assertIn("🌐①", text)
 
     def test_personal_choices_still_rendered(self) -> None:
         text = format_choices("屏凡", [{"key": "A", "text": "检查", "risk": "safe"}])

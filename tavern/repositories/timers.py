@@ -1581,14 +1581,25 @@ class TimerRepositoryMixin:
                 str(item.get("key")) for item in vote["options"]
             ],
         )
+        # 0.11.3：超时结束时按实际票数判定——截止前已形成多数则通过，
+        # 并标记 pending_resolution 供下次输入自动推进叙事；
+        # 旧实现无条件判 rejected，多数票在截止前达成也会被否决。
+        winner = str(tally.get("winner") or "")
+        passed = bool(winner)
+        status = "passed" if passed else "rejected"
+        result_payload: dict[str, Any] = {**tally, "reason": "timeout"}
+        if passed:
+            result_payload["pending_resolution"] = True
         connection.execute(
             """
             UPDATE group_votes SET
-                status = 'rejected', result_json = ?, updated_at = ?
+                status = ?, winner_key = ?, result_json = ?, updated_at = ?
             WHERE id = ?
             """,
             (
-                json_dump({**tally, "reason": "timeout"}),
+                status,
+                winner,
+                json_dump(result_payload),
                 now,
                 vote_id,
             ),
@@ -1606,6 +1617,6 @@ class TimerRepositoryMixin:
         self._apply_return_vote_result(
             connection,
             vote_id=vote_id,
-            passed=False,
+            passed=passed,
             now=now,
         )

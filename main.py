@@ -90,7 +90,7 @@ _INSTANCE_PAGE_PATTERNS = (
 
 
 HELP_TEXT = """\
-【AI 酒馆 v0.11.2｜多人叙事、真人 DM 与世界协议 v5】
+【AI 酒馆 v0.11.4｜多人叙事、真人 DM 与世界协议 v5】
 主持：/酒馆 开启 <副本> → /酒馆 开演
 恢复：/酒馆 暂停 → /酒馆 恢复 → 全员准备 → /酒馆 继续
 玩家：/酒馆 加入｜角色｜准备｜阵容｜暂离｜返回队列｜退出
@@ -130,6 +130,15 @@ from .tavern.presentation import (
     _format_remaining_time,
     _story_reply_parts,
 )
+
+
+def _team_index_from_argument(argument: str) -> int:
+    """0.11.3：解析「全队 2」/「全队」→ 全队行动候选项下标（0 基）。"""
+    text = str(argument or "").strip()
+    if text.isdigit():
+        value = int(text)
+        return max(0, value - 1) if value >= 1 else 0
+    return 0
 
 
 class TavernPlugin(Star):
@@ -1054,6 +1063,14 @@ class TavernPlugin(Star):
         if response:
             yield await self._rich_result(event, response)
 
+    @tavern.command("全队", alias={"全队行动", "提议全队"}, priority=200)
+    async def tavern_team(self, event: AstrMessageEvent):
+        """0.11.3：发起「全队行动」集体表决（不占用个人行动机会）。"""
+
+        response = await self._run_native_command(event, "team")
+        if response:
+            yield await self._rich_result(event, response)
+
     @tavern.command("倒计时", priority=200)
     async def tavern_countdown(self, event: AstrMessageEvent):
         """查询、总开关或逐类开关副本倒计时。"""
@@ -1521,6 +1538,35 @@ class TavernPlugin(Star):
             return
 
         try:
+            # 0.11.3：定时器结束的表决（已通过但尚未落实叙事）自动推进。
+            pending_vote = await self.database.pending_vote_resolution(
+                session["id"]
+            )
+            if pending_vote:
+                try:
+                    reply = await self.engine.process_vote_resolution(
+                        event=event,
+                        session_id=session["id"],
+                        vote=pending_vote,
+                    )
+                    await self.database.clear_vote_resolution_pending(
+                        pending_vote["id"]
+                    )
+                    parts = [
+                        part
+                        for part in (reply.story_text, reply.turn_text)
+                        if part
+                    ]
+                    body = "\n\n".join(parts) if parts else reply.text
+                    yield await self._rich_result(
+                        event, f"🌐 【表决通过 · 自动推进】\n{body}"
+                    )
+                except (TavernEngineError, ValueError) as exc:
+                    yield await self._rich_result(
+                        event,
+                        f"🌐 【表决通过】故事推进暂未完成：{exc}",
+                    )
+                return
             control = await self.database.get_control_state(session["id"])
             if control.get("mode") == "dm" and control.get("phase") != "player_handoff":
                 if sender_id != str(control.get("active_dm_user_id") or ""):
@@ -1548,6 +1594,35 @@ class TavernPlugin(Star):
                     "【集体投票进行中】请使用 /酒馆 投票 A；"
                     "投票不会消耗个人行动机会。",
                 )
+                return
+            # 0.11.3：jg 全队 / 提议全队 —— 便捷发起全队行动表决。
+            team_text = content.strip()
+            team_words = ("全队", "提议全队")
+            if any(
+                team_text == word or team_text.startswith(word + " ")
+                for word in team_words
+            ):
+                argument = (
+                    team_text.split(maxsplit=1)[1]
+                    if " " in team_text
+                    else ""
+                )
+                index = _team_index_from_argument(argument)
+                try:
+                    reply = await self.engine.process_team_proposal(
+                        event=event,
+                        session_id=session["id"],
+                        sender_id=sender_id,
+                        sender_name=str(
+                            event.get_sender_name() or sender_id
+                        ),
+                        index=index,
+                    )
+                    yield await self._rich_result(event, reply.text)
+                except TavernEngineError as exc:
+                    yield await self._rich_result(
+                        event, f"【酒馆】{exc}"
+                    )
                 return
             choice_key, flavor_text = parse_choice_input(content)
             reply = await self.engine.process_choice(
@@ -2491,6 +2566,20 @@ class TavernPlugin(Star):
                     result["choices"],
                     rerolls_left=max(0, 1 - int(result["reroll_count"])),
                 )
+            if command.action == "team":
+                # 0.11.3：/酒馆 全队 [编号] —— 发起全队行动集体表决。
+                index = _team_index_from_argument(command.argument)
+                try:
+                    reply = await self.engine.process_team_proposal(
+                        event=event,
+                        session_id=session["id"],
+                        sender_id=sender_id,
+                        sender_name=str(event.get_sender_name() or sender_id),
+                        index=index,
+                    )
+                except TavernEngineError as exc:
+                    return f"【酒馆】{exc}"
+                return reply.text
             if command.action == "vote":
                 key, _ = parse_choice_input(command.argument)
                 result = await self.database.cast_vote(
@@ -2560,7 +2649,7 @@ class TavernPlugin(Star):
                         )
                     return (
                         "【表决未通过】未形成有效多数，队伍维持现状。"
-                        "\n当前玩家重新获得一组个人选项。"
+                        "\n已为当前行动玩家重新生成一组个人选项。"
                     )
                 return (
                     f"【投票已记录】{counts}\n"

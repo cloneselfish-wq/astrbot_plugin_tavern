@@ -1691,6 +1691,73 @@ class WorkflowRepositoryMixin:
                 connection.execute("ROLLBACK")
                 raise
 
+    async def pending_vote_resolution(
+        self,
+        session_id: str,
+    ) -> dict[str, Any] | None:
+        """0.11.3：查询等待自动推进的表决。
+
+        定时器结束且已通过但尚未落实叙事的投票会被标记
+        result_json.pending_resolution=true，由下次输入自动推进。
+        """
+        return await self._run(
+            self._pending_vote_resolution,
+            session_id,
+        )
+
+    def _pending_vote_resolution(
+        self,
+        session_id: str,
+    ) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM group_votes
+                WHERE session_id = ? AND status = 'passed'
+                  AND result_json LIKE '%"pending_resolution":true%'
+                ORDER BY updated_at DESC LIMIT 1
+                """,
+                (session_id,),
+            ).fetchone()
+            return self._vote(row) if row else None
+
+    async def clear_vote_resolution_pending(
+        self,
+        vote_id: str,
+    ) -> None:
+        """清除「待推进」标记（表决已落实叙事）。"""
+        await self._run(
+            self._clear_vote_resolution_pending,
+            vote_id,
+        )
+
+    def _clear_vote_resolution_pending(
+        self,
+        vote_id: str,
+    ) -> None:
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                row = connection.execute(
+                    "SELECT result_json FROM group_votes WHERE id = ?",
+                    (vote_id,),
+                ).fetchone()
+                if row and row["result_json"]:
+                    data = json_load(row["result_json"], {})
+                    data.pop("pending_resolution", None)
+                    connection.execute(
+                        """
+                        UPDATE group_votes
+                        SET result_json = ?, updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (json_dump(data), utc_now(), vote_id),
+                    )
+                connection.execute("COMMIT")
+            except Exception:
+                connection.execute("ROLLBACK")
+                raise
+
     @staticmethod
     def _apply_return_vote_result(
         connection: sqlite3.Connection,

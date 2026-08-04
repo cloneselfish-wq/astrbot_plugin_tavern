@@ -1,5 +1,47 @@
 # Changelog
 
+## v0.11.4 — 2026-08-04
+
+### 更新摘要
+
+- **修复「全队行动 + 检定」跳过检定环节**（0.11.2 引入的回归）：全队行动选项若同时声明检定（如「魔力 DC17」），此前发起投票时不携带检定定义、表决通过后强制无检定推进（`allow_checks=False` + 拒绝模型输出 check），导致检定环节被结构性丢失。现在：
+  - 发起全队行动表决时，把选项声明的检定定义随「同意执行」选项写入投票，并在投票消息中标注「表决通过后将执行检定：魔力检定 DC17」；
+  - 表决通过后先执行该检定（按声明属性/类型/DC，leader/group 类型按类型结算，检定凭证幂等落库），再以权威检定结果生成落实叙事，骰面随回复展示；
+  - 无检定的全队行动保持直接推进（不产生骰值）。
+- 选项校验放行：确认「collective + requires_check」组合合法（不降级、不冲突）。
+- 版本号、README、模板清单、前端缓存指纹与回归测试同步至 v0.11.4。
+
+### 详细更新说明
+
+### 修复
+
+- `tavern/engine.py`：`_start_team_vote` 把 `selected.check` 转换为投票选项的 `check` 定义（stat/type/DC/优劣势/后果）并标注检定提示；`process_vote_resolution` 读取投票携带的检定，表决通过后先执行检定（单玩家或全员，按 check_type），用 `checked_resolution_prompt` 生成落实叙事，骰面随 `story_output` 展示，`EngineReply.dice` 返回骰值；检定凭证以 `operation_key` 幂等落库。
+- `tavern/repositories/worlds.py`：`_normalize_vote_options` 透传「同意执行」选项上的 `check` 定义（投票持久化）。
+- 测试：新增 `tests/test_v0114.py` 回归用例（投票携带检定并标注 DC、表决通过后执行检定并落库凭证、无检定全队行动不掷骰）。
+
+## v0.11.3 — 2026-08-04
+
+### 更新摘要
+
+- **全队行动选项独立化**：collective 选项不再占用个人选项的 A—D 字母，改为「🌐 全队行动 · 需集体表决」区块内的 `🌐①/②` 编号展示；新增 `jg 全队`、`jg 提议全队`、`/酒馆 全队 [编号]` 便捷指令直接发起全员投票（不消耗个人行动机会）。个人选项与全队行动在视觉与操作上彻底分离，消除「字母归属混淆」。
+- **collective 输出校验**：每轮全队行动选项数量上限（`MAX_TEAM_CHOICES=2`），超过上限的标记自动降级为个人选项，防止模型误标导致玩家只能投票、无法直接行动（logs1 同形态缺陷的回归防护）。
+- **投票超时按实票判定**：定时器驱动的投票结束不再无条件判「否决」——截止前已形成多数则判「通过」，并标记 `pending_resolution`，由下一次输入自动推进叙事与新选项；修复「定时器结束的表决不推进」与命令路径行为不一致。
+- **本轮未提交作废骰值**：全队选项缺集体表决等「未提交」路径会作废已锁定的骰值回执，同检定重试不再幂等命中旧骰（未消费即允许重掷）；正常提交的幂等重放语义保留。
+- 表决未通过文案与实际行为对齐（未通过后为当前行动玩家生成新选项）。
+- 版本号、README、模板清单、前端缓存指纹与回归测试同步至 v0.11.3。
+
+### 详细更新说明
+
+### 修复
+
+- `tavern/lifecycle.py`：`format_choices` 全队区块无字母编号（🌐①/②）+ `jg 全队` 提示；`normalize_choices` 对 collective 数量上限与超限降级。
+- `tavern/engine.py`：新增 `process_team_proposal`（`jg 全队` 入口）与 `_start_team_vote`（`process_choice` 复用）；全队缺集体表决的「未提交」raise 前作废骰值回执。
+- `tavern/repositories/rules.py`：新增 `revoke_operation_receipt`（幂等作废操作回执）。
+- `tavern/repositories/timers.py`：`_expire_vote_timer` 超时按实票判定通过/否决，通过时写 `pending_resolution`；返场请求结果随实票。
+- `tavern/repositories/workflow.py`：新增 `pending_vote_resolution` / `clear_vote_resolution_pending`（待推进表决查询与清除）。
+- `main.py`：`jg 全队` / `jg 提议全队` 输入与 `/酒馆 全队` 命令；故事输入入口自动推进待处理表决；表决未通过文案对齐。
+- 测试：新增 `tests/test_v0113.py` 回归用例（collective 上限、全队无字母、超时实票判定、pending 推进、骰值作废幂等）；更新 `test_v0112.py` 中全队渲染断言。
+
 ## v0.11.2 — 2026-08-04
 
 ### 更新摘要

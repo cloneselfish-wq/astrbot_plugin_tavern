@@ -1606,7 +1606,12 @@ class WorldRepositoryMixin:
             if key not in CHOICE_KEYS or key in seen or not text:
                 continue
             seen.add(key)
-            result.append({"key": key, "text": text})
+            entry: dict[str, Any] = {"key": key, "text": text}
+            # 0.11.4：透传「同意执行」选项上声明的检定定义，
+            # 供表决通过后按该检定执行（如全队行动的 魔力 DC17）。
+            if isinstance(item.get("check"), Mapping):
+                entry["check"] = dict(item["check"])
+            result.append(entry)
         return result
 
     def _select_world_event(

@@ -1594,6 +1594,11 @@ def normalize_choices(value: Any, world: Mapping[str, Any] | None = None) -> lis
     if set(by_key)!=set(CHOICE_KEYS): raise ValueError("每回合必须提供 A、B、C、D 四个有效选项")
     result=[by_key[k] for k in CHOICE_KEYS]
     if not any(x["risk"]=="safe" for x in result): raise ValueError("每组选项至少需要一个安全风险选项")
+    # 0.11.3：collective 输出校验——每轮最多 MAX_TEAM_CHOICES 个全队行动，
+    # 超出的标记降级为个人选项（防止模型误标导致玩家只能投票、无法行动）。
+    collective_indexes = [i for i, item in enumerate(result) if item["collective"]]
+    for index in reversed(collective_indexes[MAX_TEAM_CHOICES:]):
+        result[index]["collective"] = False
     return result
 
 
@@ -1703,13 +1708,22 @@ _CHOICE_LETTER_EMOJI = {
     "F": "🅵️",
 }
 
+# 0.11.3：每轮最多允许的全队行动（collective）选项数量。
+# 超过上限的 collective 标记会被规范化为个人选项，防止模型误标
+# 导致玩家只能投票、无法直接行动。
+MAX_TEAM_CHOICES = 2
+
+# 全队行动候选的编号标识（不占用个人选项的 A—D 字母）。
+_TEAM_NUMBER_LABELS = ("①", "②", "③", "④")
+
 
 def format_choices(character_name: str, choices: Sequence[Mapping[str, Any]], *, rerolls_left: int = 1) -> str:
     # 0.11.2：区分个人选项与「全队行动」（collective）选项。
-    # 旧实现把两者混在同一个行动回合里，玩家误把全队行动当个人选择。
+    # 0.11.3：全队行动不再占用个人选项的 A—D 字母，改以「全队①/②」
+    # 编号展示，并通过 jg 全队 指令进入表决。
     defaults={"safe":"安全","controlled":"可控","dangerous":"危险","desperate":"绝境","lethal":"致命"}
 
-    def append_choice(lines: list[str], item: Mapping[str, Any]) -> None:
+    def choice_annotations(item: Mapping[str, Any]) -> list[str]:
         annotations=[str(item.get("risk_label") or defaults.get(str(item.get("risk")),"可控"))]
         if item.get("requires_check"):
             label=str(item.get("check_label") or item.get("check_stat") or "").strip()
@@ -1718,21 +1732,26 @@ def format_choices(character_name: str, choices: Sequence[Mapping[str, Any]], *,
             check_text=(f'需“{label}”检定' if label else "需检定")
             if dc: check_text += f" DC{dc}"
             annotations.append(check_text)
-        key=str(item.get("key") or ""); letter=_CHOICE_LETTER_EMOJI.get(key.upper(),key)
-        lines.extend(["",f"{letter} {item.get('text')}（{' · '.join(annotations)}）"] )
+        return annotations
+
+    def append_choice(lines: list[str], item: Mapping[str, Any], letter: str) -> None:
+        annotations = choice_annotations(item)
+        lines.append(f"{letter} {item.get('text')}（{' · '.join(annotations)}）")
         if str(item.get("risk")) in {"dangerous","desperate","lethal"} and item.get("known_consequences"): lines.append(f"⚠️ 已知后果：{item.get('known_consequences')}")
 
     lines=[f"🎯 【{character_name}的行动回合】"]
     personal=[item for item in choices if not bool(item.get("collective"))]
     collective=[item for item in choices if bool(item.get("collective"))]
     for item in personal:
-        append_choice(lines, item)
+        key=str(item.get("key") or ""); letter=_CHOICE_LETTER_EMOJI.get(key.upper(),key)
+        append_choice(lines, item, letter)
     if collective:
         lines.append("")
         lines.append("🌐 【全队行动 · 需集体表决】")
-        lines.append("（选择后将进入全员投票，不消耗个人行动机会）")
-        for item in collective:
-            append_choice(lines, item)
+        lines.append("（发送 jg 全队 选择；不消耗个人行动机会）")
+        for index, item in enumerate(collective):
+            number = _TEAM_NUMBER_LABELS[index] if index < len(_TEAM_NUMBER_LABELS) else f"{index+1}"
+            append_choice(lines, item, f"🌐{number}")
     lines.extend(["","","💬 发送：jg A","📝 也可：/酒馆 选择 A 语气尽量温和",f"♻️ 本回合剩余重整次数：{max(0,rerolls_left)}"] )
     return "\n".join(lines)
 
