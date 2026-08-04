@@ -90,7 +90,7 @@ _INSTANCE_PAGE_PATTERNS = (
 
 
 HELP_TEXT = """\
-【AI 酒馆 v0.9.3｜多人跑团与独立存档】
+【AI 酒馆 v0.11.2｜多人叙事、真人 DM 与世界协议 v5】
 主持：/酒馆 开启 <副本> → /酒馆 开演
 恢复：/酒馆 暂停 → /酒馆 恢复 → 全员准备 → /酒馆 继续
 玩家：/酒馆 加入｜角色｜准备｜阵容｜暂离｜返回队列｜退出
@@ -100,6 +100,7 @@ HELP_TEXT = """\
 集体：/酒馆 投票 A（不消耗个人行动）
 记录：/酒馆 回顾｜存档列表｜存档 <名称>｜删档 <名称>｜读档｜回滚
 管理：审核｜强制全员准备｜强制下一位｜倒计时｜用量｜限额｜移至｜指定
+主持：/酒馆 主持 开启｜指引｜推进｜直述｜交棒｜自动｜状态｜接管
 帮助：/酒馆 帮助 建卡｜回合｜投票｜回顾｜管理
 安全：任一出场玩家可发送 /酒馆 安全暂停
 结束：/酒馆 关闭｜/酒馆 完结 确认｜/酒馆 强制终止 确认 <原因>
@@ -529,6 +530,14 @@ class TavernPlugin(Star):
                     sender_id,
                     origin,
                 )
+                if bound.get("binding_code_reissued"):
+                    return (
+                        "【建卡码已过期，系统已自动补发】\n"
+                        f"新建卡码：{bound['binding_code']}\n"
+                        f"有效期至：{bound.get('binding_expires_at')}\n\n"
+                        "请重新发送：\n"
+                        f"/酒馆 建卡 {bound['binding_code']}"
+                    )
                 return "【私聊身份绑定成功】\n" + format_card_prompt(bound)
             if command.matched and command.action == "card_preview":
                 preview = await self.database.preview_card_draft(origin)
@@ -782,6 +791,14 @@ class TavernPlugin(Star):
         """查看当前酒馆会话状态。"""
 
         response = await self._run_native_command(event, "status")
+        if response:
+            yield await self._rich_result(event, response)
+
+    @tavern.command("主持", priority=200)
+    async def tavern_dm(self, event: AstrMessageEvent):
+        """切换真人 DM、推进叙事、交棒或恢复自动模式。"""
+
+        response = await self._run_native_command(event, "dm")
         if response:
             yield await self._rich_result(event, response)
 
@@ -1504,6 +1521,26 @@ class TavernPlugin(Star):
             return
 
         try:
+            control = await self.database.get_control_state(session["id"])
+            if control.get("mode") == "dm" and control.get("phase") != "player_handoff":
+                if sender_id != str(control.get("active_dm_user_id") or ""):
+                    yield await self._rich_result(
+                        event,
+                        "【主持人模式】当前剧情由活动 DM 接管；普通玩家输入暂不记录。",
+                    )
+                    return
+                result = await self.engine.process_dm_beat(
+                    event=event,
+                    session_id=session["id"],
+                    dm_user_id=sender_id,
+                    instruction=content,
+                    progress=lambda text: self._send_event_text(event, text),
+                )
+                yield await self._rich_result(
+                    event,
+                    f"【主持推进 · 第 {result['beat_no']} 段】\n{result['narrative']}",
+                )
+                return
             vote = await self.database.active_vote(session["id"])
             if vote:
                 yield await self._rich_result(
@@ -1522,6 +1559,9 @@ class TavernPlugin(Star):
                 flavor_text=flavor_text,
                 progress=lambda text: self._send_event_text(event, text),
             )
+            if control.get("mode") == "dm" and control.get("phase") == "player_handoff":
+                await self.database.finish_dm_handoff(session["id"])
+                reply.turn_text = "【本次交棒行动已完成】已回到等待 DM 主持状态。"
             reply_parts: list[str] = []
             if reply.story_text:
                 reply_parts.append(reply.story_text)
@@ -1601,6 +1641,15 @@ class TavernPlugin(Star):
         )
         is_host = is_admin or "host" in roles
         is_moderator = is_host or "moderator" in roles
+        control_state = (
+            await self.database.get_control_state(session["id"])
+            if session
+            else {"mode": "auto", "active_dm_user_id": ""}
+        )
+        is_active_dm = bool(
+            control_state.get("mode") == "dm"
+            and str(control_state.get("active_dm_user_id") or "") == sender_id
+        )
         host_actions = {
             "start",
             "perform",
@@ -1624,6 +1673,7 @@ class TavernPlugin(Star):
             "delete_session",
             "instances",
             "worlds",
+            "dm",
         }
         moderator_actions = {
             "next",
@@ -1643,7 +1693,7 @@ class TavernPlugin(Star):
             )
         )
         privileged_action = (
-            command.action in host_actions and is_host
+            command.action in host_actions and (is_host or (command.action == "dm" and is_active_dm))
         ) or (
             command.action in moderator_actions and is_moderator
         )
@@ -1730,6 +1780,7 @@ class TavernPlugin(Star):
                 # 角色卡建立
                 "card", "card_fill", "card_preview", "card_stats_reset",
                 "card_timer_notice", "card_confirm", "card_cancel",
+                "dm",
             }
             if command.action in paused_blocked_actions:
                 return (
@@ -1964,6 +2015,13 @@ class TavernPlugin(Star):
                         else "无活动流程"
                     )
                 )
+                control = await self.database.get_control_state(session["id"])
+                control_text = (
+                    f"DM 主持 · {control.get('active_dm_user_id') or '未指定'}"
+                    f" · 第 {control.get('beat_no', 0)} 段"
+                    if control.get("mode") == "dm"
+                    else "AI 自动"
+                )
                 return (
                     "【酒馆状态】\n"
                     f"状态：{session['state']}\n"
@@ -1974,6 +2032,7 @@ class TavernPlugin(Star):
                     f"多人轮次：第 {turn['round_no']} 轮\n"
                     f"当前行动者：{current}\n"
                     f"流程：{workflow}\n"
+                    f"控制模式：{control_text}\n"
                     f"角色数：{len(roster)}\n"
                     f"章节：{progress.get('chapter') or '未记录'}\n"
                     f"当前目标："
@@ -1986,6 +2045,128 @@ class TavernPlugin(Star):
             if not session:
                 return "【酒馆】本群尚未创建会话，请先使用 /酒馆 开启。"
 
+            if command.action == "dm":
+                raw = str(command.argument or "").strip()
+                sub, _, value = raw.partition(" ")
+                sub = sub.strip()
+                value = value.strip()
+                if sub in {"", "状态"}:
+                    state = await self.database.get_control_state(session["id"])
+                    return (
+                        "【主持模式状态】\n"
+                        f"模式：{'DM 主持' if state['mode'] == 'dm' else 'AI 自动'}\n"
+                        f"活动 DM：{state.get('active_dm_user_id') or '无'}\n"
+                        f"阶段：{state.get('phase') or 'auto'}\n"
+                        f"连续推进：{state.get('beat_no', 0)} 段\n"
+                        f"一次性指引：{'已保存' if state.get('directive') else '无'}\n"
+                        f"当前交棒目标：{state.get('current_actor_ref') or '无'}"
+                    )
+                if sub == "开启":
+                    dm_id = value or sender_id
+                    if dm_id != sender_id and not is_admin:
+                        raise PermissionError("只有插件管理员可以指定其他活动 DM")
+                    state = await self.database.enable_dm_mode(
+                        session["id"], dm_id, sender_id
+                    )
+                    await self.broker.publish({
+                        "type": "dm_control", "hook": "dm_mode_enabled",
+                        "session_id": session["id"], "actor": dm_id,
+                    })
+                    return (
+                        "【已进入主持人模式】\n"
+                        f"当前活动 DM：{state['active_dm_user_id']}\n"
+                        "旧选项已失效，旧行动计时器已停止；玩家顺序保留。"
+                    )
+                if sub == "接管":
+                    if not is_admin:
+                        raise PermissionError("只有插件管理员可以强制接管 DM")
+                    state = await self.database.enable_dm_mode(
+                        session["id"], sender_id, sender_id
+                    )
+                    return f"【主持权已接管】当前活动 DM：{state['active_dm_user_id']}"
+                state = await self.database.get_control_state(session["id"])
+                if state.get("mode") != "dm":
+                    raise ValueError("当前未开启主持模式，请先发送 /酒馆 主持 开启")
+                if sender_id != str(state.get("active_dm_user_id") or "") and not is_admin:
+                    raise PermissionError("只有当前活动 DM 可以执行此操作")
+                if sub == "指引":
+                    state = await self.database.set_dm_directive(
+                        session["id"], value, sender_id
+                    )
+                    return "【一次性主持指引已保存】将在下一次 AI 推进成功后自动清除。"
+                if sub == "推进":
+                    result = await self.engine.process_dm_beat(
+                        event=event,
+                        session_id=session["id"],
+                        dm_user_id=sender_id,
+                        instruction=value,
+                        progress=lambda text: self._send_event_text(event, text),
+                    )
+                    return f"【主持推进 · 第 {result['beat_no']} 段】\n{result['narrative']}"
+                if sub == "直述":
+                    result = await self.database.commit_dm_beat(
+                        session_id=session["id"],
+                        expected_revision=int(session["revision"]),
+                        dm_user_id=sender_id,
+                        instruction=value,
+                        narrative=value,
+                        world_state=session["world_state"],
+                        direct=True,
+                    )
+                    return f"【主持直述 · 第 {result['beat_no']} 段】\n{result['narrative']}"
+                if sub == "交棒":
+                    if not value:
+                        raise ValueError("格式：/酒馆 主持 交棒 <角色名或 NPC:名称>")
+                    if value.upper().startswith("NPC:") or value.startswith("NPC："):
+                        npc_ref = value[4:].strip()
+                        npcs = await self.database.list_session_characters(
+                            session["id"], include_archived=False
+                        )
+                        npc = next((item for item in npcs if npc_ref in {
+                            str(item.get("id") or ""), str(item.get("name") or ""),
+                            *[str(alias) for alias in item.get("aliases", [])]
+                        }), None)
+                        if not npc:
+                            raise ValueError("没有找到该 NPC")
+                        await self.database.set_dm_handoff(
+                            session["id"], "npc", str(npc["id"]), sender_id
+                        )
+                        result = await self.engine.process_dm_beat(
+                            event=event, session_id=session["id"],
+                            dm_user_id=sender_id,
+                            instruction=f"让 NPC“{npc['name']}”依据其知识边界与当前状态行动一段；不替玩家行动。",
+                            progress=lambda text: self._send_event_text(event, text),
+                        )
+                        return f"【NPC 演出 · {npc['name']}】\n{result['narrative']}\n\n已回到等待 DM 状态。"
+                    target = await self.database.get_participant(
+                        session["id"], participant_ref=value
+                    )
+                    await self.database.set_dm_handoff(
+                        session["id"], "player", str(target["id"]), sender_id
+                    )
+                    turn = await self.database.designate_turn(
+                        session["id"], target["group_user_id"], sender_id
+                    )
+                    return "【已交棒，主持模式保持开启】\n" + format_turn_status(turn)
+                if sub == "自动":
+                    if not value:
+                        raise ValueError("格式：/酒馆 主持 自动 <玩家角色>")
+                    target = await self.database.get_participant(
+                        session["id"], participant_ref=value
+                    )
+                    turn = await self.database.designate_turn(
+                        session["id"], target["group_user_id"], sender_id
+                    )
+                    await self.database.disable_dm_mode(session["id"], sender_id)
+                    await self.broker.publish({
+                        "type": "dm_control", "hook": "dm_mode_disabled",
+                        "session_id": session["id"], "actor": sender_id,
+                    })
+                    return "【已恢复 AI 自动模式】\n" + format_turn_status(turn)
+                raise ValueError(
+                    "主持命令：开启、状态、指引、推进、直述、交棒、自动、接管"
+                )
+
             if command.action == "join":
                 result = await self.database.reserve_participant(
                     session["id"],
@@ -1993,8 +2174,13 @@ class TavernPlugin(Star):
                     str(event.get_sender_name() or sender_id),
                 )
                 if result.get("binding_code"):
+                    title = (
+                        "【建卡码已自动补发】"
+                        if result.get("binding_code_reissued")
+                        else "【席位已预留】"
+                    )
                     return (
-                        "【席位已预留】\n"
+                        f"{title}\n"
                         f"建卡码：{result['binding_code']}\n"
                         f"有效期至：{result.get('binding_expires_at')}\n\n"
                         "请私聊 Bot 发送：\n"
@@ -2326,9 +2512,51 @@ class TavernPlugin(Star):
                 if result["resolved"]:
                     vote = result["vote"]
                     if vote["status"] == "passed":
+                        # 0.11.2：表决通过后立即推进剧情并生成新选项。
+                        # 旧实现只发送确认文本，从不触发后续叙事（WebUI
+                        # 因只读展示数据库状态而“看似正常”）。
+                        await self.broker.publish(
+                            {
+                                "type": "vote",
+                                "action": "resolved",
+                                "session_id": session["id"],
+                                "status": "passed",
+                                "winner_key": vote["winner_key"],
+                            }
+                        )
+                        try:
+                            reply = (
+                                await self.engine.process_vote_resolution(
+                                    event=event,
+                                    session_id=session["id"],
+                                    vote=vote,
+                                )
+                            )
+                        except (TavernEngineError, ValueError) as exc:
+                            await self.database.write_audit(
+                                session["id"],
+                                sender_id,
+                                "vote.resolution_failed",
+                                "",
+                                {"error": str(exc)[:500]},
+                            )
+                            logger.warning(
+                                "AI 酒馆表决推进失败：%s", exc
+                            )
+                            return (
+                                f"【表决通过】多数选择 {vote['winner_key']}。"
+                                "\n故事推进暂未完成："
+                                f"{exc}\n可发送 /酒馆 状态 查看当前局面。"
+                            )
+                        parts = [
+                            part
+                            for part in (reply.story_text, reply.turn_text)
+                            if part
+                        ]
+                        body = "\n\n".join(parts) if parts else reply.text
                         return (
-                            f"【表决通过】多数选择 {vote['winner_key']}。"
-                            "\n当前玩家的个人行动机会没有被消耗。"
+                            f"【表决通过】多数选择 {vote['winner_key']}。\n"
+                            f"{body}"
                         )
                     return (
                         "【表决未通过】未形成有效多数，队伍维持现状。"
@@ -2822,6 +3050,7 @@ class TavernPlugin(Star):
                     sender_id,
                     confirm_name,
                 )
+                await self.engine.release_session_lock(session["id"])
                 suffix = (
                     "\n副本文件已移入回收目录，可由服务器管理员恢复。"
                     if result.get("trash_path")
@@ -3024,6 +3253,7 @@ class TavernPlugin(Star):
                     SESSION_CLOSED,
                     sender_id,
                 )
+                await self.engine.release_session_lock(session["id"])
                 return "【酒馆已关闭】关闭期间不处理消息、不调用模型。"
             if command.action == "finish":
                 if command.argument not in {"确认", "CONFIRM", "confirm"}:
@@ -3037,6 +3267,7 @@ class TavernPlugin(Star):
                     termination_type="completed",
                     reason="正常完结",
                 )
+                await self.engine.release_session_lock(session["id"])
                 return (
                     "【故事已完结】已创建最终保护存档并永久归档。"
                     "\n角色、NPC、长期记忆、剧情账本、时间线和存档均只读保留；"
@@ -3060,6 +3291,7 @@ class TavernPlugin(Star):
                     termination_type="aborted",
                     reason=reason,
                 )
+                await self.engine.release_session_lock(session["id"])
                 return (
                     "【故事已强制终止】已保存最终保护存档并永久归档。"
                     f"\n终止原因：{reason}"

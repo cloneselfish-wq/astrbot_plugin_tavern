@@ -15,6 +15,7 @@ from .stat_generation import (
     validate_stat_generation_config,
 )
 from .world_contract import attribute_lookup, stats_mode, world_contract
+from .presets import dimension_fields, normalize_preset_dimensions
 
 
 CARD_UNCREATED = "uncreated"
@@ -458,6 +459,15 @@ def world_session_modules(world: Mapping[str, Any]) -> dict[str, Any]:
     content_boundaries = dict(DEFAULT_CONTENT_BOUNDARIES)
     if isinstance(rules.get("content_boundaries"), Mapping):
         content_boundaries.update(dict(rules["content_boundaries"]))
+    if isinstance(rules.get("content_boundary"), Mapping):
+        boundary = dict(rules["content_boundary"])
+        content_boundaries.update(boundary)
+        # Protocol v4 uses hard_denials; the runtime's older policy key is
+        # retained as a compatibility projection for all narrative paths.
+        if boundary.get("hard_denials"):
+            content_boundaries["hard_limits"] = list(
+                boundary.get("hard_denials") or []
+            )
     npc_policy = dict(DEFAULT_NPC_POLICY)
     if isinstance(rules.get("npc_policy"), Mapping):
         npc_policy.update(dict(rules["npc_policy"]))
@@ -621,10 +631,41 @@ def card_template(world: Mapping[str, Any]) -> dict[str, Any]:
                        else {}),
                     **({"must_differ_from": str(item.get("must_differ_from"))}
                        if item.get("must_differ_from") else {}),
+                    **({"min_choices": _bounded_int(
+                        item.get("min_choices"), 0, 0, 100
+                    )} if item.get("min_choices") is not None else {}),
+                    **({"max_choices": _bounded_int(
+                        item.get("max_choices"), 1, 1, 100
+                    )} if item.get("max_choices") is not None else {}),
+                    **({"display_order": _bounded_int(
+                        item.get("display_order"), 1000, -100000, 100000
+                    )} if item.get("display_order") is not None else {}),
                 }
             )
     if not fields:
         fields = [dict(item) for item in DEFAULT_CARD_FIELDS]
+    dimensions = normalize_preset_dimensions(raw)
+    if dimensions:
+        generated = dimension_fields(raw)
+        generated_by_key = {str(item["key"]): item for item in generated}
+        merged: list[dict[str, Any]] = []
+        consumed: set[str] = set()
+        for item in fields:
+            key = str(item.get("key") or "")
+            if key in generated_by_key:
+                merged.append({**item, **generated_by_key[key]})
+                consumed.add(key)
+            else:
+                merged.append(item)
+        pending = [item for item in generated if str(item["key"]) not in consumed]
+        if pending:
+            insert_at = next(
+                (index + 1 for index, item in enumerate(merged)
+                 if str(item.get("key") or "") == "code"),
+                0,
+            )
+            merged[insert_at:insert_at] = pending
+        fields = merged
     for field in fields:
         if str(field.get("key") or "") in {"name", "code"}:
             field["max_chars"] = min(
@@ -836,6 +877,9 @@ def card_template(world: Mapping[str, Any]) -> dict[str, Any]:
         "origin_region_presets": origin_region_presets,
         "social_identity_presets": social_identity_presets,
         "preset_sets": preset_sets,
+        "preset_dimensions": dimensions,
+        "knowledge_profiles": dict(raw.get("knowledge_profiles") or {}),
+        "content_profiles": dict(raw.get("content_profiles") or {}),
         "profession_mode": profession_mode,
     }
 
@@ -1661,9 +1705,11 @@ _CHOICE_LETTER_EMOJI = {
 
 
 def format_choices(character_name: str, choices: Sequence[Mapping[str, Any]], *, rerolls_left: int = 1) -> str:
-    lines=[f"🎯 【{character_name}的行动回合】"]
+    # 0.11.2：区分个人选项与「全队行动」（collective）选项。
+    # 旧实现把两者混在同一个行动回合里，玩家误把全队行动当个人选择。
     defaults={"safe":"安全","controlled":"可控","dangerous":"危险","desperate":"绝境","lethal":"致命"}
-    for item in choices:
+
+    def append_choice(lines: list[str], item: Mapping[str, Any]) -> None:
         annotations=[str(item.get("risk_label") or defaults.get(str(item.get("risk")),"可控"))]
         if item.get("requires_check"):
             label=str(item.get("check_label") or item.get("check_stat") or "").strip()
@@ -1675,6 +1721,18 @@ def format_choices(character_name: str, choices: Sequence[Mapping[str, Any]], *,
         key=str(item.get("key") or ""); letter=_CHOICE_LETTER_EMOJI.get(key.upper(),key)
         lines.extend(["",f"{letter} {item.get('text')}（{' · '.join(annotations)}）"] )
         if str(item.get("risk")) in {"dangerous","desperate","lethal"} and item.get("known_consequences"): lines.append(f"⚠️ 已知后果：{item.get('known_consequences')}")
+
+    lines=[f"🎯 【{character_name}的行动回合】"]
+    personal=[item for item in choices if not bool(item.get("collective"))]
+    collective=[item for item in choices if bool(item.get("collective"))]
+    for item in personal:
+        append_choice(lines, item)
+    if collective:
+        lines.append("")
+        lines.append("🌐 【全队行动 · 需集体表决】")
+        lines.append("（选择后将进入全员投票，不消耗个人行动机会）")
+        for item in collective:
+            append_choice(lines, item)
     lines.extend(["","","💬 发送：jg A","📝 也可：/酒馆 选择 A 语气尽量温和",f"♻️ 本回合剩余重整次数：{max(0,rerolls_left)}"] )
     return "\n".join(lines)
 

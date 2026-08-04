@@ -690,6 +690,9 @@ class StoryRepositoryMixin:
             "session_rule_states": (
                 "SELECT * FROM session_rule_states WHERE session_id = ?"
             ),
+            "dm_control_states": (
+                "SELECT * FROM dm_control_states WHERE session_id = ?"
+            ),
             "session_characters": (
                 "SELECT * FROM session_characters WHERE session_id = ?"
             ),
@@ -1110,6 +1113,7 @@ class StoryRepositoryMixin:
             "story_ledger",
             "session_characters",
             "session_rule_states",
+            "dm_control_states",
         ):
             if table == "vote_ballots":
                 connection.execute(
@@ -1234,6 +1238,12 @@ class StoryRepositoryMixin:
                 "context_budget_json", "dice_rules_json", "recovery_json",
                 "revision", "created_at", "updated_at",
             ),
+            "dm_control_states": (
+                "session_id", "mode", "active_dm_user_id", "phase",
+                "directive", "beat_no", "current_actor_type",
+                "current_actor_ref", "preserved_turn_json", "revision",
+                "created_at", "updated_at",
+            ),
             "session_characters": (
                 "id", "session_id", "stable_key", "name", "aliases_json",
                 "role_type", "public_profile_json", "known_facts_json",
@@ -1264,6 +1274,7 @@ class StoryRepositoryMixin:
         }
         insert_order = (
             "session_rule_states",
+            "dm_control_states",
             "participants",
             "character_card_drafts",
             "card_binding_codes",
@@ -1287,6 +1298,7 @@ class StoryRepositoryMixin:
             rows = data.get(table, [])
             if table in {
                 "session_rule_states",
+                "dm_control_states",
                 "session_characters",
                 "session_character_states",
                 "story_ledger",
@@ -1403,6 +1415,8 @@ class StoryRepositoryMixin:
         auto_snapshot_interval: int,
         store_model_payload: bool,
         workflow: Mapping[str, Any] | None = None,
+        operation_id: str = "",
+        operation_result: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         return await self._run(
             self._commit_turn_sync,
@@ -1421,6 +1435,8 @@ class StoryRepositoryMixin:
             auto_snapshot_interval,
             store_model_payload,
             dict(workflow or {}),
+            operation_id,
+            dict(operation_result or {}),
         )
 
     def _commit_turn_sync(
@@ -1440,6 +1456,8 @@ class StoryRepositoryMixin:
         auto_snapshot_interval: int,
         store_model_payload: bool,
         workflow: dict[str, Any],
+        operation_id: str = "",
+        operation_result: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -1807,6 +1825,43 @@ class StoryRepositoryMixin:
                     """,
                     (session_id,),
                 ).fetchone()
+                # 0.11.1：回合提交与事务回执完成合并进同一事务。
+                # 此前 commit_turn 成功后再单独 update_operation(completed)，
+                # 两者跨事务，崩溃/异常会把已提交回合永久留在 pending，
+                # 导致同一行动的后续重试被“该行动正在处理中”拦截。
+                if operation_id:
+                    op_row = connection.execute(
+                        "SELECT * FROM operation_receipts WHERE operation_id = ?",
+                        (operation_id,),
+                    ).fetchone()
+                    if op_row:
+                        merged = json_load(op_row["result_json"], {})
+                        merged = (
+                            merged if isinstance(merged, dict) else {}
+                        )
+                        merged.update(dict(operation_result or {}))
+                        merged["phase"] = "committed"
+                        connection.execute(
+                            """
+                            UPDATE operation_receipts
+                            SET result_json = ?, status = 'completed',
+                                updated_at = ?
+                            WHERE operation_id = ?
+                            """,
+                            (
+                                json_dump(merged),
+                                utc_now(),
+                                op_row["operation_id"],
+                            ),
+                        )
+                        self._insert_audit(
+                            connection,
+                            session_id,
+                            "system",
+                            "operation.update",
+                            op_row["operation_id"],
+                            {"status": "completed", "phase": "committed"},
+                        )
                 connection.execute("COMMIT")
                 result = self._session(row)
                 result["player_event_id"] = player_event_id
@@ -1917,4 +1972,3 @@ class StoryRepositoryMixin:
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
         }
-

@@ -852,6 +852,174 @@ class WorkflowRepositoryMixin:
             result["tally"] = tally
             return result
 
+    async def create_group_vote(
+        self,
+        session_id: str,
+        *,
+        group_decision: Mapping[str, Any],
+        suspended_user_id: str,
+        actor_id: str,
+    ) -> dict[str, Any]:
+        """0.11.2：为「全队行动」选项直接发起集体表决。
+
+        旧流程要求叙事模型在 resolve 里自行生成 group_decision，
+        模型未生成时整轮被拒（“该选项影响全队，但模型没有生成集体表决”）。
+        现在由引擎在选项被选中时调用本方法，立即进入全员投票。
+        """
+        return await self._run(
+            self._create_group_vote,
+            session_id,
+            dict(group_decision),
+            suspended_user_id,
+            actor_id,
+        )
+
+    def _create_group_vote(
+        self,
+        session_id: str,
+        group_decision: dict[str, Any],
+        suspended_user_id: str,
+        actor_id: str,
+    ) -> dict[str, Any]:
+        question = clean_text(
+            group_decision.get("question"),
+            max_chars=500,
+        )
+        options = self._normalize_vote_options(
+            group_decision.get("options")
+        )
+        if not question or len(options) < 2:
+            raise ValueError("集体表决需要问题与至少两个选项")
+        now = utc_now()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                session = connection.execute(
+                    "SELECT * FROM sessions WHERE id = ?",
+                    (session_id,),
+                ).fetchone()
+                if not session:
+                    raise DatabaseNotFoundError("会话不存在")
+                if session["state"] != SESSION_RUNNING:
+                    raise InvalidTransitionError("酒馆当前不在运行状态")
+                if connection.execute(
+                    """
+                    SELECT 1 FROM group_votes
+                    WHERE session_id = ? AND status = 'open'
+                    """,
+                    (session_id,),
+                ).fetchone():
+                    raise InvalidTransitionError("已有一场集体表决进行中")
+                suspended_user_id = validate_platform_id(
+                    suspended_user_id,
+                    label="行动玩家 ID",
+                )
+                eligible = [
+                    str(row["group_user_id"])
+                    for row in connection.execute(
+                        """
+                        SELECT group_user_id FROM participants
+                        WHERE session_id = ?
+                          AND participation_status = 'active'
+                          AND card_status = 'approved'
+                        GROUP BY group_user_id
+                        ORDER BY MIN(created_at)
+                        """,
+                        (session_id,),
+                    ).fetchall()
+                ]
+                config_row = connection.execute(
+                    """
+                    SELECT time_rules_json FROM instance_configs
+                    WHERE session_id = ?
+                    """,
+                    (session_id,),
+                ).fetchone()
+                time_rules = normalize_time_rules(
+                    json_load(
+                        config_row["time_rules_json"] if config_row else "",
+                        {},
+                    )
+                )
+                vote_id = new_id("vote")
+                event_id = new_id("event")
+                connection.execute(
+                    """
+                    INSERT INTO group_votes(
+                        id, session_id, source_event_id, question,
+                        options_json, eligible_user_ids_json, stage,
+                        status, suspended_user_id, deadline_at,
+                        result_json, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, 1, 'open', ?, ?, '{}', ?, ?)
+                    """,
+                    (
+                        vote_id,
+                        session_id,
+                        event_id,
+                        question,
+                        json_dump(options),
+                        json_dump(eligible),
+                        suspended_user_id,
+                        deadline_after(
+                            time_rules["vote_round_one_seconds"]
+                        ),
+                        now,
+                        now,
+                    ),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO events(
+                        id, session_id, turn_no, role, actor_id, actor_name,
+                        content, meta_json, created_at
+                    ) VALUES (?, ?, ?, 'system', 'vote', '集体表决', ?, ?, ?)
+                    """,
+                    (
+                        event_id,
+                        session_id,
+                        session["turn_no"],
+                        f"【集体表决】{question}",
+                        json_dump(
+                            {
+                                "kind": "group_vote",
+                                "vote_id": vote_id,
+                                "status": "open",
+                            }
+                        ),
+                        now,
+                    ),
+                )
+                self._create_timer(
+                    connection,
+                    session_id=session_id,
+                    participant_id="",
+                    timer_type="vote",
+                    timeout_seconds=time_rules[
+                        "vote_round_one_seconds"
+                    ],
+                    reminder_seconds=time_rules[
+                        "vote_reminder_seconds"
+                    ],
+                    action={"vote_id": vote_id, "stage": 1},
+                )
+                self._insert_audit(
+                    connection,
+                    session_id,
+                    actor_id,
+                    "vote.created",
+                    vote_id,
+                    {"question": question},
+                )
+                vote_row = connection.execute(
+                    "SELECT * FROM group_votes WHERE id = ?",
+                    (vote_id,),
+                ).fetchone()
+                connection.execute("COMMIT")
+                return self._vote(vote_row)
+            except Exception:
+                connection.execute("ROLLBACK")
+                raise
+
     async def cast_vote(
         self,
         session_id: str,
@@ -1206,13 +1374,23 @@ class WorkflowRepositoryMixin:
         ).fetchone()
         if not participant:
             return
-        if connection.execute(
+        # 0.11.2：投票已结束，作废残留的 active 选项集。
+        # 旧实现因残留选项存在而直接 return，导致表决通过后
+        # 既不生成新选项、旧选项又一直挂在 WebUI 上。
+        connection.execute(
             """
-            SELECT 1 FROM choice_sets
+            UPDATE choice_sets SET status = 'superseded'
             WHERE session_id = ? AND status = 'active'
             """,
             (session["id"],),
-        ).fetchone():
+        )
+        latest = connection.execute(
+            "SELECT status FROM group_votes WHERE id = ?",
+            (vote["id"],),
+        ).fetchone()
+        if latest and latest["status"] == "passed":
+            # 表决通过：新叙事与新选项由上层 process_vote_resolution 生成，
+            # 这里只恢复行动权（行动指针未动，保持由被挂起玩家继续）。
             return
         state = json_load(session["world_state_json"], {})
         choices = fallback_choices(state)
@@ -1260,6 +1438,258 @@ class WorkflowRepositoryMixin:
                 "user_id": user_id,
             },
         )
+
+    async def commit_vote_resolution(
+        self,
+        session_id: str,
+        *,
+        expected_revision: int,
+        narrative: str,
+        world_state: Mapping[str, Any],
+        memories: Sequence[Mapping[str, Any]] = (),
+        model_payload: Mapping[str, Any] | None = None,
+        workflow: Mapping[str, Any] | None = None,
+        vote_id: str = "",
+    ) -> dict[str, Any]:
+        """0.11.2：把「集体表决通过」的落实叙事落库，并生成下一组选项。
+
+        与 DM 推进类似：不移动玩家指针、不消耗个人行动机会；
+        表决结果作为已定事实推进剧情。
+        """
+        return await self._run(
+            self._commit_vote_resolution,
+            session_id,
+            expected_revision,
+            narrative,
+            dict(world_state),
+            [dict(item) for item in memories],
+            dict(model_payload or {}),
+            dict(workflow or {}),
+            vote_id,
+        )
+
+    def _commit_vote_resolution(
+        self,
+        session_id: str,
+        expected_revision: int,
+        narrative: str,
+        world_state: dict[str, Any],
+        memories: list[dict[str, Any]],
+        model_payload: dict[str, Any],
+        workflow: dict[str, Any],
+        vote_id: str,
+    ) -> dict[str, Any]:
+        narrative = clean_text(narrative, max_chars=12000)
+        if not narrative:
+            raise ValueError("表决落实叙事不能为空")
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                session = connection.execute(
+                    "SELECT * FROM sessions WHERE id = ?",
+                    (session_id,),
+                ).fetchone()
+                if not session:
+                    raise DatabaseNotFoundError("会话不存在")
+                if int(session["revision"]) != int(expected_revision):
+                    raise DatabaseConflictError("会话已被其他请求更新")
+                if session["state"] != SESSION_RUNNING:
+                    raise InvalidTransitionError("酒馆当前不在运行状态")
+                if vote_id:
+                    vote_row = connection.execute(
+                        "SELECT * FROM group_votes WHERE id = ?",
+                        (vote_id,),
+                    ).fetchone()
+                    if vote_row and vote_row["status"] == "open":
+                        raise InvalidTransitionError("集体投票尚未结束")
+                now = utc_now()
+                new_turn = int(session["turn_no"]) + 1
+                stored_state = json_load(session["world_state_json"], {})
+                turn = turn_state_from_world(stored_state)
+                persisted_state = embed_turn_state(
+                    public_world_state(world_state),
+                    turn,
+                )
+                event_id = new_id("event")
+                meta: dict[str, Any] = {
+                    "vote_resolution": True,
+                    "vote_id": vote_id,
+                }
+                if model_payload:
+                    meta["model_payload"] = model_payload
+                connection.execute(
+                    """
+                    INSERT INTO events(
+                        id, session_id, turn_no, role, actor_id, actor_name,
+                        content, meta_json, created_at
+                    ) VALUES (?, ?, ?, 'narrator', ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        event_id,
+                        session_id,
+                        new_turn,
+                        "system",
+                        "集体表决",
+                        narrative,
+                        json_dump(meta),
+                        now,
+                    ),
+                )
+                for memory in memories[:12]:
+                    content = clean_text(
+                        memory.get("content"),
+                        max_chars=1200,
+                    )
+                    if not content:
+                        continue
+                    scope = str(memory.get("scope") or "world")
+                    scope_id = str(memory.get("scope_id") or "")
+                    kind = str(memory.get("kind") or "fact")
+                    fingerprint = memory_fingerprint(
+                        session_id, scope, scope_id, kind, content
+                    )
+                    connection.execute(
+                        """
+                        INSERT INTO memories(
+                            id, session_id, scope, scope_id, kind, content,
+                            importance, salience, tags_json, fingerprint,
+                            source_event_id, created_at, updated_at,
+                            last_accessed_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(session_id, fingerprint) DO UPDATE SET
+                            importance = MAX(importance, excluded.importance),
+                            updated_at = excluded.updated_at,
+                            source_event_id = excluded.source_event_id
+                        """,
+                        (
+                            new_id("memory"),
+                            session_id,
+                            scope,
+                            scope_id,
+                            kind,
+                            content,
+                            max(1, min(5, int(memory.get("importance", 3)))),
+                            json_dump(list(memory.get("tags") or [])),
+                            fingerprint,
+                            event_id,
+                            now,
+                            now,
+                            now,
+                        ),
+                    )
+                connection.execute(
+                    """
+                    UPDATE sessions SET turn_no = ?, revision = revision + 1,
+                        world_state_json = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        new_turn,
+                        json_dump(persisted_state),
+                        now,
+                        session_id,
+                    ),
+                )
+                result: dict[str, Any] = {
+                    "session_id": session_id,
+                    "event_id": event_id,
+                    "turn_no": new_turn,
+                    "narrative": narrative,
+                }
+                next_choices = workflow.get("next_choices")
+                next_choice_set_id = ""
+                if next_choices:
+                    # choice_sets 为每会话单集（UNIQUE(session_id)），
+                    # 插入前必须先作废现有 active 集。
+                    connection.execute(
+                        """
+                        UPDATE choice_sets SET status = 'superseded'
+                        WHERE session_id = ? AND status = 'active'
+                        """,
+                        (session_id,),
+                    )
+                    try:
+                        normalized = normalize_choices(next_choices)
+                    except ValueError:
+                        normalized = fallback_choices(world_state)
+                    participant = connection.execute(
+                        """
+                        SELECT * FROM participants
+                        WHERE session_id = ?
+                          AND participation_status = 'active'
+                          AND card_status = 'approved'
+                        ORDER BY CASE WHEN group_user_id = ? THEN 0 ELSE 1 END,
+                                 created_at LIMIT 1
+                        """,
+                        (session_id, turn.get("current_user_id") or ""),
+                    ).fetchone()
+                    if participant:
+                        choice_id = new_id("choices")
+                        connection.execute(
+                            """
+                            INSERT INTO choice_sets(
+                                id, session_id, participant_id, round_no,
+                                session_revision, choices_json, status,
+                                reroll_count, idempotency_key, created_at,
+                                updated_at
+                            ) VALUES (?, ?, ?, ?, ?, ?, 'active', 0, ?, ?, ?)
+                            """,
+                            (
+                                choice_id,
+                                session_id,
+                                participant["id"],
+                                turn["round_no"],
+                                int(session["revision"]) + 1,
+                                json_dump(normalized),
+                                f"vote-resolution:{vote_id or '?'}",
+                                now,
+                                now,
+                            ),
+                        )
+                        config = connection.execute(
+                            """
+                            SELECT time_rules_json FROM instance_configs
+                            WHERE session_id = ?
+                            """,
+                            (session_id,),
+                        ).fetchone()
+                        rules = normalize_time_rules(
+                            json_load(
+                                config["time_rules_json"] if config else "",
+                                {},
+                            )
+                        )
+                        self._create_timer(
+                            connection,
+                            session_id=session_id,
+                            participant_id=participant["id"],
+                            timer_type="turn",
+                            timeout_seconds=rules["turn_timeout_seconds"],
+                            reminder_seconds=rules[
+                                "turn_reminder_seconds"
+                            ],
+                            action={
+                                "choice_set_id": choice_id,
+                                "user_id": participant[
+                                    "group_user_id"
+                                ],
+                            },
+                        )
+                        next_choice_set_id = choice_id
+                result["next_choice_set_id"] = next_choice_set_id
+                self._insert_audit(
+                    connection,
+                    session_id,
+                    "system",
+                    "vote.resolution_committed",
+                    event_id,
+                    {"vote_id": vote_id, "turn_no": new_turn},
+                )
+                connection.execute("COMMIT")
+                return result
+            except Exception:
+                connection.execute("ROLLBACK")
+                raise
 
     @staticmethod
     def _apply_return_vote_result(

@@ -4,11 +4,11 @@ import json
 from pathlib import Path
 
 PLUGIN_NAME = "astrbot_plugin_tavern"
-PLUGIN_VERSION = "0.9.3"
-DATABASE_SCHEMA_VERSION = 8
-TEMPLATE_BUNDLE_VERSION = "1.2.0"
-CHARACTER_CARD_TEMPLATE_VERSION = 4
-NPC_IMPORT_TEMPLATE_VERSION = 1
+PLUGIN_VERSION = "0.11.2"
+DATABASE_SCHEMA_VERSION = 10
+TEMPLATE_BUNDLE_VERSION = "3.0.0"
+CHARACTER_CARD_TEMPLATE_VERSION = 6
+NPC_IMPORT_TEMPLATE_VERSION = 2
 
 SESSION_CLOSED = "closed"
 SESSION_PREPARING = "preparing"
@@ -92,6 +92,7 @@ MANAGEMENT_ACTIONS = {
     "限额": "quota",
     "Token限额": "quota",
     "删除副本": "delete_session",
+    "主持": "dm",
     "帮助": "help",
 }
 
@@ -143,6 +144,7 @@ MUTATING_ACTIONS = {
     "countdown",
     "quota",
     "delete_session",
+    "dm",
 }
 
 PLAYER_ACTIONS = {

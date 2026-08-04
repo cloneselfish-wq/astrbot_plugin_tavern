@@ -26,6 +26,7 @@ from .constants import (
     SESSION_STATES,
 )
 from .card_lifecycle import validate_card_revision
+from .card_wizard import choose_options, store_preset_snapshots
 from .lifecycle import (
     CARD_APPROVED,
     CARD_DRAFT,
@@ -70,6 +71,7 @@ from .stat_generation import (
     uses_preset_stack_stats,
 )
 from .resolution import memory_fingerprint
+from .presets import resolve_character_presets, validate_preset_selection
 from .world_contract import validate_world_contract
 from .security import clean_text, validate_platform_id, validate_slug
 from .storage import (

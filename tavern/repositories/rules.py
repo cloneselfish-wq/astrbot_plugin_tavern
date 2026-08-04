@@ -1,9 +1,300 @@
 """Domain repository methods extracted from the SQLite store."""
 
 from ..database_support import *
+from ..resolution_receipts import content_hash
+from ..rule_runtime import RuleRuntime
 
 
 class RuleRepositoryMixin:
+    async def resolve_action_intent(
+        self,
+        session_id: str,
+        intent: Mapping[str, Any],
+        context: Mapping[str, Any] | None = None,
+        *,
+        dry_run: bool = True,
+        operation_id: str = "",
+        actor_id: str = "",
+    ) -> dict[str, Any]:
+        return await self._run(
+            self._resolve_action_intent,
+            session_id,
+            dict(intent),
+            dict(context or {}),
+            bool(dry_run),
+            operation_id,
+            actor_id,
+        )
+
+    def _resolve_action_intent(
+        self,
+        session_id: str,
+        intent: dict[str, Any],
+        context: dict[str, Any],
+        dry_run: bool,
+        operation_id: str,
+        actor_id: str,
+    ) -> dict[str, Any]:
+        operation_id = clean_text(operation_id, max_chars=240) or new_id("op")
+        request_hash = content_hash(
+            {"session_id": session_id, "intent": intent, "context": context}
+        )
+        with self._connect() as connection:
+            if not dry_run:
+                connection.execute("BEGIN IMMEDIATE")
+            try:
+                existing = connection.execute(
+                    "SELECT * FROM operation_commits WHERE operation_id=?",
+                    (operation_id,),
+                ).fetchone()
+                if existing:
+                    if existing["input_hash"] != request_hash:
+                        raise DatabaseConflictError("操作 ID 已被不同请求使用")
+                    result = json_load(existing["result_json"], {})
+                    if not dry_run:
+                        connection.execute("COMMIT")
+                    return result
+
+                row = connection.execute(
+                    """
+                    SELECT s.*, ic.world_snapshot_json, ic.world_revision
+                    FROM sessions s
+                    JOIN instance_configs ic ON ic.session_id=s.id
+                    WHERE s.id=?
+                    """,
+                    (session_id,),
+                ).fetchone()
+                if not row:
+                    raise DatabaseNotFoundError("副本不存在或没有冻结世界配置")
+                if not dry_run:
+                    self._assert_session_writable(connection, session_id)
+                world = json_load(row["world_snapshot_json"], {})
+                actor_ref = str(intent.get("actor_ref") or "")
+                capability_rows = connection.execute(
+                    """
+                    SELECT * FROM actor_capability_instances
+                    WHERE session_id=? AND actor_ref=? AND available=1
+                    ORDER BY created_at ASC
+                    """,
+                    (session_id, actor_ref),
+                ).fetchall()
+                participant_id = (
+                    actor_ref.split(":", 1)[1]
+                    if actor_ref.startswith("character:") else ""
+                )
+                actor_state_row = connection.execute(
+                    """
+                    SELECT * FROM character_runtime_states
+                    WHERE session_id=? AND participant_id=?
+                    """,
+                    (session_id, participant_id),
+                ).fetchone() if participant_id else None
+                actor_runtime_state = json_load(
+                    actor_state_row["state_json"] if actor_state_row else "{}", {}
+                )
+                actor_runtime_state = (
+                    dict(actor_runtime_state)
+                    if isinstance(actor_runtime_state, Mapping) else {}
+                )
+                actor_context = context.get("actor")
+                actor_context = dict(actor_context) if isinstance(actor_context, Mapping) else {}
+                runtime_refs = actor_runtime_state.get("refs", {})
+                runtime_refs = runtime_refs if isinstance(runtime_refs, Mapping) else {}
+                provided_refs = actor_context.get("refs", {})
+                provided_refs = provided_refs if isinstance(provided_refs, Mapping) else {}
+                actor_context["refs"] = {**runtime_refs, **provided_refs}
+                if "capabilities" not in actor_context:
+                    actor_context["capabilities"] = [
+                        {
+                            "instance_id": cap["id"],
+                            "capability_ref": cap["capability_ref"],
+                            "source_ref": cap["source_ref"],
+                            "available": bool(cap["available"]),
+                            **json_load(cap["state_json"], {}),
+                        }
+                        for cap in capability_rows
+                    ]
+                current_state = json_load(row["world_state_json"], {})
+                run_context = {
+                    **context,
+                    "actor": actor_context,
+                    "session": {
+                        "refs": {
+                            "custom:session_state": row["state"],
+                            "counter:turn": int(row["turn_no"]),
+                        }
+                    },
+                    "state": {
+                        "world": current_state,
+                        "actor": actor_runtime_state,
+                    },
+                }
+                snapshot = connection.execute(
+                    """
+                    SELECT id FROM world_snapshots
+                    WHERE world_id=? AND world_revision=?
+                    ORDER BY created_at DESC LIMIT 1
+                    """,
+                    (row["world_id"], int(row["world_revision"])),
+                ).fetchone()
+                snapshot_id = str(snapshot["id"] if snapshot else "")
+                runtime = RuleRuntime(world)
+                result = runtime.resolve_action_intent(
+                    intent, run_context, operation_id=operation_id,
+                    world_snapshot_id=snapshot_id, dry_run=dry_run,
+                )
+                if dry_run:
+                    return result
+
+                now = utc_now()
+                resolved_state = result["state"]
+                resolved_state = resolved_state if isinstance(resolved_state, Mapping) else {}
+                resolved_world_state = resolved_state.get("world", current_state)
+                resolved_actor_state = resolved_state.get("actor", actor_runtime_state)
+                connection.execute(
+                    """
+                    UPDATE sessions SET world_state_json=?, revision=revision+1,
+                        updated_at=? WHERE id=?
+                    """,
+                    (json_dump(resolved_world_state), now, session_id),
+                )
+                if actor_state_row:
+                    connection.execute(
+                        """
+                        UPDATE character_runtime_states
+                        SET state_json=?, revision=revision+1, updated_at=?
+                        WHERE id=?
+                        """,
+                        (json_dump(resolved_actor_state), now, actor_state_row["id"]),
+                    )
+                for operation in result.get("planned_operations", []):
+                    if not isinstance(operation, Mapping):
+                        continue
+                    op = str(operation.get("op") or "")
+                    target_ref = str(operation.get("target_ref") or "")
+                    if target_ref.startswith("capability:") and op == "grant_reference":
+                        connection.execute(
+                            """
+                            INSERT OR IGNORE INTO actor_capability_instances(
+                                id, session_id, actor_ref, capability_ref,
+                                definition_version, source_ref, state_json,
+                                persistence_scope, available, created_at, updated_at
+                            ) VALUES (?, ?, ?, ?, 1, ?, '{}', ?, 1, ?, ?)
+                            """,
+                            (
+                                new_id("capability_instance"), session_id, actor_ref,
+                                target_ref, str(operation.get("source_ref") or "rule"),
+                                str(operation.get("persistence_scope") or "campaign"), now, now,
+                            ),
+                        )
+                    elif target_ref.startswith("capability:") and op == "revoke_reference":
+                        connection.execute(
+                            """
+                            UPDATE actor_capability_instances SET available=0, updated_at=?
+                            WHERE session_id=? AND actor_ref=? AND capability_ref=?
+                            """,
+                            (now, session_id, actor_ref, target_ref),
+                        )
+                receipt = result["receipt"]
+                connection.execute(
+                    """
+                    INSERT INTO operation_commits(
+                        operation_id, session_id, input_hash, status,
+                        result_json, rollback_json, created_at, updated_at
+                    ) VALUES (?, ?, ?, 'completed', ?, ?, ?, ?)
+                    """,
+                    (
+                        operation_id, session_id, request_hash, json_dump(result),
+                        json_dump({
+                            "world_state": current_state,
+                            "actor_state": actor_runtime_state,
+                            "session_revision": int(row["revision"]),
+                        }),
+                        now, now,
+                    ),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO resolution_receipts(
+                        receipt_id, operation_id, session_id, world_snapshot_id,
+                        content_hash, receipt_json, public_projection_json, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        receipt["receipt_id"], operation_id, session_id, snapshot_id,
+                        receipt["content_hash"], json_dump(receipt),
+                        json_dump({"outcome_id": receipt["outcome_id"],
+                                   "narrative_projection": receipt["narrative_projection"]}), now,
+                    ),
+                )
+                self._insert_audit(
+                    connection, session_id, actor_id, "rules.action_commit",
+                    operation_id, {"receipt_id": receipt["receipt_id"]},
+                )
+                connection.execute("COMMIT")
+                return result
+            except Exception:
+                if not dry_run:
+                    connection.execute("ROLLBACK")
+                raise
+
+    async def get_resolution_receipt(
+        self, receipt_id: str, *, public_only: bool = False
+    ) -> dict[str, Any]:
+        return await self._run(
+            self._get_resolution_receipt, receipt_id, bool(public_only)
+        )
+
+    def _get_resolution_receipt(
+        self, receipt_id: str, public_only: bool
+    ) -> dict[str, Any]:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM resolution_receipts WHERE receipt_id=?",
+                (receipt_id,),
+            ).fetchone()
+            if not row:
+                raise DatabaseNotFoundError("裁定凭证不存在")
+            return json_load(
+                row["public_projection_json"] if public_only else row["receipt_json"], {}
+            )
+
+    async def list_actor_capabilities(
+        self, session_id: str, actor_ref: str, *, available_only: bool = True
+    ) -> list[dict[str, Any]]:
+        return await self._run(
+            self._list_actor_capabilities,
+            session_id,
+            actor_ref,
+            bool(available_only),
+        )
+
+    def _list_actor_capabilities(
+        self, session_id: str, actor_ref: str, available_only: bool
+    ) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM actor_capability_instances
+                WHERE session_id=? AND actor_ref=?
+                  AND (?=0 OR available=1)
+                ORDER BY created_at ASC, capability_ref ASC
+                """,
+                (session_id, actor_ref, int(available_only)),
+            ).fetchall()
+            return [
+                {
+                    "instance_id": row["id"],
+                    "capability_ref": row["capability_ref"],
+                    "definition_version": row["definition_version"],
+                    "source_ref": row["source_ref"],
+                    "state": json_load(row["state_json"], {}),
+                    "persistence_scope": row["persistence_scope"],
+                    "available": bool(row["available"]),
+                }
+                for row in rows
+            ]
+
     async def get_instance_config(
         self,
         session_id: str,

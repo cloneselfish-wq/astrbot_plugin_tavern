@@ -60,5 +60,5 @@ def build_runtime(
         web_console=web_console,
         hooks=hooks,
         extensions=extensions,
-        public_api=TavernPublicAPI(database, hooks, extensions),
+        public_api=TavernPublicAPI(database, hooks, extensions, engine),
     )

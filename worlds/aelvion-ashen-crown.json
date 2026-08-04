@@ -107,7 +107,7 @@
       "maximum": 4
     },
     "character_card": {
-      "version": 3,
+      "version": 6,
       "auto_approve": false,
       "edit_requires_review": true,
       "fields": [
@@ -344,24 +344,8 @@
           "type": "textarea"
         },
         {
-          "key": "knowledge_boundary",
-          "label": "知识边界",
-          "required": true,
-          "private": false,
-          "max_chars": 400,
-          "type": "textarea"
-        },
-        {
           "key": "secret",
           "label": "私人秘密",
-          "required": false,
-          "private": true,
-          "max_chars": 600,
-          "type": "textarea"
-        },
-        {
-          "key": "content_boundaries",
-          "label": "个人内容边界",
           "required": false,
           "private": true,
           "max_chars": 600,
@@ -1643,7 +1627,1215 @@
             "limitations": "不自动兼得双方语言、知识或政治身份。"
           }
         ]
-      }
+      },
+      "preset_dimensions": [
+        {
+          "id": "species",
+          "label": "种族",
+          "selection": {
+            "mode": "single",
+            "min": 1,
+            "max": 1
+          },
+          "required": true,
+          "allow_custom": false,
+          "randomizable": true,
+          "player_editable": true,
+          "display_order": 10,
+          "options": [
+            {
+              "id": "human",
+              "value": "人类",
+              "label": "人类",
+              "summary": "分布最广、文化多样，适合任何职业与出身。",
+              "limitations": "不会因种族自动获得额外属性或社会特权。",
+              "knowledge_profile_ref": "knowledge.species.human",
+              "content_profile_ref": "content.default_player"
+            },
+            {
+              "id": "elf",
+              "value": "精灵",
+              "label": "精灵",
+              "summary": "与古林和长寿文化联系紧密，常见于翡翠林海。",
+              "limitations": "不自动掌握自然术、古代知识或精灵高层关系。",
+              "knowledge_profile_ref": "knowledge.species.elf",
+              "content_profile_ref": "content.default_player"
+            },
+            {
+              "id": "dwarf",
+              "value": "矮人",
+              "label": "矮人",
+              "summary": "山地堡垒与工艺传统深厚，常见于灰脊山脉。",
+              "limitations": "不自动精通锻造、符文或地下遗迹。",
+              "knowledge_profile_ref": "knowledge.species.dwarf",
+              "content_profile_ref": "content.default_player"
+            },
+            {
+              "id": "halfling",
+              "value": "半身人",
+              "label": "半身人",
+              "summary": "聚居于商路、农庄与河谷城镇，以韧性和社群著称。",
+              "limitations": "体型与文化不会自动转化为检定优势。",
+              "knowledge_profile_ref": "knowledge.species.halfling",
+              "content_profile_ref": "content.default_player"
+            },
+            {
+              "id": "beastkin",
+              "value": "兽裔",
+              "label": "兽裔",
+              "summary": "拥有多种兽类外观特征，族群分散于大陆各地。",
+              "limitations": "外观特征不等于超自然感官或魔兽能力。",
+              "knowledge_profile_ref": "knowledge.species.beastkin",
+              "content_profile_ref": "content.default_player"
+            },
+            {
+              "id": "half_elf",
+              "value": "半精灵",
+              "label": "半精灵",
+              "summary": "成长于人类与精灵文化交界，身份经历通常更复杂。",
+              "limitations": "不自动兼得双方语言、知识或政治身份。",
+              "knowledge_profile_ref": "knowledge.species.half_elf",
+              "content_profile_ref": "content.default_player"
+            }
+          ]
+        },
+        {
+          "id": "profession",
+          "label": "职业",
+          "selection": {
+            "mode": "single",
+            "min": 1,
+            "max": 1
+          },
+          "required": true,
+          "allow_custom": false,
+          "randomizable": true,
+          "player_editable": true,
+          "display_order": 20,
+          "options": [
+            {
+              "name": "骑士",
+              "fixed_total": 50,
+              "attributes": {
+                "strength": 8,
+                "constitution": 8,
+                "dexterity": 5,
+                "perception": 4,
+                "intelligence": 3,
+                "willpower": 6,
+                "charisma": 6,
+                "mana": 1,
+                "faith": 5,
+                "survival": 4
+              },
+              "role": "重甲前排、护卫、阵线控制",
+              "ability_source": "骑士团训练、军用武器与盾牌",
+              "limitations": "远程与奥术薄弱，重甲影响潜行",
+              "base_total": 50,
+              "base_attributes": {
+                "strength": 8,
+                "constitution": 8,
+                "dexterity": 5,
+                "perception": 4,
+                "intelligence": 3,
+                "willpower": 6,
+                "charisma": 6,
+                "mana": 1,
+                "faith": 5,
+                "survival": 4
+              },
+              "bonus_rule": {
+                "primary_attribute_bonus": 7,
+                "secondary_attribute_bonus": 3,
+                "attributes_must_be_distinct": true,
+                "free_split_or_partial_allocation": false
+              },
+              "final_total": 60,
+              "effective_attribute_formula": "职业基础属性 + 主属性7点 + 副属性3点",
+              "selection_value": "骑士",
+              "display_at_profession_step": true,
+              "display_text": "骑士｜力量8｜体质8｜灵巧5｜感知4｜智力3｜意志6｜魅力6｜魔力1｜信仰5｜生存4｜基础总和50｜重甲前排、护卫、阵线控制",
+              "auto_apply_on_select": true,
+              "base_values_locked": true,
+              "manual_reentry_required": false,
+              "skip_manual_stat_questions": true,
+              "id": "knight",
+              "aliases": [],
+              "value": "骑士",
+              "label": "骑士",
+              "knowledge_profile_ref": "knowledge.profession.knight",
+              "content_profile_ref": "content.default_player",
+              "capability_grants": [
+                "capability:knight.signature"
+              ]
+            },
+            {
+              "name": "法师",
+              "fixed_total": 50,
+              "attributes": {
+                "strength": 2,
+                "constitution": 3,
+                "dexterity": 5,
+                "perception": 6,
+                "intelligence": 9,
+                "willpower": 7,
+                "charisma": 4,
+                "mana": 9,
+                "faith": 3,
+                "survival": 2
+              },
+              "role": "奥术输出、控制、仪式与知识",
+              "ability_source": "七塔教育、法器、法术书与星辉脉流",
+              "limitations": "体能脆弱，施法依赖专注、法术位与材料",
+              "base_total": 50,
+              "base_attributes": {
+                "strength": 2,
+                "constitution": 3,
+                "dexterity": 5,
+                "perception": 6,
+                "intelligence": 9,
+                "willpower": 7,
+                "charisma": 4,
+                "mana": 9,
+                "faith": 3,
+                "survival": 2
+              },
+              "bonus_rule": {
+                "primary_attribute_bonus": 7,
+                "secondary_attribute_bonus": 3,
+                "attributes_must_be_distinct": true,
+                "free_split_or_partial_allocation": false
+              },
+              "final_total": 60,
+              "effective_attribute_formula": "职业基础属性 + 主属性7点 + 副属性3点",
+              "selection_value": "法师",
+              "display_at_profession_step": true,
+              "display_text": "法师｜力量2｜体质3｜灵巧5｜感知6｜智力9｜意志7｜魅力4｜魔力9｜信仰3｜生存2｜基础总和50｜奥术输出、控制、仪式与知识",
+              "auto_apply_on_select": true,
+              "base_values_locked": true,
+              "manual_reentry_required": false,
+              "skip_manual_stat_questions": true,
+              "id": "mage",
+              "aliases": [],
+              "value": "法师",
+              "label": "法师",
+              "knowledge_profile_ref": "knowledge.profession.mage",
+              "content_profile_ref": "content.default_player",
+              "capability_grants": [
+                "capability:mage.signature"
+              ]
+            },
+            {
+              "name": "术士",
+              "fixed_total": 50,
+              "attributes": {
+                "strength": 3,
+                "constitution": 4,
+                "dexterity": 5,
+                "perception": 5,
+                "intelligence": 7,
+                "willpower": 8,
+                "charisma": 7,
+                "mana": 8,
+                "faith": 1,
+                "survival": 2
+              },
+              "role": "诅咒、异界力量、谈判与爆发",
+              "ability_source": "契约、血脉或禁忌媒介",
+              "limitations": "力量伴随债务、反噬或契约限制",
+              "base_total": 50,
+              "base_attributes": {
+                "strength": 3,
+                "constitution": 4,
+                "dexterity": 5,
+                "perception": 5,
+                "intelligence": 7,
+                "willpower": 8,
+                "charisma": 7,
+                "mana": 8,
+                "faith": 1,
+                "survival": 2
+              },
+              "bonus_rule": {
+                "primary_attribute_bonus": 7,
+                "secondary_attribute_bonus": 3,
+                "attributes_must_be_distinct": true,
+                "free_split_or_partial_allocation": false
+              },
+              "final_total": 60,
+              "effective_attribute_formula": "职业基础属性 + 主属性7点 + 副属性3点",
+              "selection_value": "术士",
+              "display_at_profession_step": true,
+              "display_text": "术士｜力量3｜体质4｜灵巧5｜感知5｜智力7｜意志8｜魅力7｜魔力8｜信仰1｜生存2｜基础总和50｜诅咒、异界力量、谈判与爆发",
+              "auto_apply_on_select": true,
+              "base_values_locked": true,
+              "manual_reentry_required": false,
+              "skip_manual_stat_questions": true,
+              "id": "warlock",
+              "aliases": [],
+              "value": "术士",
+              "label": "术士",
+              "knowledge_profile_ref": "knowledge.profession.warlock",
+              "content_profile_ref": "content.default_player",
+              "capability_grants": [
+                "capability:warlock.signature"
+              ]
+            },
+            {
+              "name": "牧师",
+              "fixed_total": 50,
+              "attributes": {
+                "strength": 3,
+                "constitution": 5,
+                "dexterity": 3,
+                "perception": 6,
+                "intelligence": 6,
+                "willpower": 8,
+                "charisma": 6,
+                "mana": 4,
+                "faith": 9,
+                "survival": 0
+              },
+              "role": "治疗、祝福、驱邪与神学",
+              "ability_source": "神殿训练、圣徽、祷文与信仰",
+              "limitations": "违背教义会削弱神术，攻击手段有限",
+              "base_total": 50,
+              "base_attributes": {
+                "strength": 3,
+                "constitution": 5,
+                "dexterity": 3,
+                "perception": 6,
+                "intelligence": 6,
+                "willpower": 8,
+                "charisma": 6,
+                "mana": 4,
+                "faith": 9,
+                "survival": 0
+              },
+              "bonus_rule": {
+                "primary_attribute_bonus": 7,
+                "secondary_attribute_bonus": 3,
+                "attributes_must_be_distinct": true,
+                "free_split_or_partial_allocation": false
+              },
+              "final_total": 60,
+              "effective_attribute_formula": "职业基础属性 + 主属性7点 + 副属性3点",
+              "selection_value": "牧师",
+              "display_at_profession_step": true,
+              "display_text": "牧师｜力量3｜体质5｜灵巧3｜感知6｜智力6｜意志8｜魅力6｜魔力4｜信仰9｜生存0｜基础总和50｜治疗、祝福、驱邪与神学",
+              "auto_apply_on_select": true,
+              "base_values_locked": true,
+              "manual_reentry_required": false,
+              "skip_manual_stat_questions": true,
+              "id": "priest",
+              "aliases": [],
+              "value": "牧师",
+              "label": "牧师",
+              "knowledge_profile_ref": "knowledge.profession.priest",
+              "content_profile_ref": "content.default_player",
+              "capability_grants": [
+                "capability:priest.signature"
+              ]
+            },
+            {
+              "name": "猎人",
+              "fixed_total": 50,
+              "attributes": {
+                "strength": 5,
+                "constitution": 6,
+                "dexterity": 8,
+                "perception": 9,
+                "intelligence": 4,
+                "willpower": 5,
+                "charisma": 3,
+                "mana": 2,
+                "faith": 1,
+                "survival": 7
+              },
+              "role": "远程、追踪、陷阱与野外生存",
+              "ability_source": "弓弩、猎具、地形经验与兽类知识",
+              "limitations": "狭窄近战和纯社交场景较弱",
+              "base_total": 50,
+              "base_attributes": {
+                "strength": 5,
+                "constitution": 6,
+                "dexterity": 8,
+                "perception": 9,
+                "intelligence": 4,
+                "willpower": 5,
+                "charisma": 3,
+                "mana": 2,
+                "faith": 1,
+                "survival": 7
+              },
+              "bonus_rule": {
+                "primary_attribute_bonus": 7,
+                "secondary_attribute_bonus": 3,
+                "attributes_must_be_distinct": true,
+                "free_split_or_partial_allocation": false
+              },
+              "final_total": 60,
+              "effective_attribute_formula": "职业基础属性 + 主属性7点 + 副属性3点",
+              "selection_value": "猎人",
+              "display_at_profession_step": true,
+              "display_text": "猎人｜力量5｜体质6｜灵巧8｜感知9｜智力4｜意志5｜魅力3｜魔力2｜信仰1｜生存7｜基础总和50｜远程、追踪、陷阱与野外生存",
+              "auto_apply_on_select": true,
+              "base_values_locked": true,
+              "manual_reentry_required": false,
+              "skip_manual_stat_questions": true,
+              "id": "hunter",
+              "aliases": [],
+              "value": "猎人",
+              "label": "猎人",
+              "knowledge_profile_ref": "knowledge.profession.hunter",
+              "content_profile_ref": "content.default_player",
+              "capability_grants": [
+                "capability:hunter.signature"
+              ]
+            },
+            {
+              "name": "狂战士",
+              "fixed_total": 50,
+              "attributes": {
+                "strength": 9,
+                "constitution": 9,
+                "dexterity": 7,
+                "perception": 4,
+                "intelligence": 2,
+                "willpower": 8,
+                "charisma": 1,
+                "mana": 0,
+                "faith": 2,
+                "survival": 8
+              },
+              "role": "近战爆发、破阵、承伤与威吓",
+              "ability_source": "氏族战法、怒意与强韧体魄",
+              "limitations": "狂暴会降低判断与防御，缺乏精细法术",
+              "base_total": 50,
+              "base_attributes": {
+                "strength": 9,
+                "constitution": 9,
+                "dexterity": 7,
+                "perception": 4,
+                "intelligence": 2,
+                "willpower": 8,
+                "charisma": 1,
+                "mana": 0,
+                "faith": 2,
+                "survival": 8
+              },
+              "bonus_rule": {
+                "primary_attribute_bonus": 7,
+                "secondary_attribute_bonus": 3,
+                "attributes_must_be_distinct": true,
+                "free_split_or_partial_allocation": false
+              },
+              "final_total": 60,
+              "effective_attribute_formula": "职业基础属性 + 主属性7点 + 副属性3点",
+              "selection_value": "狂战士",
+              "display_at_profession_step": true,
+              "display_text": "狂战士｜力量9｜体质9｜灵巧7｜感知4｜智力2｜意志8｜魅力1｜魔力0｜信仰2｜生存8｜基础总和50｜近战爆发、破阵、承伤与威吓",
+              "auto_apply_on_select": true,
+              "base_values_locked": true,
+              "manual_reentry_required": false,
+              "skip_manual_stat_questions": true,
+              "id": "berserker",
+              "aliases": [],
+              "value": "狂战士",
+              "label": "狂战士",
+              "knowledge_profile_ref": "knowledge.profession.berserker",
+              "content_profile_ref": "content.default_player",
+              "capability_grants": [
+                "capability:berserker.signature"
+              ]
+            },
+            {
+              "name": "盗贼",
+              "fixed_total": 50,
+              "attributes": {
+                "strength": 4,
+                "constitution": 4,
+                "dexterity": 9,
+                "perception": 8,
+                "intelligence": 6,
+                "willpower": 5,
+                "charisma": 6,
+                "mana": 2,
+                "faith": 1,
+                "survival": 5
+              },
+              "role": "潜行、侦察、开锁、奇袭与情报",
+              "ability_source": "工具、训练、暗号与城市关系",
+              "limitations": "正面持久战薄弱，复杂机关仍需时间与工具",
+              "base_total": 50,
+              "base_attributes": {
+                "strength": 4,
+                "constitution": 4,
+                "dexterity": 9,
+                "perception": 8,
+                "intelligence": 6,
+                "willpower": 5,
+                "charisma": 6,
+                "mana": 2,
+                "faith": 1,
+                "survival": 5
+              },
+              "bonus_rule": {
+                "primary_attribute_bonus": 7,
+                "secondary_attribute_bonus": 3,
+                "attributes_must_be_distinct": true,
+                "free_split_or_partial_allocation": false
+              },
+              "final_total": 60,
+              "effective_attribute_formula": "职业基础属性 + 主属性7点 + 副属性3点",
+              "selection_value": "盗贼",
+              "display_at_profession_step": true,
+              "display_text": "盗贼｜力量4｜体质4｜灵巧9｜感知8｜智力6｜意志5｜魅力6｜魔力2｜信仰1｜生存5｜基础总和50｜潜行、侦察、开锁、奇袭与情报",
+              "auto_apply_on_select": true,
+              "base_values_locked": true,
+              "manual_reentry_required": false,
+              "skip_manual_stat_questions": true,
+              "id": "rogue",
+              "aliases": [],
+              "value": "盗贼",
+              "label": "盗贼",
+              "knowledge_profile_ref": "knowledge.profession.rogue",
+              "content_profile_ref": "content.default_player",
+              "capability_grants": [
+                "capability:rogue.signature"
+              ]
+            },
+            {
+              "name": "圣骑士",
+              "fixed_total": 50,
+              "attributes": {
+                "strength": 8,
+                "constitution": 8,
+                "dexterity": 3,
+                "perception": 4,
+                "intelligence": 3,
+                "willpower": 7,
+                "charisma": 6,
+                "mana": 1,
+                "faith": 9,
+                "survival": 1
+              },
+              "role": "重甲、护卫、圣击与士气",
+              "ability_source": "神圣誓言、武备与教会授权",
+              "limitations": "必须遵守誓言，远程和隐蔽能力有限",
+              "base_total": 50,
+              "base_attributes": {
+                "strength": 8,
+                "constitution": 8,
+                "dexterity": 3,
+                "perception": 4,
+                "intelligence": 3,
+                "willpower": 7,
+                "charisma": 6,
+                "mana": 1,
+                "faith": 9,
+                "survival": 1
+              },
+              "bonus_rule": {
+                "primary_attribute_bonus": 7,
+                "secondary_attribute_bonus": 3,
+                "attributes_must_be_distinct": true,
+                "free_split_or_partial_allocation": false
+              },
+              "final_total": 60,
+              "effective_attribute_formula": "职业基础属性 + 主属性7点 + 副属性3点",
+              "selection_value": "圣骑士",
+              "display_at_profession_step": true,
+              "display_text": "圣骑士｜力量8｜体质8｜灵巧3｜感知4｜智力3｜意志7｜魅力6｜魔力1｜信仰9｜生存1｜基础总和50｜重甲、护卫、圣击与士气",
+              "auto_apply_on_select": true,
+              "base_values_locked": true,
+              "manual_reentry_required": false,
+              "skip_manual_stat_questions": true,
+              "id": "paladin",
+              "aliases": [],
+              "value": "圣骑士",
+              "label": "圣骑士",
+              "knowledge_profile_ref": "knowledge.profession.paladin",
+              "content_profile_ref": "content.default_player",
+              "capability_grants": [
+                "capability:paladin.signature"
+              ]
+            },
+            {
+              "name": "德鲁伊",
+              "fixed_total": 50,
+              "attributes": {
+                "strength": 3,
+                "constitution": 6,
+                "dexterity": 5,
+                "perception": 8,
+                "intelligence": 7,
+                "willpower": 7,
+                "charisma": 3,
+                "mana": 6,
+                "faith": 5,
+                "survival": 0
+              },
+              "role": "自然法术、治疗、变形与环境控制",
+              "ability_source": "地脉共鸣、自然媒介与盟约",
+              "limitations": "污染地、金属封闭区和反自然仪式会削弱能力",
+              "base_total": 50,
+              "base_attributes": {
+                "strength": 3,
+                "constitution": 6,
+                "dexterity": 5,
+                "perception": 8,
+                "intelligence": 7,
+                "willpower": 7,
+                "charisma": 3,
+                "mana": 6,
+                "faith": 5,
+                "survival": 0
+              },
+              "bonus_rule": {
+                "primary_attribute_bonus": 7,
+                "secondary_attribute_bonus": 3,
+                "attributes_must_be_distinct": true,
+                "free_split_or_partial_allocation": false
+              },
+              "final_total": 60,
+              "effective_attribute_formula": "职业基础属性 + 主属性7点 + 副属性3点",
+              "selection_value": "德鲁伊",
+              "display_at_profession_step": true,
+              "display_text": "德鲁伊｜力量3｜体质6｜灵巧5｜感知8｜智力7｜意志7｜魅力3｜魔力6｜信仰5｜生存0｜基础总和50｜自然法术、治疗、变形与环境控制",
+              "auto_apply_on_select": true,
+              "base_values_locked": true,
+              "manual_reentry_required": false,
+              "skip_manual_stat_questions": true,
+              "id": "druid",
+              "aliases": [],
+              "value": "德鲁伊",
+              "label": "德鲁伊",
+              "knowledge_profile_ref": "knowledge.profession.druid",
+              "content_profile_ref": "content.default_player",
+              "capability_grants": [
+                "capability:druid.signature"
+              ]
+            },
+            {
+              "name": "吟游诗人",
+              "fixed_total": 50,
+              "attributes": {
+                "strength": 3,
+                "constitution": 4,
+                "dexterity": 7,
+                "perception": 7,
+                "intelligence": 6,
+                "willpower": 5,
+                "charisma": 9,
+                "mana": 6,
+                "faith": 1,
+                "survival": 2
+              },
+              "role": "交涉、鼓舞、幻术、传闻与支援",
+              "ability_source": "表演、故事、韵律魔法与人脉",
+              "limitations": "正面承伤低，强力效果依赖表演与听觉条件",
+              "base_total": 50,
+              "base_attributes": {
+                "strength": 3,
+                "constitution": 4,
+                "dexterity": 7,
+                "perception": 7,
+                "intelligence": 6,
+                "willpower": 5,
+                "charisma": 9,
+                "mana": 6,
+                "faith": 1,
+                "survival": 2
+              },
+              "bonus_rule": {
+                "primary_attribute_bonus": 7,
+                "secondary_attribute_bonus": 3,
+                "attributes_must_be_distinct": true,
+                "free_split_or_partial_allocation": false
+              },
+              "final_total": 60,
+              "effective_attribute_formula": "职业基础属性 + 主属性7点 + 副属性3点",
+              "selection_value": "吟游诗人",
+              "display_at_profession_step": true,
+              "display_text": "吟游诗人｜力量3｜体质4｜灵巧7｜感知7｜智力6｜意志5｜魅力9｜魔力6｜信仰1｜生存2｜基础总和50｜交涉、鼓舞、幻术、传闻与支援",
+              "auto_apply_on_select": true,
+              "base_values_locked": true,
+              "manual_reentry_required": false,
+              "skip_manual_stat_questions": true,
+              "id": "bard",
+              "aliases": [],
+              "value": "吟游诗人",
+              "label": "吟游诗人",
+              "knowledge_profile_ref": "knowledge.profession.bard",
+              "content_profile_ref": "content.default_player",
+              "capability_grants": [
+                "capability:bard.signature"
+              ]
+            },
+            {
+              "name": "炼金术师",
+              "fixed_total": 50,
+              "attributes": {
+                "strength": 3,
+                "constitution": 5,
+                "dexterity": 7,
+                "perception": 8,
+                "intelligence": 9,
+                "willpower": 6,
+                "charisma": 4,
+                "mana": 4,
+                "faith": 1,
+                "survival": 3
+              },
+              "role": "药剂、炸弹、鉴定、制作与战场支援",
+              "ability_source": "配方、材料、工具与实验记录",
+              "limitations": "没有材料和制作时间时能力显著下降",
+              "base_total": 50,
+              "base_attributes": {
+                "strength": 3,
+                "constitution": 5,
+                "dexterity": 7,
+                "perception": 8,
+                "intelligence": 9,
+                "willpower": 6,
+                "charisma": 4,
+                "mana": 4,
+                "faith": 1,
+                "survival": 3
+              },
+              "bonus_rule": {
+                "primary_attribute_bonus": 7,
+                "secondary_attribute_bonus": 3,
+                "attributes_must_be_distinct": true,
+                "free_split_or_partial_allocation": false
+              },
+              "final_total": 60,
+              "effective_attribute_formula": "职业基础属性 + 主属性7点 + 副属性3点",
+              "selection_value": "炼金术师",
+              "display_at_profession_step": true,
+              "display_text": "炼金术师｜力量3｜体质5｜灵巧7｜感知8｜智力9｜意志6｜魅力4｜魔力4｜信仰1｜生存3｜基础总和50｜药剂、炸弹、鉴定、制作与战场支援",
+              "auto_apply_on_select": true,
+              "base_values_locked": true,
+              "manual_reentry_required": false,
+              "skip_manual_stat_questions": true,
+              "id": "alchemist",
+              "aliases": [],
+              "value": "炼金术师",
+              "label": "炼金术师",
+              "knowledge_profile_ref": "knowledge.profession.alchemist",
+              "content_profile_ref": "content.default_player",
+              "capability_grants": [
+                "capability:alchemist.signature"
+              ]
+            },
+            {
+              "name": "武僧",
+              "fixed_total": 50,
+              "attributes": {
+                "strength": 7,
+                "constitution": 7,
+                "dexterity": 9,
+                "perception": 7,
+                "intelligence": 4,
+                "willpower": 9,
+                "charisma": 2,
+                "mana": 1,
+                "faith": 2,
+                "survival": 2
+              },
+              "role": "机动近战、格挡、控制与精神抵抗",
+              "ability_source": "门派训练、呼吸法与身体锻炼",
+              "limitations": "缺乏重甲和远程火力，破坏大型目标能力有限",
+              "base_total": 50,
+              "base_attributes": {
+                "strength": 7,
+                "constitution": 7,
+                "dexterity": 9,
+                "perception": 7,
+                "intelligence": 4,
+                "willpower": 9,
+                "charisma": 2,
+                "mana": 1,
+                "faith": 2,
+                "survival": 2
+              },
+              "bonus_rule": {
+                "primary_attribute_bonus": 7,
+                "secondary_attribute_bonus": 3,
+                "attributes_must_be_distinct": true,
+                "free_split_or_partial_allocation": false
+              },
+              "final_total": 60,
+              "effective_attribute_formula": "职业基础属性 + 主属性7点 + 副属性3点",
+              "selection_value": "武僧",
+              "display_at_profession_step": true,
+              "display_text": "武僧｜力量7｜体质7｜灵巧9｜感知7｜智力4｜意志9｜魅力2｜魔力1｜信仰2｜生存2｜基础总和50｜机动近战、格挡、控制与精神抵抗",
+              "auto_apply_on_select": true,
+              "base_values_locked": true,
+              "manual_reentry_required": false,
+              "skip_manual_stat_questions": true,
+              "id": "monk",
+              "aliases": [],
+              "value": "武僧",
+              "label": "武僧",
+              "knowledge_profile_ref": "knowledge.profession.monk",
+              "content_profile_ref": "content.default_player",
+              "capability_grants": [
+                "capability:monk.signature"
+              ]
+            }
+          ]
+        },
+        {
+          "id": "origin_region",
+          "label": "出身地区",
+          "selection": {
+            "mode": "single",
+            "min": 1,
+            "max": 1
+          },
+          "required": true,
+          "allow_custom": false,
+          "randomizable": true,
+          "player_editable": true,
+          "display_order": 30,
+          "options": [
+            {
+              "name": "北境王国",
+              "summary": "封建城镇、农庄、骑士领与边境堡垒构成的王国腹地。",
+              "common_knowledge": [
+                "王国法律与税制",
+                "王家大道",
+                "地方贵族礼仪"
+              ],
+              "typical_languages": [
+                "通用语"
+              ],
+              "possible_contacts": [
+                "地方守卫",
+                "驿站人员",
+                "村镇行会"
+              ],
+              "limitations": "不自动获得贵族身份、军职或王室关系。",
+              "id": "northern_kingdom",
+              "value": "北境王国",
+              "label": "北境王国",
+              "knowledge_profile_ref": "knowledge.origin.northern_kingdom",
+              "content_profile_ref": "content.default_player"
+            },
+            {
+              "name": "灰脊山脉",
+              "summary": "矮人堡垒、矿镇、山口村落与废弃矿坑交错的高山地区。",
+              "common_knowledge": [
+                "山路与矿道常识",
+                "矿石辨识基础",
+                "雪山天气"
+              ],
+              "typical_languages": [
+                "通用语",
+                "矮人语"
+              ],
+              "possible_contacts": [
+                "矿工",
+                "商队护卫",
+                "矮人工匠"
+              ],
+              "limitations": "不自动知道封闭氏族秘密、秘银矿脉或古代矿坑位置。",
+              "id": "grayridge_mountains",
+              "value": "灰脊山脉",
+              "label": "灰脊山脉",
+              "knowledge_profile_ref": "knowledge.origin.grayridge_mountains",
+              "content_profile_ref": "content.default_player"
+            },
+            {
+              "name": "翡翠林海",
+              "summary": "精灵聚落、德鲁伊圣地、猎户村与古老兽径所在的巨大森林。",
+              "common_knowledge": [
+                "林地生存基础",
+                "常见药草",
+                "古林禁忌"
+              ],
+              "typical_languages": [
+                "通用语",
+                "精灵语"
+              ],
+              "possible_contacts": [
+                "猎户",
+                "德鲁伊学徒",
+                "林地向导"
+              ],
+              "limitations": "不自动获得古灵认可，也不能无条件使用自然门径。",
+              "id": "emerald_wilds",
+              "value": "翡翠林海",
+              "label": "翡翠林海",
+              "knowledge_profile_ref": "knowledge.origin.emerald_wilds",
+              "content_profile_ref": "content.default_player"
+            },
+            {
+              "name": "盐风海岸",
+              "summary": "自由港、渔村、盐场、商船航线与海盗湾密布的沿海地区。",
+              "common_knowledge": [
+                "港口规矩",
+                "基础航海",
+                "走私暗语常识"
+              ],
+              "typical_languages": [
+                "通用语",
+                "海商行话"
+              ],
+              "possible_contacts": [
+                "船员",
+                "码头工",
+                "商会伙计"
+              ],
+              "limitations": "不自动拥有船只、海盗身份或跨国贸易许可。",
+              "id": "saltwind_coast",
+              "value": "盐风海岸",
+              "label": "盐风海岸",
+              "knowledge_profile_ref": "knowledge.origin.saltwind_coast",
+              "content_profile_ref": "content.default_player"
+            },
+            {
+              "name": "旧帝国遗迹带",
+              "summary": "围绕星辉塔、断裂传送阵和地下城形成的拾荒者聚居区。",
+              "common_knowledge": [
+                "遗迹避险基础",
+                "常见符文警示",
+                "废墟交易规矩"
+              ],
+              "typical_languages": [
+                "通用语",
+                "少量旧帝国符号"
+              ],
+              "possible_contacts": [
+                "拾荒者",
+                "遗迹向导",
+                "古物商"
+              ],
+              "limitations": "不自动掌握古代魔法、完整旧帝国语或遗迹核心权限。",
+              "id": "old_empire_ruins",
+              "value": "旧帝国遗迹带",
+              "label": "旧帝国遗迹带",
+              "knowledge_profile_ref": "knowledge.origin.old_empire_ruins",
+              "content_profile_ref": "content.default_player"
+            },
+            {
+              "name": "圣辉领",
+              "summary": "晨辉教会直接管理的修道院、圣城、疗养村与朝圣道路。",
+              "common_knowledge": [
+                "教会礼仪",
+                "常见祷文",
+                "亡灵与疫病禁忌"
+              ],
+              "typical_languages": [
+                "通用语",
+                "教会礼仪语"
+              ],
+              "possible_contacts": [
+                "修士",
+                "医者",
+                "巡礼者"
+              ],
+              "limitations": "不自动获得神术、圣职或教会高层信任。",
+              "id": "holy_radiance_domain",
+              "value": "圣辉领",
+              "label": "圣辉领",
+              "knowledge_profile_ref": "knowledge.origin.holy_radiance_domain",
+              "content_profile_ref": "content.default_player"
+            },
+            {
+              "name": "红沙边地",
+              "summary": "干旱荒原、边境要塞、游牧营地与古战场组成的南部边地。",
+              "common_knowledge": [
+                "荒漠取水",
+                "商路方向",
+                "边地部族礼节"
+              ],
+              "typical_languages": [
+                "通用语",
+                "边地语"
+              ],
+              "possible_contacts": [
+                "驼队商人",
+                "边军",
+                "部族向导"
+              ],
+              "limitations": "不自动拥有部族权威、军用通行证或秘密水源地图。",
+              "id": "red_sand_frontier",
+              "value": "红沙边地",
+              "label": "红沙边地",
+              "knowledge_profile_ref": "knowledge.origin.red_sand_frontier",
+              "content_profile_ref": "content.default_player"
+            },
+            {
+              "name": "漂泊无籍",
+              "summary": "没有稳定故乡，长期随商队、佣兵团、难民队伍或流浪艺人迁徙。",
+              "common_knowledge": [
+                "多地风俗碎片",
+                "道路生存",
+                "识别危险落脚点"
+              ],
+              "typical_languages": [
+                "通用语",
+                "一种自选地方口音或行话"
+              ],
+              "possible_contacts": [
+                "旅店老板",
+                "车夫",
+                "流浪者"
+              ],
+              "limitations": "信息广但不深，缺乏稳定户籍、土地与官方担保。",
+              "id": "wandering_stateless",
+              "value": "漂泊无籍",
+              "label": "漂泊无籍",
+              "knowledge_profile_ref": "knowledge.origin.wandering_stateless",
+              "content_profile_ref": "content.default_player"
+            }
+          ]
+        },
+        {
+          "id": "social_identity",
+          "label": "社会身份",
+          "selection": {
+            "mode": "single",
+            "min": 1,
+            "max": 1
+          },
+          "required": true,
+          "allow_custom": false,
+          "randomizable": true,
+          "player_editable": true,
+          "display_order": 40,
+          "options": [
+            {
+              "name": "没落贵族",
+              "summary": "出身有纹章或旧领地的家族，但当前缺乏财富、军队或政治实权。",
+              "starting_strengths": [
+                "礼仪",
+                "谱系常识",
+                "上层社会沟通"
+              ],
+              "obligations": [
+                "家族债务",
+                "名誉压力"
+              ],
+              "limitations": "不得自称现任领主、王族继承人或调动私人军队。",
+              "id": "fallen_noble",
+              "value": "没落贵族",
+              "label": "没落贵族",
+              "knowledge_profile_ref": "knowledge.identity.fallen_noble",
+              "content_profile_ref": "content.default_player"
+            },
+            {
+              "name": "自由民",
+              "summary": "拥有基本人身自由与合法户籍的普通居民。",
+              "starting_strengths": [
+                "地方生活常识",
+                "稳定社会关系",
+                "适应性"
+              ],
+              "obligations": [
+                "税赋",
+                "地方征召"
+              ],
+              "limitations": "没有天然特权、专业执照或秘密组织资源。",
+              "id": "free_citizen",
+              "value": "自由民",
+              "label": "自由民",
+              "knowledge_profile_ref": "knowledge.identity.free_citizen",
+              "content_profile_ref": "content.default_player"
+            },
+            {
+              "name": "城镇工匠",
+              "summary": "曾在铁匠、木匠、皮匠、石匠或其他手工业作坊生活与工作。",
+              "starting_strengths": [
+                "一种工艺常识",
+                "工具维护",
+                "行会规矩"
+              ],
+              "obligations": [
+                "师门或行会责任"
+              ],
+              "limitations": "不能仅凭身份制作魔法装备或大师级作品。",
+              "id": "town_artisan",
+              "value": "城镇工匠",
+              "label": "城镇工匠",
+              "knowledge_profile_ref": "knowledge.identity.town_artisan",
+              "content_profile_ref": "content.default_player"
+            },
+            {
+              "name": "农庄子弟",
+              "summary": "来自农庄、牧场、磨坊或小型乡村社区。",
+              "starting_strengths": [
+                "牲畜照料",
+                "季节与天气",
+                "乡野劳作"
+              ],
+              "obligations": [
+                "家庭生计",
+                "乡土关系"
+              ],
+              "limitations": "不自动精通野外战斗、草药学或贵族礼仪。",
+              "id": "farmstead_child",
+              "value": "农庄子弟",
+              "label": "农庄子弟",
+              "knowledge_profile_ref": "knowledge.identity.farmstead_child",
+              "content_profile_ref": "content.default_player"
+            },
+            {
+              "name": "行会学徒",
+              "summary": "曾受商业、工艺、抄写、药剂或其他城市行会训练。",
+              "starting_strengths": [
+                "账目与契约",
+                "行业术语",
+                "同业联系"
+              ],
+              "obligations": [
+                "学徒契约",
+                "行会规则"
+              ],
+              "limitations": "尚未拥有大师资格、独立商号或高级配方。",
+              "id": "guild_apprentice",
+              "value": "行会学徒",
+              "label": "行会学徒",
+              "knowledge_profile_ref": "knowledge.identity.guild_apprentice",
+              "content_profile_ref": "content.default_player"
+            },
+            {
+              "name": "神殿侍从",
+              "summary": "曾在神殿、修道院、慈善所或墓园担任基层侍从。",
+              "starting_strengths": [
+                "宗教礼仪",
+                "照护伤病",
+                "教会基层关系"
+              ],
+              "obligations": [
+                "信仰规范",
+                "神殿旧识"
+              ],
+              "limitations": "身份本身不赋予神术、驱邪权或圣职等级。",
+              "id": "temple_attendant",
+              "value": "神殿侍从",
+              "label": "神殿侍从",
+              "knowledge_profile_ref": "knowledge.identity.temple_attendant",
+              "content_profile_ref": "content.default_player"
+            },
+            {
+              "name": "骑士扈从",
+              "summary": "曾为骑士、军官或贵族武装担任侍从与随员。",
+              "starting_strengths": [
+                "军营规矩",
+                "武具保养",
+                "马匹照料"
+              ],
+              "obligations": [
+                "旧主关系",
+                "荣誉承诺"
+              ],
+              "limitations": "不是正式骑士，不能自动拥有封地、骑士团权限或战马。",
+              "id": "knight_squire",
+              "value": "骑士扈从",
+              "label": "骑士扈从",
+              "knowledge_profile_ref": "knowledge.identity.knight_squire",
+              "content_profile_ref": "content.default_player"
+            },
+            {
+              "name": "学院学徒",
+              "summary": "曾在法师塔、抄写院、教会学校或私人导师处接受基础教育。",
+              "starting_strengths": [
+                "读写",
+                "基础理论",
+                "文献检索"
+              ],
+              "obligations": [
+                "学费债务",
+                "导师要求"
+              ],
+              "limitations": "不自动掌握高阶法术、禁书内容或议会许可。",
+              "id": "academy_student",
+              "value": "学院学徒",
+              "label": "学院学徒",
+              "knowledge_profile_ref": "knowledge.identity.academy_student",
+              "content_profile_ref": "content.default_player"
+            },
+            {
+              "name": "边境猎户",
+              "summary": "长期生活在森林、山地或荒原边缘，以狩猎、采集或向导为生。",
+              "starting_strengths": [
+                "追踪基础",
+                "野外路线",
+                "常见兽类习性"
+              ],
+              "obligations": [
+                "家园安全",
+                "猎场规矩"
+              ],
+              "limitations": "不自动拥有稀有魔兽知识、完美追踪或无限补给。",
+              "id": "frontier_hunter",
+              "value": "边境猎户",
+              "label": "边境猎户",
+              "knowledge_profile_ref": "knowledge.identity.frontier_hunter",
+              "content_profile_ref": "content.default_player"
+            },
+            {
+              "name": "商队成员",
+              "summary": "曾担任车夫、护卫、翻译、伙计、记账员或采购人。",
+              "starting_strengths": [
+                "道路行情",
+                "货物常识",
+                "跨地区交涉"
+              ],
+              "obligations": [
+                "商队债务或旧雇主"
+              ],
+              "limitations": "不自动拥有大量财富、商会决策权或跨境特许。",
+              "id": "caravan_member",
+              "value": "商队成员",
+              "label": "商队成员",
+              "knowledge_profile_ref": "knowledge.identity.caravan_member",
+              "content_profile_ref": "content.default_player"
+            },
+            {
+              "name": "佣兵老兵",
+              "summary": "参加过地方战争、护送或清剿任务并幸存下来。",
+              "starting_strengths": [
+                "战场纪律",
+                "危险判断",
+                "佣兵圈关系"
+              ],
+              "obligations": [
+                "旧战友",
+                "战争创伤或旧债"
+              ],
+              "limitations": "不自动拥有军衔、传奇战绩或高级军事机密。",
+              "id": "mercenary_veteran",
+              "value": "佣兵老兵",
+              "label": "佣兵老兵",
+              "knowledge_profile_ref": "knowledge.identity.mercenary_veteran",
+              "content_profile_ref": "content.default_player"
+            },
+            {
+              "name": "流亡者",
+              "summary": "因战争、罪名、政治冲突、灾难或家族问题离开原有社会。",
+              "starting_strengths": [
+                "隐藏行踪",
+                "适应陌生环境",
+                "识别追捕风险"
+              ],
+              "obligations": [
+                "追索者或未解决往事"
+              ],
+              "limitations": "不得用模糊流亡背景免费获得王室秘密、禁术或跨国情报网。",
+              "id": "exile",
+              "value": "流亡者",
+              "label": "流亡者",
+              "knowledge_profile_ref": "knowledge.identity.exile",
+              "content_profile_ref": "content.default_player"
+            }
+          ]
+        }
+      ]
     },
     "time_rules": {
       "card_code_ttl_seconds": 1800,
@@ -3269,15 +4461,453 @@
         "profession_base_is_immutable": true
       }
     },
-    "world_schema_version": 2,
+    "world_schema_version": 5,
     "capabilities": {
-      "character_stats": true,
-      "attribute_checks": true,
-      "dice_resolution": true,
-      "option_risk_labels": true,
-      "group_decisions": true,
-      "npc_generation": true,
-      "world_events": true
+      "definitions": [
+        {
+          "capability_id": "knight.signature",
+          "label": "盾墙守势",
+          "capability_type_ref": "capability_type:profession_signature",
+          "description": "以盾牌与站位保护一名相邻同伴。",
+          "tags": [
+            "profession.knight"
+          ],
+          "grant_policy": "ignore",
+          "effects": [
+            {
+              "op": "add_narrative_constraint",
+              "value": "以盾牌与站位保护一名相邻同伴。"
+            }
+          ]
+        },
+        {
+          "capability_id": "mage.signature",
+          "label": "星火箭",
+          "capability_type_ref": "capability_type:profession_signature",
+          "description": "塑形一束可见星火；需要专注与奥术资源。",
+          "tags": [
+            "profession.mage"
+          ],
+          "grant_policy": "ignore",
+          "effects": [
+            {
+              "op": "add_narrative_constraint",
+              "value": "塑形一束可见星火；需要专注与奥术资源。"
+            }
+          ]
+        },
+        {
+          "capability_id": "warlock.signature",
+          "label": "契约低语",
+          "capability_type_ref": "capability_type:profession_signature",
+          "description": "借契约媒介感知附近异常魔力，代价由契约约束。",
+          "tags": [
+            "profession.warlock"
+          ],
+          "grant_policy": "ignore",
+          "effects": [
+            {
+              "op": "add_narrative_constraint",
+              "value": "借契约媒介感知附近异常魔力，代价由契约约束。"
+            }
+          ]
+        },
+        {
+          "capability_id": "priest.signature",
+          "label": "晨辉祷言",
+          "capability_type_ref": "capability_type:profession_signature",
+          "description": "以圣徽稳定伤势或驱散轻微恐惧。",
+          "tags": [
+            "profession.priest"
+          ],
+          "grant_policy": "ignore",
+          "effects": [
+            {
+              "op": "add_narrative_constraint",
+              "value": "以圣徽稳定伤势或驱散轻微恐惧。"
+            }
+          ]
+        },
+        {
+          "capability_id": "hunter.signature",
+          "label": "猎径追踪",
+          "capability_type_ref": "capability_type:profession_signature",
+          "description": "根据真实痕迹判断近期通行方向。",
+          "tags": [
+            "profession.hunter"
+          ],
+          "grant_policy": "ignore",
+          "effects": [
+            {
+              "op": "add_narrative_constraint",
+              "value": "根据真实痕迹判断近期通行方向。"
+            }
+          ]
+        },
+        {
+          "capability_id": "berserker.signature",
+          "label": "破阵怒意",
+          "capability_type_ref": "capability_type:profession_signature",
+          "description": "短时强化正面压制，同时降低精细判断。",
+          "tags": [
+            "profession.berserker"
+          ],
+          "grant_policy": "ignore",
+          "effects": [
+            {
+              "op": "add_narrative_constraint",
+              "value": "短时强化正面压制，同时降低精细判断。"
+            }
+          ]
+        },
+        {
+          "capability_id": "rogue.signature",
+          "label": "巧手探察",
+          "capability_type_ref": "capability_type:profession_signature",
+          "description": "使用工具检查机关、锁具和人为痕迹。",
+          "tags": [
+            "profession.rogue"
+          ],
+          "grant_policy": "ignore",
+          "effects": [
+            {
+              "op": "add_narrative_constraint",
+              "value": "使用工具检查机关、锁具和人为痕迹。"
+            }
+          ]
+        },
+        {
+          "capability_id": "paladin.signature",
+          "label": "誓约守护",
+          "capability_type_ref": "capability_type:profession_signature",
+          "description": "依据公开誓约保护目标并对抗亵渎。",
+          "tags": [
+            "profession.paladin"
+          ],
+          "grant_policy": "ignore",
+          "effects": [
+            {
+              "op": "add_narrative_constraint",
+              "value": "依据公开誓约保护目标并对抗亵渎。"
+            }
+          ]
+        },
+        {
+          "capability_id": "druid.signature",
+          "label": "地脉聆听",
+          "capability_type_ref": "capability_type:profession_signature",
+          "description": "在自然环境中辨认污染、天气和生灵异常。",
+          "tags": [
+            "profession.druid"
+          ],
+          "grant_policy": "ignore",
+          "effects": [
+            {
+              "op": "add_narrative_constraint",
+              "value": "在自然环境中辨认污染、天气和生灵异常。"
+            }
+          ]
+        },
+        {
+          "capability_id": "bard.signature",
+          "label": "鼓舞曲调",
+          "capability_type_ref": "capability_type:profession_signature",
+          "description": "以表演稳定士气；不能强制改变他人意志。",
+          "tags": [
+            "profession.bard"
+          ],
+          "grant_policy": "ignore",
+          "effects": [
+            {
+              "op": "add_narrative_constraint",
+              "value": "以表演稳定士气；不能强制改变他人意志。"
+            }
+          ]
+        },
+        {
+          "capability_id": "alchemist.signature",
+          "label": "应急炼剂",
+          "capability_type_ref": "capability_type:profession_signature",
+          "description": "使用已有材料调制一次性基础炼剂。",
+          "tags": [
+            "profession.alchemist"
+          ],
+          "grant_policy": "ignore",
+          "effects": [
+            {
+              "op": "add_narrative_constraint",
+              "value": "使用已有材料调制一次性基础炼剂。"
+            }
+          ]
+        },
+        {
+          "capability_id": "monk.signature",
+          "label": "流息架势",
+          "capability_type_ref": "capability_type:profession_signature",
+          "description": "以内息调整身法和近身防御。",
+          "tags": [
+            "profession.monk"
+          ],
+          "grant_policy": "ignore",
+          "effects": [
+            {
+              "op": "add_narrative_constraint",
+              "value": "以内息调整身法和近身防御。"
+            }
+          ]
+        },
+        {
+          "capability_id": "mage.fireball",
+          "label": "火球术",
+          "capability_type_ref": "capability_type:arcane_spell",
+          "description": "凝聚火焰投射物，受环境、专注和目标状态约束。",
+          "tags": [
+            "effect.flame"
+          ],
+          "costs": [
+            {
+              "resource_ref": "resource:arcane_focus",
+              "operation": "subtract",
+              "value": 1
+            }
+          ],
+          "effects": [
+            {
+              "op": "add_narrative_constraint",
+              "value": "以可见火焰影响目标与环境，不自动宣告伤害。"
+            }
+          ]
+        },
+        {
+          "capability_id": "mage.flame_blast",
+          "label": "炎爆术",
+          "capability_type_ref": "capability_type:arcane_spell",
+          "description": "火球术的进阶形态，范围更大且代价更高。",
+          "tags": [
+            "effect.flame",
+            "shape.blast"
+          ],
+          "costs": [
+            {
+              "resource_ref": "resource:arcane_focus",
+              "operation": "subtract",
+              "value": 2
+            }
+          ],
+          "effects": [
+            {
+              "op": "add_narrative_constraint",
+              "value": "形成范围火焰冲击，必须依据裁定凭证叙述结果。"
+            }
+          ]
+        },
+        {
+          "capability_id": "mage.crownfire",
+          "label": "冠焰术",
+          "capability_type_ref": "capability_type:arcane_spell",
+          "description": "灰烬王冠篇章中的高阶火焰塑形。",
+          "tags": [
+            "effect.flame",
+            "tier.high"
+          ],
+          "costs": [
+            {
+              "resource_ref": "resource:arcane_focus",
+              "operation": "subtract",
+              "value": 3
+            }
+          ]
+        }
+      ],
+      "initial_grants": [
+        {
+          "grant_id": "grant.knight",
+          "capability_ref": "capability:knight.signature",
+          "source_ref": "custom:preset.profession",
+          "persistence_scope": "campaign",
+          "when": {
+            "ref": "custom:preset.profession",
+            "scope": "actor",
+            "operator": "==",
+            "value": "knight"
+          }
+        },
+        {
+          "grant_id": "grant.mage",
+          "capability_ref": "capability:mage.signature",
+          "source_ref": "custom:preset.profession",
+          "persistence_scope": "campaign",
+          "when": {
+            "ref": "custom:preset.profession",
+            "scope": "actor",
+            "operator": "==",
+            "value": "mage"
+          }
+        },
+        {
+          "grant_id": "grant.warlock",
+          "capability_ref": "capability:warlock.signature",
+          "source_ref": "custom:preset.profession",
+          "persistence_scope": "campaign",
+          "when": {
+            "ref": "custom:preset.profession",
+            "scope": "actor",
+            "operator": "==",
+            "value": "warlock"
+          }
+        },
+        {
+          "grant_id": "grant.priest",
+          "capability_ref": "capability:priest.signature",
+          "source_ref": "custom:preset.profession",
+          "persistence_scope": "campaign",
+          "when": {
+            "ref": "custom:preset.profession",
+            "scope": "actor",
+            "operator": "==",
+            "value": "priest"
+          }
+        },
+        {
+          "grant_id": "grant.hunter",
+          "capability_ref": "capability:hunter.signature",
+          "source_ref": "custom:preset.profession",
+          "persistence_scope": "campaign",
+          "when": {
+            "ref": "custom:preset.profession",
+            "scope": "actor",
+            "operator": "==",
+            "value": "hunter"
+          }
+        },
+        {
+          "grant_id": "grant.berserker",
+          "capability_ref": "capability:berserker.signature",
+          "source_ref": "custom:preset.profession",
+          "persistence_scope": "campaign",
+          "when": {
+            "ref": "custom:preset.profession",
+            "scope": "actor",
+            "operator": "==",
+            "value": "berserker"
+          }
+        },
+        {
+          "grant_id": "grant.rogue",
+          "capability_ref": "capability:rogue.signature",
+          "source_ref": "custom:preset.profession",
+          "persistence_scope": "campaign",
+          "when": {
+            "ref": "custom:preset.profession",
+            "scope": "actor",
+            "operator": "==",
+            "value": "rogue"
+          }
+        },
+        {
+          "grant_id": "grant.paladin",
+          "capability_ref": "capability:paladin.signature",
+          "source_ref": "custom:preset.profession",
+          "persistence_scope": "campaign",
+          "when": {
+            "ref": "custom:preset.profession",
+            "scope": "actor",
+            "operator": "==",
+            "value": "paladin"
+          }
+        },
+        {
+          "grant_id": "grant.druid",
+          "capability_ref": "capability:druid.signature",
+          "source_ref": "custom:preset.profession",
+          "persistence_scope": "campaign",
+          "when": {
+            "ref": "custom:preset.profession",
+            "scope": "actor",
+            "operator": "==",
+            "value": "druid"
+          }
+        },
+        {
+          "grant_id": "grant.bard",
+          "capability_ref": "capability:bard.signature",
+          "source_ref": "custom:preset.profession",
+          "persistence_scope": "campaign",
+          "when": {
+            "ref": "custom:preset.profession",
+            "scope": "actor",
+            "operator": "==",
+            "value": "bard"
+          }
+        },
+        {
+          "grant_id": "grant.alchemist",
+          "capability_ref": "capability:alchemist.signature",
+          "source_ref": "custom:preset.profession",
+          "persistence_scope": "campaign",
+          "when": {
+            "ref": "custom:preset.profession",
+            "scope": "actor",
+            "operator": "==",
+            "value": "alchemist"
+          }
+        },
+        {
+          "grant_id": "grant.monk",
+          "capability_ref": "capability:monk.signature",
+          "source_ref": "custom:preset.profession",
+          "persistence_scope": "campaign",
+          "when": {
+            "ref": "custom:preset.profession",
+            "scope": "actor",
+            "operator": "==",
+            "value": "monk"
+          }
+        }
+      ],
+      "transitions": [
+        {
+          "transition_id": "fireball_to_flame_blast",
+          "from": [
+            "capability:mage.fireball"
+          ],
+          "when": {
+            "ref": "stat:intelligence",
+            "scope": "actor",
+            "operator": ">=",
+            "value": 9
+          },
+          "operations": [
+            {
+              "op": "set_availability",
+              "target_ref": "capability:mage.fireball",
+              "value": false
+            },
+            {
+              "op": "grant_reference",
+              "target_ref": "capability:mage.flame_blast"
+            }
+          ]
+        },
+        {
+          "transition_id": "flame_blast_to_crownfire",
+          "from": [
+            "capability:mage.flame_blast"
+          ],
+          "when": {
+            "ref": "story_flag:ashen_crown_attuned",
+            "scope": "world",
+            "operator": "==",
+            "value": true
+          },
+          "operations": [
+            {
+              "op": "grant_reference",
+              "target_ref": "capability:mage.crownfire"
+            }
+          ]
+        }
+      ]
     },
     "option_presentation": {
       "annotation": {
@@ -3315,7 +4945,405 @@
         "label": "致命",
         "requires_visible_consequence": true
       }
-    ]
+    ],
+    "knowledge_boundary": {
+      "policy": "strict",
+      "global_rules": [
+        "角色只获得角色卡预设、亲历事件、已公开线索和合理来源授权的知识。",
+        "职业能力不等于全领域知识；显示名称改变不得扩大知识授权。",
+        "导演秘密、其他角色私人秘密和未公开幕后动机一律不可读取。"
+      ],
+      "forbidden_domains": [
+        "导演秘密",
+        "其他角色私人秘密",
+        "未公开幕后动机"
+      ],
+      "metagame_policy": "deny",
+      "unknown_fact_behavior": "表现为不知道、传闻认知或请求调查"
+    },
+    "content_boundary": {
+      "hard_blocked_tags": [
+        "露骨性内容",
+        "非自愿性内容",
+        "替玩家决定重大意志"
+      ],
+      "default_profile_ref": "content.default_player",
+      "player_may_relax": false,
+      "safety_pause_overrides_all": true
+    },
+    "entity_registry": {
+      "entities": [
+        {
+          "entity_type": "custom",
+          "id": "check_modifier",
+          "label": "本次裁定修正"
+        },
+        {
+          "entity_type": "custom",
+          "id": "damage_multiplier",
+          "label": "世界定义效果倍率"
+        },
+        {
+          "entity_type": "custom",
+          "id": "action.damage_tag",
+          "label": "行动效果标签"
+        },
+        {
+          "entity_type": "custom",
+          "id": "target.creature_tag",
+          "label": "目标生物标签"
+        },
+        {
+          "entity_type": "custom",
+          "id": "scene.environment_tag",
+          "label": "环境标签"
+        },
+        {
+          "entity_type": "story_flag",
+          "id": "ashen_crown_attuned",
+          "label": "已与灰烬王冠共鸣"
+        },
+        {
+          "entity_type": "custom_tag",
+          "id": "authority.silver_torch",
+          "label": "银炬公会权限"
+        },
+        {
+          "entity_type": "custom_tag",
+          "id": "material.consecrated_silver",
+          "label": "祝圣白银材质"
+        },
+        {
+          "entity_type": "custom_tag",
+          "id": "authority.royal",
+          "label": "王家权限"
+        },
+        {
+          "entity_type": "custom",
+          "id": "preset.species",
+          "label": "种族"
+        },
+        {
+          "entity_type": "custom",
+          "id": "preset.profession",
+          "label": "职业"
+        },
+        {
+          "entity_type": "custom",
+          "id": "preset.origin_region",
+          "label": "出身地区"
+        },
+        {
+          "entity_type": "custom",
+          "id": "preset.social_identity",
+          "label": "社会身份"
+        },
+        {
+          "entity_type": "stat",
+          "id": "strength",
+          "label": "力量"
+        },
+        {
+          "entity_type": "stat",
+          "id": "constitution",
+          "label": "体质"
+        },
+        {
+          "entity_type": "stat",
+          "id": "dexterity",
+          "label": "灵巧"
+        },
+        {
+          "entity_type": "stat",
+          "id": "perception",
+          "label": "感知"
+        },
+        {
+          "entity_type": "stat",
+          "id": "intelligence",
+          "label": "智力"
+        },
+        {
+          "entity_type": "stat",
+          "id": "willpower",
+          "label": "意志"
+        },
+        {
+          "entity_type": "stat",
+          "id": "charisma",
+          "label": "魅力"
+        },
+        {
+          "entity_type": "stat",
+          "id": "mana",
+          "label": "魔力"
+        },
+        {
+          "entity_type": "stat",
+          "id": "faith",
+          "label": "信仰"
+        },
+        {
+          "entity_type": "stat",
+          "id": "survival",
+          "label": "生存"
+        }
+      ]
+    },
+    "capability_types": {
+      "definitions": [
+        {
+          "id": "profession_signature",
+          "label": "职业标志能力"
+        },
+        {
+          "id": "arcane_spell",
+          "label": "奥术塑形"
+        }
+      ]
+    },
+    "resources": {
+      "definitions": [
+        {
+          "resource_id": "arcane_focus",
+          "label": "奥术专注",
+          "value_type": "integer",
+          "range": {
+            "min": 0,
+            "max": 6
+          },
+          "initial_value": 6,
+          "persistence_scope": "session"
+        },
+        {
+          "resource_id": "divine_favor",
+          "label": "神恩",
+          "value_type": "integer",
+          "range": {
+            "min": 0,
+            "max": 6
+          },
+          "initial_value": 6,
+          "persistence_scope": "session"
+        },
+        {
+          "resource_id": "endurance",
+          "label": "耐力",
+          "value_type": "integer",
+          "range": {
+            "min": 0,
+            "max": 10
+          },
+          "initial_value": 10,
+          "persistence_scope": "scene"
+        }
+      ]
+    },
+    "runtime_effects": {
+      "definitions": [
+        {
+          "runtime_effect_id": "wounded",
+          "label": "负伤",
+          "duration_units": [
+            "scene",
+            "until_condition"
+          ]
+        },
+        {
+          "runtime_effect_id": "graymoon_mark",
+          "label": "灰月印记",
+          "duration_units": [
+            "chapter",
+            "permanent"
+          ]
+        },
+        {
+          "runtime_effect_id": "wanted",
+          "label": "被通缉",
+          "duration_units": [
+            "world_time",
+            "until_condition"
+          ]
+        }
+      ]
+    },
+    "objects": {
+      "definitions": [
+        {
+          "object_id": "silver_torch_badge",
+          "label": "银炬徽章",
+          "provides": [
+            "custom_tag:authority.silver_torch"
+          ]
+        },
+        {
+          "object_id": "consecrated_silver",
+          "label": "祝圣白银",
+          "provides": [
+            "custom_tag:material.consecrated_silver"
+          ]
+        },
+        {
+          "object_id": "royal_seal",
+          "label": "王家印信",
+          "provides": [
+            "custom_tag:authority.royal"
+          ]
+        }
+      ]
+    },
+    "action_types": {
+      "definitions": [
+        {
+          "id": "investigate",
+          "label": "调查"
+        },
+        {
+          "id": "persuade",
+          "label": "交涉"
+        },
+        {
+          "id": "travel",
+          "label": "旅行"
+        },
+        {
+          "id": "craft",
+          "label": "制作"
+        },
+        {
+          "id": "use_capability",
+          "label": "使用能力"
+        }
+      ]
+    },
+    "resolution_methods": {
+      "methods": [
+        {
+          "method_id": "aelvion_d20",
+          "label": "阿尔维恩 D20",
+          "default_outcome_id": "failure",
+          "steps": [
+            {
+              "step_id": "roll",
+              "op": "random_integer",
+              "min": 1,
+              "max": 20
+            },
+            {
+              "step_id": "modifier",
+              "op": "read_value",
+              "scope": "actor",
+              "ref": "custom:check_modifier"
+            },
+            {
+              "step_id": "total",
+              "op": "sum",
+              "inputs": [
+                "roll",
+                "modifier"
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    "interaction_rules": {
+      "enabled": true,
+      "settings": {
+        "conflict_strategy": "priority_then_stack",
+        "max_matches_per_event": 10
+      },
+      "rules": [
+        {
+          "rule_id": "flame_in_heavy_rain",
+          "mode": "hybrid",
+          "enabled": true,
+          "priority": 80,
+          "triggers": [
+            {
+              "event": "action.requested",
+              "phase": "before_resolution"
+            }
+          ],
+          "when": {
+            "all": [
+              {
+                "ref": "custom:action.damage_tag",
+                "scope": "action",
+                "operator": "==",
+                "value": "flame"
+              },
+              {
+                "ref": "custom:scene.environment_tag",
+                "scope": "scene",
+                "operator": "==",
+                "value": "heavy_rain"
+              }
+            ]
+          },
+          "effects": [
+            {
+              "op": "modify_value",
+              "target_ref": "custom:check_modifier",
+              "value": -2
+            },
+            {
+              "op": "add_narrative_constraint",
+              "value": "暴雨削弱并扰动火焰表现。"
+            }
+          ],
+          "stacking": {
+            "group": "environmental_flame",
+            "strategy": "highest",
+            "limit": 1
+          }
+        },
+        {
+          "rule_id": "consecrated_silver_against_undead",
+          "mode": "hybrid",
+          "enabled": true,
+          "priority": 100,
+          "triggers": [
+            {
+              "event": "action.requested",
+              "phase": "before_resolution"
+            }
+          ],
+          "when": {
+            "all": [
+              {
+                "ref": "custom:action.damage_tag",
+                "scope": "action",
+                "operator": "==",
+                "value": "consecrated_silver"
+              },
+              {
+                "ref": "custom:target.creature_tag",
+                "scope": "target",
+                "operator": "==",
+                "value": "undead"
+              }
+            ]
+          },
+          "effects": [
+            {
+              "op": "modify_value",
+              "target_ref": "custom:check_modifier",
+              "value": 2
+            },
+            {
+              "op": "add_narrative_constraint",
+              "value": "祝圣白银对当前亡灵结构产生世界定义的压制。"
+            }
+          ],
+          "stacking": {
+            "group": "material_affinity",
+            "strategy": "highest",
+            "limit": 1
+          }
+        }
+      ]
+    }
   },
   "initial_state": {
     "location": "鸦渡镇银炬冒险者公会大厅",
@@ -3365,15 +5393,480 @@
       ]
     }
   },
-  "world_schema_version": 2,
-  "world_content_version": "1.2.0",
+  "world_schema_version": 5,
+  "world_content_version": "3.0.0",
   "capabilities": {
-    "character_stats": true,
-    "attribute_checks": true,
-    "dice_resolution": true,
-    "option_risk_labels": true,
-    "group_decisions": true,
-    "npc_generation": true,
-    "world_events": true
-  }
+    "definitions": [
+      {
+        "capability_id": "knight.signature",
+        "label": "盾墙守势",
+        "capability_type_ref": "capability_type:profession_signature",
+        "description": "以盾牌与站位保护一名相邻同伴。",
+        "tags": [
+          "profession.knight"
+        ],
+        "grant_policy": "ignore",
+        "effects": [
+          {
+            "op": "add_narrative_constraint",
+            "value": "以盾牌与站位保护一名相邻同伴。"
+          }
+        ]
+      },
+      {
+        "capability_id": "mage.signature",
+        "label": "星火箭",
+        "capability_type_ref": "capability_type:profession_signature",
+        "description": "塑形一束可见星火；需要专注与奥术资源。",
+        "tags": [
+          "profession.mage"
+        ],
+        "grant_policy": "ignore",
+        "effects": [
+          {
+            "op": "add_narrative_constraint",
+            "value": "塑形一束可见星火；需要专注与奥术资源。"
+          }
+        ]
+      },
+      {
+        "capability_id": "warlock.signature",
+        "label": "契约低语",
+        "capability_type_ref": "capability_type:profession_signature",
+        "description": "借契约媒介感知附近异常魔力，代价由契约约束。",
+        "tags": [
+          "profession.warlock"
+        ],
+        "grant_policy": "ignore",
+        "effects": [
+          {
+            "op": "add_narrative_constraint",
+            "value": "借契约媒介感知附近异常魔力，代价由契约约束。"
+          }
+        ]
+      },
+      {
+        "capability_id": "priest.signature",
+        "label": "晨辉祷言",
+        "capability_type_ref": "capability_type:profession_signature",
+        "description": "以圣徽稳定伤势或驱散轻微恐惧。",
+        "tags": [
+          "profession.priest"
+        ],
+        "grant_policy": "ignore",
+        "effects": [
+          {
+            "op": "add_narrative_constraint",
+            "value": "以圣徽稳定伤势或驱散轻微恐惧。"
+          }
+        ]
+      },
+      {
+        "capability_id": "hunter.signature",
+        "label": "猎径追踪",
+        "capability_type_ref": "capability_type:profession_signature",
+        "description": "根据真实痕迹判断近期通行方向。",
+        "tags": [
+          "profession.hunter"
+        ],
+        "grant_policy": "ignore",
+        "effects": [
+          {
+            "op": "add_narrative_constraint",
+            "value": "根据真实痕迹判断近期通行方向。"
+          }
+        ]
+      },
+      {
+        "capability_id": "berserker.signature",
+        "label": "破阵怒意",
+        "capability_type_ref": "capability_type:profession_signature",
+        "description": "短时强化正面压制，同时降低精细判断。",
+        "tags": [
+          "profession.berserker"
+        ],
+        "grant_policy": "ignore",
+        "effects": [
+          {
+            "op": "add_narrative_constraint",
+            "value": "短时强化正面压制，同时降低精细判断。"
+          }
+        ]
+      },
+      {
+        "capability_id": "rogue.signature",
+        "label": "巧手探察",
+        "capability_type_ref": "capability_type:profession_signature",
+        "description": "使用工具检查机关、锁具和人为痕迹。",
+        "tags": [
+          "profession.rogue"
+        ],
+        "grant_policy": "ignore",
+        "effects": [
+          {
+            "op": "add_narrative_constraint",
+            "value": "使用工具检查机关、锁具和人为痕迹。"
+          }
+        ]
+      },
+      {
+        "capability_id": "paladin.signature",
+        "label": "誓约守护",
+        "capability_type_ref": "capability_type:profession_signature",
+        "description": "依据公开誓约保护目标并对抗亵渎。",
+        "tags": [
+          "profession.paladin"
+        ],
+        "grant_policy": "ignore",
+        "effects": [
+          {
+            "op": "add_narrative_constraint",
+            "value": "依据公开誓约保护目标并对抗亵渎。"
+          }
+        ]
+      },
+      {
+        "capability_id": "druid.signature",
+        "label": "地脉聆听",
+        "capability_type_ref": "capability_type:profession_signature",
+        "description": "在自然环境中辨认污染、天气和生灵异常。",
+        "tags": [
+          "profession.druid"
+        ],
+        "grant_policy": "ignore",
+        "effects": [
+          {
+            "op": "add_narrative_constraint",
+            "value": "在自然环境中辨认污染、天气和生灵异常。"
+          }
+        ]
+      },
+      {
+        "capability_id": "bard.signature",
+        "label": "鼓舞曲调",
+        "capability_type_ref": "capability_type:profession_signature",
+        "description": "以表演稳定士气；不能强制改变他人意志。",
+        "tags": [
+          "profession.bard"
+        ],
+        "grant_policy": "ignore",
+        "effects": [
+          {
+            "op": "add_narrative_constraint",
+            "value": "以表演稳定士气；不能强制改变他人意志。"
+          }
+        ]
+      },
+      {
+        "capability_id": "alchemist.signature",
+        "label": "应急炼剂",
+        "capability_type_ref": "capability_type:profession_signature",
+        "description": "使用已有材料调制一次性基础炼剂。",
+        "tags": [
+          "profession.alchemist"
+        ],
+        "grant_policy": "ignore",
+        "effects": [
+          {
+            "op": "add_narrative_constraint",
+            "value": "使用已有材料调制一次性基础炼剂。"
+          }
+        ]
+      },
+      {
+        "capability_id": "monk.signature",
+        "label": "流息架势",
+        "capability_type_ref": "capability_type:profession_signature",
+        "description": "以内息调整身法和近身防御。",
+        "tags": [
+          "profession.monk"
+        ],
+        "grant_policy": "ignore",
+        "effects": [
+          {
+            "op": "add_narrative_constraint",
+            "value": "以内息调整身法和近身防御。"
+          }
+        ]
+      },
+      {
+        "capability_id": "mage.fireball",
+        "label": "火球术",
+        "capability_type_ref": "capability_type:arcane_spell",
+        "description": "凝聚火焰投射物，受环境、专注和目标状态约束。",
+        "tags": [
+          "effect.flame"
+        ],
+        "costs": [
+          {
+            "resource_ref": "resource:arcane_focus",
+            "operation": "subtract",
+            "value": 1
+          }
+        ],
+        "effects": [
+          {
+            "op": "add_narrative_constraint",
+            "value": "以可见火焰影响目标与环境，不自动宣告伤害。"
+          }
+        ]
+      },
+      {
+        "capability_id": "mage.flame_blast",
+        "label": "炎爆术",
+        "capability_type_ref": "capability_type:arcane_spell",
+        "description": "火球术的进阶形态，范围更大且代价更高。",
+        "tags": [
+          "effect.flame",
+          "shape.blast"
+        ],
+        "costs": [
+          {
+            "resource_ref": "resource:arcane_focus",
+            "operation": "subtract",
+            "value": 2
+          }
+        ],
+        "effects": [
+          {
+            "op": "add_narrative_constraint",
+            "value": "形成范围火焰冲击，必须依据裁定凭证叙述结果。"
+          }
+        ]
+      },
+      {
+        "capability_id": "mage.crownfire",
+        "label": "冠焰术",
+        "capability_type_ref": "capability_type:arcane_spell",
+        "description": "灰烬王冠篇章中的高阶火焰塑形。",
+        "tags": [
+          "effect.flame",
+          "tier.high"
+        ],
+        "costs": [
+          {
+            "resource_ref": "resource:arcane_focus",
+            "operation": "subtract",
+            "value": 3
+          }
+        ]
+      }
+    ],
+    "initial_grants": [
+      {
+        "grant_id": "grant.knight",
+        "capability_ref": "capability:knight.signature",
+        "source_ref": "custom:preset.profession",
+        "persistence_scope": "campaign",
+        "when": {
+          "ref": "custom:preset.profession",
+          "scope": "actor",
+          "operator": "==",
+          "value": "knight"
+        }
+      },
+      {
+        "grant_id": "grant.mage",
+        "capability_ref": "capability:mage.signature",
+        "source_ref": "custom:preset.profession",
+        "persistence_scope": "campaign",
+        "when": {
+          "ref": "custom:preset.profession",
+          "scope": "actor",
+          "operator": "==",
+          "value": "mage"
+        }
+      },
+      {
+        "grant_id": "grant.warlock",
+        "capability_ref": "capability:warlock.signature",
+        "source_ref": "custom:preset.profession",
+        "persistence_scope": "campaign",
+        "when": {
+          "ref": "custom:preset.profession",
+          "scope": "actor",
+          "operator": "==",
+          "value": "warlock"
+        }
+      },
+      {
+        "grant_id": "grant.priest",
+        "capability_ref": "capability:priest.signature",
+        "source_ref": "custom:preset.profession",
+        "persistence_scope": "campaign",
+        "when": {
+          "ref": "custom:preset.profession",
+          "scope": "actor",
+          "operator": "==",
+          "value": "priest"
+        }
+      },
+      {
+        "grant_id": "grant.hunter",
+        "capability_ref": "capability:hunter.signature",
+        "source_ref": "custom:preset.profession",
+        "persistence_scope": "campaign",
+        "when": {
+          "ref": "custom:preset.profession",
+          "scope": "actor",
+          "operator": "==",
+          "value": "hunter"
+        }
+      },
+      {
+        "grant_id": "grant.berserker",
+        "capability_ref": "capability:berserker.signature",
+        "source_ref": "custom:preset.profession",
+        "persistence_scope": "campaign",
+        "when": {
+          "ref": "custom:preset.profession",
+          "scope": "actor",
+          "operator": "==",
+          "value": "berserker"
+        }
+      },
+      {
+        "grant_id": "grant.rogue",
+        "capability_ref": "capability:rogue.signature",
+        "source_ref": "custom:preset.profession",
+        "persistence_scope": "campaign",
+        "when": {
+          "ref": "custom:preset.profession",
+          "scope": "actor",
+          "operator": "==",
+          "value": "rogue"
+        }
+      },
+      {
+        "grant_id": "grant.paladin",
+        "capability_ref": "capability:paladin.signature",
+        "source_ref": "custom:preset.profession",
+        "persistence_scope": "campaign",
+        "when": {
+          "ref": "custom:preset.profession",
+          "scope": "actor",
+          "operator": "==",
+          "value": "paladin"
+        }
+      },
+      {
+        "grant_id": "grant.druid",
+        "capability_ref": "capability:druid.signature",
+        "source_ref": "custom:preset.profession",
+        "persistence_scope": "campaign",
+        "when": {
+          "ref": "custom:preset.profession",
+          "scope": "actor",
+          "operator": "==",
+          "value": "druid"
+        }
+      },
+      {
+        "grant_id": "grant.bard",
+        "capability_ref": "capability:bard.signature",
+        "source_ref": "custom:preset.profession",
+        "persistence_scope": "campaign",
+        "when": {
+          "ref": "custom:preset.profession",
+          "scope": "actor",
+          "operator": "==",
+          "value": "bard"
+        }
+      },
+      {
+        "grant_id": "grant.alchemist",
+        "capability_ref": "capability:alchemist.signature",
+        "source_ref": "custom:preset.profession",
+        "persistence_scope": "campaign",
+        "when": {
+          "ref": "custom:preset.profession",
+          "scope": "actor",
+          "operator": "==",
+          "value": "alchemist"
+        }
+      },
+      {
+        "grant_id": "grant.monk",
+        "capability_ref": "capability:monk.signature",
+        "source_ref": "custom:preset.profession",
+        "persistence_scope": "campaign",
+        "when": {
+          "ref": "custom:preset.profession",
+          "scope": "actor",
+          "operator": "==",
+          "value": "monk"
+        }
+      }
+    ],
+    "transitions": [
+      {
+        "transition_id": "fireball_to_flame_blast",
+        "from": [
+          "capability:mage.fireball"
+        ],
+        "when": {
+          "ref": "stat:intelligence",
+          "scope": "actor",
+          "operator": ">=",
+          "value": 9
+        },
+        "operations": [
+          {
+            "op": "set_availability",
+            "target_ref": "capability:mage.fireball",
+            "value": false
+          },
+          {
+            "op": "grant_reference",
+            "target_ref": "capability:mage.flame_blast"
+          }
+        ]
+      },
+      {
+        "transition_id": "flame_blast_to_crownfire",
+        "from": [
+          "capability:mage.flame_blast"
+        ],
+        "when": {
+          "ref": "story_flag:ashen_crown_attuned",
+          "scope": "world",
+          "operator": "==",
+          "value": true
+        },
+        "operations": [
+          {
+            "op": "grant_reference",
+            "target_ref": "capability:mage.crownfire"
+          }
+        ]
+      }
+    ]
+  },
+  "minimum_plugin_version": "0.11.0",
+  "protocol": {
+    "core_version": 5,
+    "features": {
+      "entity_registry": "1.0",
+      "condition_engine": "1.0",
+      "operation_engine": "1.0",
+      "event_pipeline": "1.0",
+      "resolution_receipt": "1.0",
+      "capabilities": "1.0",
+      "resources": "1.0",
+      "runtime_effects": "1.0",
+      "objects": "1.0",
+      "resolution_methods": "1.0",
+      "interaction_rules": "1.0",
+      "action_intents": "1.0"
+    }
+  },
+  "required_features": [
+    "entity_registry@>=1.0",
+    "condition_engine@>=1.0",
+    "operation_engine@>=1.0",
+    "event_pipeline@>=1.0",
+    "resolution_receipt@>=1.0",
+    "capabilities@>=1.0",
+    "interaction_rules@>=1.0"
+  ]
 }

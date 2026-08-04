@@ -1,6 +1,9 @@
 """Domain repository methods extracted from the SQLite store."""
 
 from ..database_support import *
+from ..entity_registry import EntityRegistry
+from ..resolution_receipts import content_hash
+from ..rule_runtime import enabled_feature_versions
 
 
 class WorldRepositoryMixin:
@@ -17,7 +20,7 @@ class WorldRepositoryMixin:
                 f"""
                 SELECT * FROM worlds
                 {condition}
-                ORDER BY archived ASC, updated_at DESC, name COLLATE NOCASE
+                ORDER BY archived ASC, sort_order ASC, display_no ASC
                 """
             ).fetchall()
             result: list[dict[str, Any]] = []
@@ -63,6 +66,134 @@ class WorldRepositoryMixin:
     ) -> dict[str, Any]:
         return await self._run(self._save_world, dict(payload), actor_id)
 
+    async def set_world_sort_order(
+        self,
+        world_id: str,
+        sort_order: int,
+        actor_id: str,
+    ) -> dict[str, Any]:
+        return await self._run(
+            self._set_world_sort_order, world_id, int(sort_order), actor_id
+        )
+
+    def _set_world_sort_order(
+        self, world_id: str, sort_order: int, actor_id: str
+    ) -> dict[str, Any]:
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                current = connection.execute(
+                    "SELECT * FROM worlds WHERE id=?", (world_id,)
+                ).fetchone()
+                if not current:
+                    raise DatabaseNotFoundError("世界包不存在")
+                connection.execute(
+                    "UPDATE worlds SET sort_order=? WHERE id=?",
+                    (max(1, sort_order), world_id),
+                )
+                self._insert_audit(
+                    connection, "", actor_id, "world.reorder", world_id,
+                    {"display_no": current["display_no"], "sort_order": max(1, sort_order)},
+                )
+                row = connection.execute(
+                    "SELECT * FROM worlds WHERE id=?", (world_id,)
+                ).fetchone()
+                connection.execute("COMMIT")
+                return self._world(row)
+            except Exception:
+                connection.execute("ROLLBACK")
+                raise
+
+    @staticmethod
+    def _allocate_world_display_no(connection: sqlite3.Connection) -> int:
+        maximum = int(connection.execute(
+            "SELECT COALESCE(MAX(display_no), 0) + 1 AS value FROM worlds"
+        ).fetchone()["value"])
+        row = connection.execute(
+            "SELECT value FROM tavern_meta WHERE key='next_world_display_no'"
+        ).fetchone()
+        try:
+            counter = int(row["value"]) if row else 1
+        except (TypeError, ValueError):
+            counter = 1
+        value = max(maximum, counter)
+        connection.execute(
+            """
+            INSERT INTO tavern_meta(key, value) VALUES ('next_world_display_no', ?)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value
+            """,
+            (str(value + 1),),
+        )
+        return value
+
+    def _persist_world_revision(
+        self,
+        connection: sqlite3.Connection,
+        row: sqlite3.Row,
+        world: Mapping[str, Any],
+        now: str,
+    ) -> None:
+        revision = int(row["revision"])
+        snapshot_hash = content_hash(world)
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO world_rule_revisions(
+                id, world_id, world_revision, content_hash, rules_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                new_id("world_rule"), row["id"], revision, snapshot_hash,
+                json_dump(world.get("rules") or {}), now,
+            ),
+        )
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO world_snapshots(
+                id, world_id, world_revision, content_hash, snapshot_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                new_id("world_snapshot"), row["id"], revision, snapshot_hash,
+                json_dump(dict(world)), now,
+            ),
+        )
+        features = enabled_feature_versions(world)
+        required = {
+            str(item).split("@", 1)[0]
+            for item in world.get("required_features", [])
+            if isinstance(item, str)
+        }
+        for feature, version in features.items():
+            connection.execute(
+                """
+                INSERT OR REPLACE INTO world_feature_versions(
+                    world_id, world_revision, feature_name, feature_version,
+                    required, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (row["id"], revision, feature, version, int(feature in required), now),
+            )
+        try:
+            registry = EntityRegistry(world)
+        except Exception:
+            registry = None
+        if registry is not None:
+            for item in registry.export():
+                connection.execute(
+                    """
+                    INSERT OR REPLACE INTO world_entity_registry(
+                        world_id, world_revision, entity_ref, entity_type,
+                        label, definition_json, content_hash, visibility, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        row["id"], revision, item["ref"], item["entity_type"],
+                        item["label"], json_dump(item["definition"]),
+                        content_hash(item["definition"]),
+                        str(item["definition"].get("visibility") or "world"), now,
+                    ),
+                )
+
     def _save_world(
         self,
         payload: dict[str, Any],
@@ -98,6 +229,7 @@ class WorldRepositoryMixin:
         validate_world_contract({**payload, "rules": rules})
         known_fields = {
             "id", "slug", "name", "description", "system_prompt", "rules",
+            "display_no", "sort_order",
             "opening_scene", "initial_state", "archived", "revision",
             "created_at", "updated_at", "world_schema_version", "capabilities",
             "player_limits", "card_template", "time_rules", "choice_mode",
@@ -173,17 +305,20 @@ class WorldRepositoryMixin:
                     action = "world.update"
                 else:
                     world_id = new_id("world")
+                    display_no = self._allocate_world_display_no(connection)
                     connection.execute(
                         """
                         INSERT INTO worlds(
-                            id, slug, name, description, system_prompt,
+                            id, slug, display_no, sort_order, name, description, system_prompt,
                             rules_json, extensions_json, opening_scene, initial_state_json,
                             archived, revision, created_at, updated_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 1, ?, ?)
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 1, ?, ?)
                         """,
                         (
                             world_id,
                             slug,
+                            display_no,
+                            display_no,
                             name,
                             description,
                             system_prompt,
@@ -208,6 +343,9 @@ class WorldRepositoryMixin:
                     "SELECT * FROM worlds WHERE id = ?",
                     (world_id,),
                 ).fetchone()
+                self._persist_world_revision(
+                    connection, row, self._world(row), now
+                )
                 connection.execute("COMMIT")
                 return self._world(row)
             except Exception:

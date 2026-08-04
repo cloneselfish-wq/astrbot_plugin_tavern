@@ -610,7 +610,8 @@ class AdminRepositoryMixin:
             code_cursor = connection.execute(
                 """
                 UPDATE card_binding_codes SET status = 'expired'
-                WHERE status = 'active' AND expires_at <= ?
+                WHERE status = 'active' AND expires_at <> ''
+                  AND expires_at <= ?
                 """,
                 (now,),
             )
@@ -723,6 +724,9 @@ class AdminRepositoryMixin:
                 "session_rule_states": (
                     "SELECT * FROM session_rule_states ORDER BY created_at"
                 ),
+                "dm_control_states": (
+                    "SELECT * FROM dm_control_states ORDER BY created_at"
+                ),
                 "session_characters": (
                     "SELECT * FROM session_characters ORDER BY created_at"
                 ),
@@ -755,6 +759,33 @@ class AdminRepositoryMixin:
                 ),
                 "operation_receipts": (
                     "SELECT * FROM operation_receipts ORDER BY created_at"
+                ),
+                "world_feature_versions": (
+                    "SELECT * FROM world_feature_versions ORDER BY world_id, world_revision, feature_name"
+                ),
+                "world_entity_registry": (
+                    "SELECT * FROM world_entity_registry ORDER BY world_id, world_revision, entity_ref"
+                ),
+                "world_rule_revisions": (
+                    "SELECT * FROM world_rule_revisions ORDER BY created_at"
+                ),
+                "world_snapshots": (
+                    "SELECT * FROM world_snapshots ORDER BY created_at"
+                ),
+                "actor_capability_instances": (
+                    "SELECT * FROM actor_capability_instances ORDER BY created_at"
+                ),
+                "runtime_effect_instances": (
+                    "SELECT * FROM runtime_effect_instances ORDER BY created_at"
+                ),
+                "operation_commits": (
+                    "SELECT * FROM operation_commits ORDER BY created_at"
+                ),
+                "resolution_receipts": (
+                    "SELECT * FROM resolution_receipts ORDER BY created_at"
+                ),
+                "migration_receipts": (
+                    "SELECT * FROM migration_receipts ORDER BY created_at"
                 ),
                 "group_registry": (
                     "SELECT * FROM group_registry ORDER BY created_at"
@@ -794,10 +825,10 @@ class AdminRepositoryMixin:
             schema_version = int(bundle.get("schema_version", 0))
         except (TypeError, ValueError) as exc:
             raise ValueError("备份数据库版本无效") from exc
-        if schema_version != DATABASE_SCHEMA_VERSION:
+        if schema_version not in {9, DATABASE_SCHEMA_VERSION}:
             raise ValueError(
-                f"v0.9.x 仅接受 Schema {DATABASE_SCHEMA_VERSION} 备份；"
-                f"当前为 Schema {schema_version}，不再执行旧数据迁移"
+                f"v0.11.x 仅接受 Schema 9 或 {DATABASE_SCHEMA_VERSION} 备份；"
+                f"当前为 Schema {schema_version}，请先升级插件或使用兼容版本转换"
             )
         data = bundle.get("data")
         if not isinstance(data, Mapping):
@@ -832,6 +863,7 @@ class AdminRepositoryMixin:
             "snapshot_workflows",
             "session_archives",
             "session_rule_states",
+            "dm_control_states",
             "session_characters",
             "session_character_states",
             "story_ledger",
@@ -856,6 +888,15 @@ class AdminRepositoryMixin:
                 raise ValueError(f"备份表 {table} 格式错误")
             if len(data[table]) > 1_000_000:
                 raise ValueError(f"备份表 {table} 记录数异常")
+        if schema_version >= 10:
+            required_v10 = {
+                "world_feature_versions", "world_entity_registry",
+                "world_rule_revisions", "world_snapshots",
+                "actor_capability_instances", "runtime_effect_instances",
+                "operation_commits", "resolution_receipts", "migration_receipts",
+            }
+            if not required_v10.issubset(data.keys()):
+                raise ValueError("Schema 10 备份缺少规则与迁移数据表")
 
     async def import_bundle(
         self,
@@ -874,7 +915,14 @@ class AdminRepositoryMixin:
         self.validate_bundle(bundle)
         if mode not in {'merge', 'replace'}:
             raise ValueError('导入模式必须为 merge 或 replace')
+        bundle_schema = int(bundle.get('schema_version', 0))
         data = {table: [dict(row) for row in rows] for table, rows in bundle['data'].items()}
+        for table in (
+            'world_feature_versions', 'world_entity_registry', 'world_rule_revisions',
+            'world_snapshots', 'actor_capability_instances', 'runtime_effect_instances',
+            'operation_commits', 'resolution_receipts', 'migration_receipts',
+        ):
+            data.setdefault(table, [])
         policy_tables = ('timer_policies', 'token_usage', 'token_quota_policies')
         counts: dict[str, int] = {}
         with self._connect() as connection:
@@ -883,9 +931,34 @@ class AdminRepositoryMixin:
                 if mode == 'merge':
                     self._validate_merge_conflicts(connection, data)
                 if mode == 'replace':
-                    for table in ('audit_logs', 'token_usage', 'token_quota_policies', 'timer_policies', 'story_storage', 'group_registry', 'operation_receipts', 'card_revision_requests', 'configuration_revisions', 'provider_health', 'session_archives', 'inspiration_transactions', 'roll_revisions', 'assist_tokens', 'memory_governance', 'session_character_states', 'scene_clocks', 'story_ledger', 'session_characters', 'session_rule_states', 'snapshot_workflows', 'return_requests', 'ban_records', 'permission_grants', 'delegation_grants', 'timer_instances', 'selected_world_events', 'vote_ballots', 'group_votes', 'rolls', 'choice_sets', 'card_binding_codes', 'character_card_drafts', 'character_runtime_states', 'participants', 'character_card_versions', 'character_cards', 'instance_configs', 'snapshots', 'memories', 'events', 'players', 'sessions', 'characters', 'worlds'):
+                    connection.execute('DELETE FROM dm_control_states')
+                    for table in ('migration_receipts', 'resolution_receipts', 'operation_commits', 'runtime_effect_instances', 'actor_capability_instances', 'world_entity_registry', 'world_feature_versions', 'world_snapshots', 'world_rule_revisions', 'audit_logs', 'token_usage', 'token_quota_policies', 'timer_policies', 'story_storage', 'group_registry', 'operation_receipts', 'card_revision_requests', 'configuration_revisions', 'provider_health', 'session_archives', 'inspiration_transactions', 'roll_revisions', 'assist_tokens', 'memory_governance', 'session_character_states', 'scene_clocks', 'story_ledger', 'session_characters', 'session_rule_states', 'snapshot_workflows', 'return_requests', 'ban_records', 'permission_grants', 'delegation_grants', 'timer_instances', 'selected_world_events', 'vote_ballots', 'group_votes', 'rolls', 'choice_sets', 'card_binding_codes', 'character_card_drafts', 'character_runtime_states', 'participants', 'character_card_versions', 'character_cards', 'instance_configs', 'snapshots', 'memories', 'events', 'players', 'sessions', 'characters', 'worlds'):
                         connection.execute(f'DELETE FROM {table}')
-                self._import_rows(connection, 'worlds', data['worlds'], ('id', 'slug', 'name', 'description', 'system_prompt', 'rules_json', 'extensions_json', 'opening_scene', 'initial_state_json', 'archived', 'revision', 'created_at', 'updated_at'), merge=mode == 'merge')
+                used_numbers = {
+                    int(row[0]) for row in connection.execute(
+                        'SELECT display_no FROM worlds WHERE display_no IS NOT NULL'
+                    ).fetchall()
+                }
+                next_number = max(used_numbers, default=0) + 1
+                ordered_worlds = sorted(
+                    data['worlds'], key=lambda item: (str(item.get('created_at') or ''), str(item.get('id') or ''))
+                )
+                for world_row in ordered_worlds:
+                    desired = int(world_row.get('display_no') or 0)
+                    existing_same = connection.execute(
+                        'SELECT display_no FROM worlds WHERE id=?', (world_row.get('id'),)
+                    ).fetchone()
+                    if existing_same:
+                        desired = int(existing_same[0])
+                    elif desired <= 0 or (mode == 'merge' and desired in used_numbers):
+                        while next_number in used_numbers:
+                            next_number += 1
+                        desired = next_number
+                        next_number += 1
+                    used_numbers.add(desired)
+                    world_row['display_no'] = desired
+                    world_row['sort_order'] = int(world_row.get('sort_order') or desired)
+                self._import_rows(connection, 'worlds', data['worlds'], ('id', 'slug', 'display_no', 'sort_order', 'name', 'description', 'system_prompt', 'rules_json', 'extensions_json', 'opening_scene', 'initial_state_json', 'archived', 'revision', 'created_at', 'updated_at'), merge=mode == 'merge')
                 self._import_rows(connection, 'characters', data['characters'], ('id', 'world_id', 'slug', 'name', 'role', 'profile_json', 'prompt', 'enabled', 'sort_order', 'revision', 'created_at', 'updated_at'), merge=mode == 'merge')
                 self._import_rows(connection, 'sessions', data['sessions'], ('id', 'platform_id', 'group_id', 'unified_origin', 'instance_slug', 'instance_name', 'selected', 'world_id', 'state', 'turn_no', 'revision', 'world_state_json', 'history_floor_seq', 'created_at', 'updated_at'), merge=mode == 'merge')
                 self._import_rows(connection, 'players', data['players'], ('id', 'session_id', 'user_id', 'display_name', 'character_name', 'profile_json', 'enabled', 'created_at', 'updated_at'), merge=mode == 'merge')
@@ -898,6 +971,31 @@ class AdminRepositoryMixin:
                 domain_columns: dict[str, tuple[str, ...]] = {'session_archives': ('session_id', 'termination_type', 'reason', 'final_snapshot_id', 'ended_by', 'ended_at', 'readonly'), 'session_rule_states': ('session_id', 'progress_json', 'content_boundaries_json', 'npc_policy_json', 'context_budget_json', 'dice_rules_json', 'recovery_json', 'revision', 'created_at', 'updated_at'), 'session_characters': ('id', 'session_id', 'stable_key', 'name', 'aliases_json', 'role_type', 'public_profile_json', 'known_facts_json', 'misconceptions_json', 'source', 'review_status', 'lifecycle_status', 'persistent', 'first_event_id', 'last_event_id', 'first_turn', 'last_turn', 'revision', 'created_at', 'updated_at'), 'session_character_states': ('character_id', 'state_json', 'revision', 'updated_at'), 'story_ledger': ('id', 'session_id', 'stable_key', 'kind', 'title', 'description', 'status', 'visibility', 'source_event_id', 'completed_event_id', 'revision', 'created_at', 'updated_at'), 'scene_clocks': ('id', 'session_id', 'stable_key', 'title', 'segments', 'current_value', 'visibility', 'trigger_text', 'status', 'triggered_event_id', 'revision', 'created_at', 'updated_at'), 'memory_governance': ('memory_id', 'visibility', 'locked', 'pinned', 'invalidated', 'supersedes_id', 'conflict_status', 'note', 'updated_by', 'updated_at'), 'assist_tokens': ('id', 'session_id', 'source_participant_id', 'target_participant_id', 'stat', 'method', 'status', 'expires_round', 'source_event_id', 'created_at', 'consumed_at'), 'roll_revisions': ('id', 'roll_id', 'revision_no', 'reason', 'previous_json', 'revised_json', 'actor_id', 'created_at'), 'inspiration_transactions': ('id', 'session_id', 'participant_id', 'delta', 'balance_after', 'reason', 'operation_id', 'created_at'), 'provider_health': ('provider_id', 'status', 'consecutive_failures', 'last_failure_reason', 'last_failure_at', 'last_success_at', 'circuit_until', 'updated_at'), 'configuration_revisions': ('id', 'fingerprint', 'payload_json', 'saved_by', 'saved_at'), 'operation_receipts': ('operation_id', 'session_id', 'operation_type', 'request_json', 'result_json', 'status', 'created_at', 'updated_at')}
                 for table in ('session_rule_states', 'session_characters', 'session_character_states', 'story_ledger', 'scene_clocks', 'memory_governance', 'assist_tokens', 'roll_revisions', 'inspiration_transactions', 'provider_health', 'configuration_revisions', 'operation_receipts', 'session_archives'):
                     self._import_rows(connection, table, data[table], domain_columns[table], merge=mode == 'merge')
+                v10_columns: dict[str, tuple[str, ...]] = {
+                    'world_feature_versions': ('world_id', 'world_revision', 'feature_name', 'feature_version', 'required', 'created_at'),
+                    'world_entity_registry': ('world_id', 'world_revision', 'entity_ref', 'entity_type', 'label', 'definition_json', 'content_hash', 'visibility', 'created_at'),
+                    'world_rule_revisions': ('id', 'world_id', 'world_revision', 'content_hash', 'rules_json', 'created_at'),
+                    'world_snapshots': ('id', 'world_id', 'world_revision', 'content_hash', 'snapshot_json', 'created_at'),
+                    'actor_capability_instances': ('id', 'session_id', 'actor_ref', 'capability_ref', 'definition_version', 'source_ref', 'state_json', 'persistence_scope', 'available', 'created_at', 'updated_at'),
+                    'runtime_effect_instances': ('id', 'session_id', 'target_ref', 'effect_ref', 'source_ref', 'state_json', 'duration_json', 'persistence_scope', 'status', 'created_at', 'updated_at'),
+                    'operation_commits': ('operation_id', 'session_id', 'input_hash', 'status', 'result_json', 'rollback_json', 'created_at', 'updated_at'),
+                    'resolution_receipts': ('receipt_id', 'operation_id', 'session_id', 'world_snapshot_id', 'content_hash', 'receipt_json', 'public_projection_json', 'created_at'),
+                    'migration_receipts': ('id', 'migration_type', 'source_version', 'target_version', 'world_id', 'session_id', 'operation_id', 'receipt_json', 'confirmed_by', 'created_at'),
+                }
+                for table, columns in v10_columns.items():
+                    self._import_rows(connection, table, data[table], columns, merge=mode == 'merge')
+                self._import_rows(
+                    connection,
+                    'dm_control_states',
+                    data['dm_control_states'],
+                    (
+                        'session_id', 'mode', 'active_dm_user_id', 'phase',
+                        'directive', 'beat_no', 'current_actor_type',
+                        'current_actor_ref', 'preserved_turn_json', 'revision',
+                        'created_at', 'updated_at',
+                    ),
+                    merge=mode == 'merge',
+                )
                 self._import_rows(connection, 'group_registry', data['group_registry'], ('id', 'platform_id', 'group_id', 'remark', 'revision', 'created_at', 'updated_at'), merge=mode == 'merge')
                 data['story_storage'] = []
                 policy_columns: dict[str, tuple[str, ...]] = {'timer_policies': ('session_id', 'global_enabled', 'switches_json', 'revision', 'updated_by', 'updated_at'), 'token_usage': ('id', 'session_id', 'group_id', 'request_type', 'provider_id', 'input_tokens', 'cached_input_tokens', 'output_tokens', 'total_tokens', 'reserved_tokens', 'usage_source', 'status', 'created_at', 'settled_at'), 'token_quota_policies': ('id', 'scope_type', 'scope_id', 'window_seconds', 'token_limit', 'enabled', 'revision', 'updated_by', 'updated_at')}
@@ -1019,11 +1117,12 @@ class AdminRepositoryMixin:
                 values.append(row[column])
             existing = None
             if merge:
-                identity_column = {
+                identity_columns = {
                     "instance_configs": "session_id",
                     "snapshot_workflows": "snapshot_id",
                     "session_archives": "session_id",
                     "session_rule_states": "session_id",
+                    "dm_control_states": "session_id",
                     "session_character_states": "character_id",
                     "memory_governance": "memory_id",
                     "provider_health": "provider_id",
@@ -1032,14 +1131,21 @@ class AdminRepositoryMixin:
                     "group_registry": "id",
                     "story_storage": "session_id",
                     "timer_policies": "session_id",
+                    "world_feature_versions": ("world_id", "world_revision", "feature_name"),
+                    "world_entity_registry": ("world_id", "world_revision", "entity_ref"),
+                    "operation_commits": "operation_id",
+                    "resolution_receipts": "receipt_id",
+                    "migration_receipts": "id",
                 }.get(table, "id")
-                if identity_column not in row:
-                    raise ValueError(
-                        f"备份表 {table} 缺少字段 {identity_column}"
-                    )
+                if isinstance(identity_columns, str):
+                    identity_columns = (identity_columns,)
+                missing_identity = [column for column in identity_columns if column not in row]
+                if missing_identity:
+                    raise ValueError(f"备份表 {table} 缺少字段 {missing_identity[0]}")
+                where = " AND ".join(f"{column}=?" for column in identity_columns)
                 existing = connection.execute(
-                    f"SELECT 1 FROM {table} WHERE {identity_column} = ?",
-                    (row[identity_column],),
+                    f"SELECT 1 FROM {table} WHERE {where}",
+                    tuple(row[column] for column in identity_columns),
                 ).fetchone()
             if existing:
                 # Merge is deliberately insert-only. Existing records are the

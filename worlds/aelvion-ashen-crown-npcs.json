@@ -28,6 +28,18 @@
         "不会高阶魔法",
         "不能越权调动王国军队",
         "不会把全部公会情报无条件交出"
+      ],
+      "actor_complexity": "full",
+      "capability_refs": [
+        "capability:knight.signature"
+      ],
+      "resource_refs": [
+        "resource:endurance"
+      ],
+      "runtime_effect_refs": [],
+      "object_refs": [],
+      "custom_tags": [
+        "faction.银炬冒险者公会"
       ]
     },
     "prompt": "他隐瞒自己十年前曾在旧桥下见过相同符文，但当时任务记录被七塔议会收走。他害怕旧事证明自己当年判断失误，不会主动承认，除非玩家取得记录或建立信任。",
@@ -62,6 +74,18 @@
         "伤势严重",
         "没有战斗经验",
         "只看见事件的一部分"
+      ],
+      "actor_complexity": "simplified",
+      "capability_refs": [
+        "capability:hunter.signature"
+      ],
+      "resource_refs": [
+        "resource:endurance"
+      ],
+      "runtime_effect_refs": [],
+      "object_refs": [],
+      "custom_tags": [
+        "faction.北境王国驿站"
       ]
     },
     "prompt": "他曾听见呼名声使用了自己已故姐姐的声音，因此隐瞒了短暂跟随声音离队的事实。该秘密是心理与线索来源，不代表他被永久控制。",
@@ -96,6 +120,18 @@
         "无法复活死者",
         "神术受圣徽和祷告条件限制",
         "不会主动泄露忏悔内容"
+      ],
+      "actor_complexity": "simplified",
+      "capability_refs": [
+        "capability:priest.signature"
+      ],
+      "resource_refs": [
+        "resource:endurance"
+      ],
+      "runtime_effect_refs": [],
+      "object_refs": [],
+      "custom_tags": [
+        "faction.晨辉教会"
       ]
     },
     "prompt": "她发现礼拜堂地下旧封印正在变弱，却担心公开消息引发恐慌。她会先测试队伍是否可靠，再提供进入地下室的机会。",
@@ -131,6 +167,19 @@
         "正面战斗能力普通",
         "不会为玩家无偿冒险",
         "情报可能过时或带有交易目的"
+      ],
+      "actor_complexity": "full",
+      "capability_refs": [
+        "capability:mage.signature",
+        "capability:mage.fireball"
+      ],
+      "resource_refs": [
+        "resource:endurance"
+      ],
+      "runtime_effect_refs": [],
+      "object_refs": [],
+      "custom_tags": [
+        "faction.黑烛商会"
       ]
     },
     "prompt": "他持有一张通往旧帝国地下驿站的残图，但只有在队伍替他取回被教会扣押的封印箱或提供同等价值情报时才会交易。",
@@ -166,6 +215,18 @@
         "不会施展高阶奥术",
         "鉴定需要时间和工具",
         "拒绝制作禁忌奴役符文"
+      ],
+      "actor_complexity": "simplified",
+      "capability_refs": [
+        "capability:alchemist.signature"
+      ],
+      "resource_refs": [
+        "resource:endurance"
+      ],
+      "runtime_effect_refs": [],
+      "object_refs": [],
+      "custom_tags": [
+        "faction.灰脊氏族与银炬公会合作方"
       ]
     },
     "prompt": "她认出徽章背面的环纹使用了失传的“逆流蚀刻”技术，但会先要求队伍证明物品来源合法，以免卷入走私案。",
@@ -201,6 +262,18 @@
         "在城镇政治中影响有限",
         "不会透露盟约圣地位置",
         "污染区施法受限"
+      ],
+      "actor_complexity": "simplified",
+      "capability_refs": [
+        "capability:druid.signature"
+      ],
+      "resource_refs": [
+        "resource:endurance"
+      ],
+      "runtime_effect_refs": [],
+      "object_refs": [],
+      "custom_tags": [
+        "faction.翡翠盟约"
       ]
     },
     "prompt": "她知道北林深处出现了一座原本不存在的旧帝国门塔，但担心人类势力涌入，因此不会在初次见面时公开精确位置。",

@@ -94,7 +94,7 @@ _INSTANCE_PAGE_PATTERNS = (
 
 
 HELP_TEXT = """\
-【AI 酒馆 v0.9.3｜多人跑团与独立存档】
+【AI 酒馆 v0.11.2｜多人叙事、真人 DM 与世界协议 v5】
 主持：/酒馆 开启 <副本> → /酒馆 开演
 恢复：/酒馆 暂停 → /酒馆 恢复 → 全员准备 → /酒馆 继续
 玩家：/酒馆 加入｜角色｜准备｜阵容｜暂离｜返回队列｜退出
@@ -104,6 +104,7 @@ HELP_TEXT = """\
 集体：/酒馆 投票 A（不消耗个人行动）
 记录：/酒馆 回顾｜存档列表｜存档 <名称>｜删档 <名称>｜读档｜回滚
 管理：审核｜强制全员准备｜强制下一位｜倒计时｜用量｜限额｜移至｜指定
+主持：/酒馆 主持 开启｜指引｜推进｜直述｜交棒｜自动｜状态｜接管
 帮助：/酒馆 帮助 建卡｜回合｜投票｜回顾｜管理
 安全：任一出场玩家可发送 /酒馆 安全暂停
 结束：/酒馆 关闭｜/酒馆 完结 确认｜/酒馆 强制终止 确认 <原因>
@@ -779,10 +780,37 @@ def format_card_preview(draft: Mapping[str, Any]) -> str:
     for definition in template.get("fields") or []:
         if definition.get("stat_key"):
             continue
-        value = str(fields.get(definition.get("key"), "") or "")
+        raw_value = fields.get(definition.get("key"), "")
+        value = (
+            "、".join(str(item) for item in raw_value)
+            if isinstance(raw_value, list)
+            else str(raw_value or "")
+        )
         if definition.get("private"):
             value = "（私密字段已保存）" if value else "（未填写）"
         lines.append(f"· {definition.get('label')}：{value or '（未填写）'}")
+    resolved_boundaries = fields.get("_resolved_boundaries")
+    if isinstance(resolved_boundaries, Mapping):
+        knowledge = resolved_boundaries.get("knowledge") or {}
+        content = resolved_boundaries.get("content") or {}
+        lines.extend(["", "【知识边界｜由世界包与预设生成】"])
+        domains = knowledge.get("domains") or {}
+        if domains:
+            lines.append(
+                "· 领域：" + "；".join(
+                    f"{key}={value}" for key, value in domains.items()
+                )
+            )
+        lines.append(
+            "· 禁止范围："
+            + "、".join(knowledge.get("forbidden_domains") or [])
+            if knowledge.get("forbidden_domains")
+            else "· 禁止范围：按世界通用规则"
+        )
+        lines.extend(["", "【内容边界｜世界包权威】"])
+        lines.append(f"· 分级：{content.get('rating') or 'general'}")
+        if content.get("hard_denials"):
+            lines.append("· 硬边界：" + "、".join(content["hard_denials"]))
     if uses_preset_stack_stats(template):
         lines.append("")
         try:

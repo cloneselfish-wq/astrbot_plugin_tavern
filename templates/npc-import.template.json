@@ -1,43 +1,47 @@
 {
-  "template_metadata": {
-    "template_bundle_version": "1.2.0",
-    "compatible_plugin_version": "0.9.3",
-    "npc_import_template_version": 1,
-    "purpose": "管理台常驻 NPC 批量导入载荷；复制后修改 world_slug 与 items",
-    "merge_rule": "v0.9.3 导入时按同一世界内的 NPC 名称更新，未命中名称则新建"
-  },
-  "world_slug": "generic-world-template",
+  "template_version": 2,
+  "minimum_plugin_version": "0.11.0",
+  "world_slug": "replace-with-world-slug",
   "items": [
     {
-      "slug": "npc_example_guide",
-      "name": "示例向导",
+      "slug": "simple-actor",
+      "name": "简化 NPC",
       "role": "npc",
       "profile": {
-        "identity": "替换为公开身份、职业与社会位置",
-        "appearance": "替换为可见外貌、服装、年龄段与显著物件",
-        "personality": "替换为稳定性格、说话方式和压力下的反应",
-        "public_background": "替换为玩家可以通过常识或普通调查得知的经历",
-        "faction": "替换为所属阵营；无阵营时填写独立",
-        "location": "替换为常驻或首次出现地点",
-        "known_facts": [
-          "该 NPC 确实知道且能够合理说明的事实",
-          "与其身份、经历或亲历事件一致的线索"
-        ],
-        "misunderstandings": [
-          "该 NPC 当前相信但可能不正确的判断"
-        ],
-        "relationship_stance": "替换为对玩家的初始立场、合作条件和底线",
-        "capabilities": [
-          "替换为来源明确的技能、资源或权限"
-        ],
-        "limitations": [
-          "替换为能力上限、知识盲区、资源条件和不能越过的权限"
-        ],
-        "private_direction": "仅供叙事引擎使用：替换为隐藏动机、私人秘密、触发条件与绝不能提前公开的内容"
+        "actor_complexity": "simplified",
+        "identity": "身份",
+        "capability_refs": [],
+        "resource_refs": [],
+        "runtime_effect_refs": [],
+        "object_refs": [],
+        "custom_tags": []
       },
-      "prompt": "仅供叙事引擎使用：说明该 NPC 的隐藏目标、保密信息、何时愿意透露、哪些行为不会做。不得写入玩家不可避免的强制结果。",
-      "sort_order": 0,
-      "enabled": true
+      "prompt": "只写该 NPC 的私密动机与行为边界。",
+      "sort_order": 10
+    },
+    {
+      "slug": "full-actor",
+      "name": "完整 NPC",
+      "role": "npc",
+      "profile": {
+        "actor_complexity": "full",
+        "identity": "身份",
+        "capability_refs": [
+          "capability:basic"
+        ],
+        "resources": {
+          "resource:focus": 5
+        },
+        "runtime_effect_refs": [],
+        "object_refs": [
+          "object:example_object"
+        ],
+        "custom_tags": [
+          "faction.example"
+        ]
+      },
+      "prompt": "不得读取玩家私密信息或临时获得未声明能力。",
+      "sort_order": 20
     }
   ]
 }

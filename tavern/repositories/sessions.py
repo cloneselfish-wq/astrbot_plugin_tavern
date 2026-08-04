@@ -627,6 +627,7 @@ class SessionRepositoryMixin:
         instance_slug: str,
         instance_name: str,
         snapshot_ref: str = "",
+        candidate_world_ref: str = "",
     ) -> dict[str, Any]:
         return await self._run(
             self._clone_session,
@@ -635,6 +636,7 @@ class SessionRepositoryMixin:
             instance_slug,
             instance_name,
             snapshot_ref,
+            candidate_world_ref,
         )
 
     def _clone_session(
@@ -644,6 +646,7 @@ class SessionRepositoryMixin:
         instance_slug: str,
         instance_name: str,
         snapshot_ref: str,
+        candidate_world_ref: str,
     ) -> dict[str, Any]:
         slug = validate_slug(instance_slug)
         name = clean_text(instance_name, max_chars=100)
@@ -658,6 +661,39 @@ class SessionRepositoryMixin:
                 ).fetchone()
                 if not source:
                     raise DatabaseNotFoundError("源副本不存在")
+                candidate_world = None
+                candidate_payload: dict[str, Any] | None = None
+                if candidate_world_ref:
+                    candidate_world = connection.execute(
+                        """
+                        SELECT * FROM worlds
+                        WHERE (id=? OR slug=?) AND archived=0
+                        """,
+                        (candidate_world_ref, candidate_world_ref),
+                    ).fetchone()
+                    if not candidate_world:
+                        raise DatabaseNotFoundError("候选世界包不存在或已归档")
+                    source_config = connection.execute(
+                        "SELECT * FROM instance_configs WHERE session_id=?",
+                        (source_session_id,),
+                    ).fetchone()
+                    if not source_config:
+                        raise DatabaseNotFoundError("源副本缺少冻结世界配置")
+                    from ..world_migration import compare_world_contracts
+
+                    candidate_payload = self._world(candidate_world)
+                    migration = compare_world_contracts(
+                        json_load(source_config["world_snapshot_json"], {}),
+                        candidate_payload,
+                    )
+                    if not migration["safe_for_clone"]:
+                        codes = ", ".join(
+                            str(item.get("code") or "unknown")
+                            for item in migration["blockers"]
+                        )
+                        raise DatabaseConflictError(
+                            f"候选世界不能安全克隆应用：{codes}"
+                        )
                 duplicate = connection.execute(
                     """
                     SELECT 1 FROM sessions
@@ -730,7 +766,7 @@ class SessionRepositoryMixin:
                         source["unified_origin"],
                         slug,
                         name,
-                        source["world_id"],
+                        candidate_world["id"] if candidate_world else source["world_id"],
                         turn_no,
                         state_json,
                         now,
@@ -748,6 +784,13 @@ class SessionRepositoryMixin:
                     phase["branched_from_snapshot_id"] = (
                         snapshot["id"] if snapshot else ""
                     )
+                    if candidate_world and candidate_payload:
+                        phase["world_upgrade_from_revision"] = int(
+                            config["world_revision"]
+                        )
+                        phase["world_upgrade_to_revision"] = int(
+                            candidate_world["revision"]
+                        )
                     connection.execute(
                         """
                         INSERT INTO instance_configs(
@@ -758,9 +801,18 @@ class SessionRepositoryMixin:
                         """,
                         (
                             target_id,
-                            config["world_revision"],
-                            config["world_snapshot_json"],
-                            config["time_rules_json"],
+                            (
+                                candidate_world["revision"]
+                                if candidate_world else config["world_revision"]
+                            ),
+                            (
+                                json_dump(candidate_payload)
+                                if candidate_payload else config["world_snapshot_json"]
+                            ),
+                            (
+                                json_dump(world_time_rules(candidate_payload))
+                                if candidate_payload else config["time_rules_json"]
+                            ),
                             json_dump(phase),
                             now,
                             now,
@@ -2861,4 +2913,3 @@ class SessionRepositoryMixin:
             except Exception:
                 connection.execute("ROLLBACK")
                 raise
-

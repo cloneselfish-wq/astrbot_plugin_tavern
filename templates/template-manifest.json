@@ -1,27 +1,45 @@
 {
-  "template_bundle_version": "1.2.0",
-  "compatible_plugin_version": "0.9.3",
-  "world_schema_version": 3,
-  "character_card_template_version": 4,
-  "npc_import_template_version": 1,
+  "template_bundle_version": "3.0.0",
+  "compatible_plugin_version": "0.11.2",
+  "world_schema_versions": [
+    2,
+    3,
+    4,
+    5
+  ],
+  "character_card_template_versions": [
+    5,
+    6
+  ],
+  "npc_import_template_version": 2,
+  "feature_protocol_versions": {
+    "entity_registry": "1.0",
+    "condition_engine": "1.0",
+    "operation_engine": "1.0",
+    "event_pipeline": "1.0",
+    "resolution_receipt": "1.0",
+    "capabilities": "1.0",
+    "resources": "1.0",
+    "runtime_effects": "1.0",
+    "objects": "1.0",
+    "resolution_methods": "1.0",
+    "interaction_rules": "1.0",
+    "action_intents": "1.0"
+  },
   "files": {
     "instructions": "templates/README.md",
-    "world_package": "templates/world-package.template.json",
-    "preset_stack_world_package": "templates/world-package-preset-stack.template.json",
-    "npc_import": "templates/npc-import.template.json"
+    "v4_world_package": "templates/world-package.template.json",
+    "v4_preset_stack_world_package": "templates/world-package-preset-stack.template.json",
+    "capabilities": "templates/world-package-capabilities.template.json",
+    "interaction_rules": "templates/world-package-interaction-rules.template.json",
+    "v5_full_example": "templates/world-package-v5-full-example.json",
+    "npc_import": "templates/npc-import.template.json",
+    "v4_to_v5_migration": "templates/migration-v4-to-v5.example.json",
+    "id_aliases": "templates/id-aliases.example.json"
   },
   "release_policy": {
     "validated_in_test_suite": true,
-    "update_together_when": [
-      "plugin_version_changes",
-      "world_schema_changes",
-      "character_card_or_preset_wizard_changes",
-      "resolution_or_dice_contract_changes",
-      "context_compiler_or_budget_changes",
-      "attribute_id_or_display_label_changes",
-      "npc_import_contract_changes",
-      "stable_id_or_validation_rules_change",
-      "stat_generation_or_preset_stack_contract_changes"
-    ]
+    "unknown_extensions_round_trip": true,
+    "running_sessions_keep_frozen_snapshot": true
   }
 }

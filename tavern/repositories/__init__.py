@@ -9,6 +9,7 @@ from .characters import CharacterRepositoryMixin
 from .workflow import WorkflowRepositoryMixin
 from .timers import TimerRepositoryMixin
 from .admin import AdminRepositoryMixin
+from .control import ControlRepositoryMixin
 
 __all__ = [
     "CurrentStateRepositoryMixin",
@@ -20,4 +21,5 @@ __all__ = [
     "WorkflowRepositoryMixin",
     "TimerRepositoryMixin",
     "AdminRepositoryMixin",
+    "ControlRepositoryMixin",
 ]

@@ -10,6 +10,7 @@ import sqlite3
 import stat
 import uuid
 import zipfile
+from collections import OrderedDict
 from contextlib import closing
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -40,6 +41,7 @@ from .database import (
     InvalidTransitionError,
     TavernDatabase,
 )
+from .database_support import validate_slug
 from .events import EventBroker
 from .lifecycle import normalize_time_rules
 from .diagnostics import build_diagnostic_report
@@ -48,6 +50,8 @@ from .operations import recovery_summary
 from .world_migration import compare_world_contracts
 from .world_preflight import inspect_world_package
 from .world_import import world_edit_payload, world_import_payload
+from .rule_runtime import RuleRuntime
+from .entity_registry import EntityRegistry
 from .storage import (
     file_sha256,
     next_timestamped_path,
@@ -58,6 +62,40 @@ from .storage import (
 
 _BACKUP_HASH_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _MAX_BACKUP_UNCOMPRESSED = 4 * 1024 * 1024 * 1024
+# 世界包导入冲突的前缀标记：前端据此弹出「覆盖为新修订 / 另存副本」决策弹窗。
+_WORLD_CONFLICT_PREFIX = "导入冲突"
+_WORLD_SIMULATE_MAX_BYTES = 1_000_000
+_WORLD_SIMULATE_MAX_DEPTH = 40
+
+
+def _json_size(obj: Any) -> int:
+    try:
+        return len(json.dumps(obj, ensure_ascii=False))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _json_depth(obj: Any, limit: int = _WORLD_SIMULATE_MAX_DEPTH) -> bool:
+    """粗略判断 JSON 嵌套深度是否超过 limit（防计算型 DoS）。"""
+
+    def walk(value: Any, depth: int) -> bool:
+        if depth > limit:
+            return True
+        if isinstance(value, dict):
+            return any(walk(item, depth + 1) for item in value.values())
+        if isinstance(value, (list, tuple)):
+            return any(walk(item, depth + 1) for item in value)
+        return False
+
+    return walk(obj, 0)
+
+
+def _content_version_key(value: Any) -> tuple[int, ...] | None:
+    text = str(value or "").strip().lstrip("vV")
+    match = re.fullmatch(r"\d+(?:\.\d+){0,3}", text)
+    if not match:
+        return None
+    return tuple(int(part) for part in text.split("."))
 
 
 def _safe_backup_member(name: str) -> PurePosixPath:
@@ -189,7 +227,27 @@ class TavernWebConsole:
         self.logger = logger
         self.allow_group = allow_group
         self.config_lock = config_lock
+        # 0.11.1：按 (slug, revision) 缓存 RuleRuntime，避免每次
+        # world_simulate 全量重建 EntityRegistry/CapabilityService/EventPipeline。
+        # RuleRuntime 在 __init__ 后只读（resolve 不修改内部状态），可安全复用。
+        self._rule_runtime_cache: "OrderedDict[tuple[str, int], RuleRuntime]" = (
+            OrderedDict()
+        )
         self._register_routes()
+
+    def _cached_rule_runtime(self, world: Mapping[str, Any]) -> RuleRuntime:
+        slug = str(world.get("slug") or "").strip()
+        revision = int(world.get("revision") or 0)
+        if not slug:
+            return RuleRuntime(world)
+        key = (slug, revision)
+        cached = self._rule_runtime_cache.get(key)
+        if cached is None:
+            cached = RuleRuntime(world)
+            self._rule_runtime_cache[key] = cached
+            if len(self._rule_runtime_cache) > 8:
+                self._rule_runtime_cache.popitem(last=False)
+        return cached
 
     def _register(self, path: str, handler: Any, methods: list[str], desc: str) -> None:
         self.context.register_web_api(
@@ -206,6 +264,8 @@ class TavernWebConsole:
             ("worlds/preflight", self.world_preflight, ["POST"], "Inspect world package"),
             ("worlds/migration", self.world_migration, ["POST"], "Compare frozen world contract"),
             ("worlds/save", self.world_save, ["POST"], "Save world"),
+            ("worlds/order", self.world_order, ["POST"], "Reorder world"),
+            ("worlds/simulate", self.world_simulate, ["POST"], "Dry-run v5 rules"),
             ("worlds/archive", self.world_archive, ["POST"], "Archive world"),
             ("worlds/restore", self.world_restore, ["POST"], "Restore world"),
             ("characters", self.characters, ["GET"], "List characters"),
@@ -506,6 +566,54 @@ class TavernWebConsole:
         except Exception as exc:
             return self._handle_error(exc)
 
+    async def world_order(self):
+        try:
+            payload = await self._payload()
+            item = await self.database.set_world_sort_order(
+                str(payload.get("id") or ""),
+                int(payload.get("sort_order") or 1),
+                self._actor(),
+            )
+            await self.broker.publish({"type": "world", "action": "reorder"})
+            return json_response({"item": item})
+        except Exception as exc:
+            return self._handle_error(exc)
+
+    async def world_simulate(self):
+        try:
+            # 0.11.1：补齐鉴权（此前是唯一漏掉 _username() 的路由），
+            # 并对可投递的 world/intent/context 做体积与深度上限，防计算型 DoS。
+            self._username()
+            payload = await self._payload()
+            world_ref = str(payload.get("world_ref") or "")
+            world = (
+                await self.database.get_world(world_ref)
+                if world_ref
+                else payload.get("world")
+            )
+            if not isinstance(world, dict):
+                raise ValueError("请提供 world_ref 或 world")
+            if _json_size(world) > _WORLD_SIMULATE_MAX_BYTES:
+                raise ValueError("世界包过大，拒绝执行规则模拟")
+            if _json_depth(world):
+                raise ValueError("世界包嵌套过深，拒绝执行规则模拟")
+            report = inspect_world_package(world)
+            if not report["compatible"]:
+                raise ValueError("世界包体检未通过，不能执行规则模拟")
+            intent = payload.get("intent")
+            context = payload.get("context", {})
+            if not isinstance(intent, dict) or not isinstance(context, dict):
+                raise ValueError("intent 与 context 必须是 JSON 对象")
+            if _json_depth({"intent": intent, "context": context}):
+                raise ValueError("intent 或 context 嵌套过深")
+            result = self._cached_rule_runtime(world).resolve_action_intent(
+                intent, context, dry_run=True,
+                world_snapshot_id=f"preview:{world.get('slug', '')}",
+            )
+            return json_response({"result": result, "preflight": report})
+        except Exception as exc:
+            return self._handle_error(exc)
+
     async def world_migration(self):
         try:
             payload = await self._payload()
@@ -595,7 +703,9 @@ class TavernWebConsole:
         """导入世界包 JSON：校验结构后按 slug 新建或更新世界。"""
         try:
             self._username()
-            payload = await self._payload()
+            request_payload = await self._payload()
+            import_mode = str(request_payload.get("import_mode") or "auto")
+            payload = request_payload.get("world", request_payload)
             if not isinstance(payload, dict):
                 raise ValueError("世界包 JSON 格式无效：顶层必须是一个对象")
             if not payload.get("slug"):
@@ -619,13 +729,53 @@ class TavernWebConsole:
                 ]
                 raise ValueError("世界包体检未通过：" + "；".join(messages[:5]))
             import_payload = world_import_payload(payload)
-            # 按 slug 更新已存在世界，否则新建（save_world 会再次校验字段合法性）
             mode = "created"
             try:
                 existing = await self.database.get_world(str(payload["slug"]))
-                import_payload["id"] = existing["id"]
-                import_payload["revision"] = existing["revision"]
-                mode = "updated"
+                existing_package = world_import_payload(existing)
+                incoming_hash = hashlib.sha256(
+                    json.dumps(import_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+                ).hexdigest()
+                existing_hash = hashlib.sha256(
+                    json.dumps(existing_package, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+                ).hexdigest()
+                if incoming_hash == existing_hash:
+                    return json_response({"item": existing, "mode": "identical", "preflight": report})
+                if import_mode == "copy":
+                    copy_slug = str(request_payload.get("copy_slug") or f"{payload['slug']}-copy")
+                    suffix = 2
+                    while True:
+                        try:
+                            await self.database.get_world(copy_slug)
+                            copy_slug = f"{payload['slug']}-copy-{suffix}"
+                            suffix += 1
+                        except DatabaseNotFoundError:
+                            break
+                    import_payload["slug"] = copy_slug
+                    mode = "copied"
+                else:
+                    old_version = str(existing.get("world_content_version") or existing.get("version") or "")
+                    new_version = str(payload.get("world_content_version") or payload.get("version") or "")
+                    if old_version and new_version and old_version == new_version and import_mode != "force_revision":
+                        raise DatabaseConflictError(
+                            f"{_WORLD_CONFLICT_PREFIX}：同 slug、同内容版本但内容不同；"
+                            "请选择“覆盖为新修订”或“另存副本”"
+                        )
+                    old_key = _content_version_key(old_version)
+                    new_key = _content_version_key(new_version)
+                    if (
+                        old_key is not None
+                        and new_key is not None
+                        and new_key < old_key
+                        and import_mode != "force_revision"
+                    ):
+                        raise DatabaseConflictError(
+                            f"{_WORLD_CONFLICT_PREFIX}：导入包的内容版本低于现有世界；"
+                            "如确需回退，请明确选择“覆盖为新修订”"
+                        )
+                    import_payload["id"] = existing["id"]
+                    import_payload["revision"] = existing["revision"]
+                    mode = "updated"
             except DatabaseNotFoundError:
                 pass
             item = await self.database.save_world(import_payload, self._actor())
@@ -650,6 +800,9 @@ class TavernWebConsole:
                     "请指定目标世界：world_id 或 world_slug 不能为空"
                 )
             world = await self.database.get_world(str(world_ref).strip())
+            template_version = int(payload.get("template_version", 1) or 1)
+            if template_version not in {1, 2}:
+                raise ValueError("只接受 NPC 导入模板 v1 或 v2")
             items = (
                 payload.get("items")
                 or payload.get("npcs")
@@ -659,13 +812,17 @@ class TavernWebConsole:
                 raise ValueError(
                     "常驻角色数据必须是非空数组（字段 items / npcs）"
                 )
-            existing = {
-                item["name"]: item
-                for item in (
-                    await self.database.list_characters(world["id"])
-                )
-                if isinstance(item.get("name"), str)
+            existing_items = await self.database.list_characters(world["id"])
+            existing_by_slug = {
+                str(item.get("slug")): item for item in existing_items
+                if item.get("slug")
             }
+            existing_by_name = {
+                str(item.get("name")): item for item in existing_items
+                if item.get("name")
+            }
+            registry = EntityRegistry(world) if int(world.get("world_schema_version", 0) or 0) >= 5 else None
+            input_slugs: set[str] = set()
             created = []
             for index, raw in enumerate(items):
                 if not isinstance(raw, dict):
@@ -680,6 +837,31 @@ class TavernWebConsole:
                         f"角色「{name}」的 profile 必须是 JSON 对象"
                     )
                 profile = dict(npc_profile) if isinstance(npc_profile, dict) else {}
+                raw_slug = str(raw.get("slug") or "").strip()
+                if raw_slug:
+                    if raw_slug in input_slugs:
+                        raise ValueError(f"NPC 导入包含重复 slug：{raw_slug}")
+                    input_slugs.add(raw_slug)
+                    validate_slug(raw_slug)
+                if registry is not None:
+                    ref_fields = {
+                        "capability_refs": "capability",
+                        "resource_refs": "resource",
+                        "runtime_effect_refs": "runtime_effect",
+                        "object_refs": "object",
+                    }
+                    for field, expected_type in ref_fields.items():
+                        values = profile.get(field, [])
+                        if not isinstance(values, list):
+                            raise ValueError(f"角色「{name}」的 {field} 必须是数组")
+                        for ref in values:
+                            registry.resolve(ref, expected_type)
+                    resources = profile.get("resources", {})
+                    if resources and not isinstance(resources, dict):
+                        raise ValueError(f"角色「{name}」的 resources 必须是对象")
+                    if isinstance(resources, dict):
+                        for ref in resources:
+                            registry.resolve(ref, "resource")
                 private = raw.get("private_direction") or raw.get("prompt") or ""
                 if private:
                     profile.setdefault("private_direction", private)
@@ -691,7 +873,11 @@ class TavernWebConsole:
                     "prompt": str(private),
                     "enabled": 1,
                 }
-                prior = existing.get(name)
+                prior = existing_by_slug.get(raw_slug) if raw_slug else None
+                if prior is None:
+                    # v1 did not require stable slugs, so name fallback remains
+                    # solely for legacy imports.
+                    prior = existing_by_name.get(name)
                 if prior:
                     character_payload["id"] = prior["id"]
                     character_payload["revision"] = prior["revision"]
@@ -699,7 +885,9 @@ class TavernWebConsole:
                     character_payload["sort_order"] = prior.get("sort_order", 0)
                     character_payload["enabled"] = prior.get("enabled", 1)
                 else:
-                    character_payload["slug"] = f"npc_{uuid.uuid4().hex[:12]}"
+                    character_payload["slug"] = raw_slug or f"npc_{uuid.uuid4().hex[:12]}"
+                if "sort_order" in raw:
+                    character_payload["sort_order"] = int(raw["sort_order"])
                 created.append(
                     await self.database.save_character(
                         character_payload, self._actor()
@@ -742,6 +930,7 @@ class TavernWebConsole:
                     "players": await self.database.list_players(session_id),
                     "roster": await self.database.list_roster(session_id),
                     "turn": await self.database.get_turn_status(session_id),
+                    "control": await self.database.get_control_state(session_id),
                     "events": await self.database.recent_events(session_id, 80),
                     "snapshots": await self.database.list_snapshots(session_id),
                     "instance_config": (
@@ -1026,6 +1215,9 @@ class TavernWebConsole:
                     snapshot_ref=str(
                         payload.get("snapshot_ref") or ""
                     ),
+                    candidate_world_ref=str(
+                        payload.get("candidate_world_ref") or ""
+                    ),
                 )
             else:
                 session_id = str(payload.get("session_id") or "")
@@ -1042,6 +1234,36 @@ class TavernWebConsole:
                         }
                     )
                     return json_response({"result": result})
+                if action == "dm_enable":
+                    result = await self.database.enable_dm_mode(
+                        session_id,
+                        str(payload.get("dm_user_id") or actor),
+                        actor,
+                    )
+                    return json_response({"control": result})
+                if action == "dm_directive":
+                    result = await self.database.set_dm_directive(
+                        session_id,
+                        str(payload.get("directive") or ""),
+                        str(payload.get("dm_user_id") or actor),
+                    )
+                    return json_response({"control": result})
+                if action == "dm_direct":
+                    session = await self.database.get_session(session_id)
+                    dm_user_id = str(payload.get("dm_user_id") or "")
+                    result = await self.database.commit_dm_beat(
+                        session_id=session_id,
+                        expected_revision=int(session["revision"]),
+                        dm_user_id=dm_user_id,
+                        instruction=str(payload.get("narrative") or ""),
+                        narrative=str(payload.get("narrative") or ""),
+                        world_state=session["world_state"],
+                        direct=True,
+                    )
+                    return json_response({"result": result})
+                if action == "dm_disable":
+                    result = await self.database.disable_dm_mode(session_id, actor)
+                    return json_response({"control": result})
                 if action == "delete":
                     result = await self.database.delete_session(
                         session_id,
@@ -1838,7 +2060,7 @@ class TavernWebConsole:
                 raise ValueError("缺少备份文件")
             filename = str(upload.filename or "").lower()
             if not filename.endswith((".json", ".zip")):
-                raise ValueError("只接受 v0.9.x Schema 8 的 JSON 或 ZIP 备份")
+                raise ValueError("只接受完整的 Schema 9 或 Schema 10 JSON/ZIP 备份")
             temp_dir = self.data_dir / "imports"
             temp_dir.mkdir(parents=True, exist_ok=True)
             suffix = ".zip" if filename.endswith(".zip") else ".json"

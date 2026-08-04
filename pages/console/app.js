@@ -97,7 +97,7 @@ function validateCharacterCardTemplate(template) {
       throw new Error("preset_stack 必须声明 base_stats 与 bonus_sources");
     }
     if (generation.allow_manual_edit !== false) {
-      throw new Error("v0.9.3 的 preset_stack 必须设置 allow_manual_edit=false");
+      throw new Error("preset_stack 必须设置 allow_manual_edit=false");
     }
     // Canonicalize the editor value without deleting the compatibility copy.
     template.stat_generation = generation;
@@ -1114,10 +1114,10 @@ function renderWorlds() {
   }
   root.innerHTML = app.worlds
     .map(
-      (world, index) => `
+      (world) => `
         <article class="world-card ${world.archived ? "is-archived" : ""}">
           <div class="world-card-top">
-            <span class="world-number">WORLD ${String(index + 1).padStart(2, "0")}</span>
+            <span class="world-number">WORLD ${String(world.display_no || 0).padStart(2, "0")}</span>
             ${world.archived ? '<span class="status-badge status-closed">已归档</span>' : ""}
           </div>
           <h3>${escapeHTML(world.name)}</h3>
@@ -1154,6 +1154,9 @@ function renderWorlds() {
             <button class="action-button" data-world-action="preflight" data-id="${escapeHTML(
               world.id,
             )}">兼容性体检</button>
+            ${Number(world.world_schema_version || 0) >= 5 ? `<button class="action-button" data-world-action="simulate" data-id="${escapeHTML(world.id)}">规则模拟</button>` : ""}
+            <button class="action-button" data-world-action="up" data-id="${escapeHTML(world.id)}">上移</button>
+            <button class="action-button" data-world-action="down" data-id="${escapeHTML(world.id)}">下移</button>
             ${
               world.archived
                 ? `<button class="action-button" data-world-action="restore" data-id="${escapeHTML(
@@ -1438,6 +1441,10 @@ function openWorldEditor(world = null) {
       description: "",
       system_prompt: "",
       opening_scene: "",
+      world_schema_version: 5,
+      minimum_plugin_version: "0.11.0",
+      protocol: { core_version: 5, features: {} },
+      required_features: [],
       rules: {
         resolution: "d20",
         default_difficulty: 12,
@@ -1462,6 +1469,12 @@ function openWorldEditor(world = null) {
       },
     };
   const rulesForEditor = { ...(item.rules || {}) };
+  const protocolEnvelope = {
+    protocol: item.protocol || { core_version: Number(item.world_schema_version || 5), features: {} },
+    required_features: item.required_features || [],
+    id_aliases: item.id_aliases || {},
+    numeric_policies: item.numeric_policies || {},
+  };
   const characterCardTemplate =
     rulesForEditor.character_card ||
     item.card_template ||
@@ -1480,6 +1493,17 @@ function openWorldEditor(world = null) {
           <label for="world-slug">唯一标识</label>
           <input id="world-slug" value="${escapeHTML(item.slug)}" maxlength="64"
             placeholder="lowercase-slug" />
+        </div>
+        <div class="field">
+          <label for="world-schema-version">世界核心协议</label>
+          <select id="world-schema-version">
+            ${[2, 3, 4, 5].map((value) => `<option value="${value}" ${Number(item.world_schema_version || 5) === value ? "selected" : ""}>v${value}${value === 5 ? " · 模块化" : " · 兼容模式"}</option>`).join("")}
+          </select>
+        </div>
+        <div class="field field-span-2">
+          <label for="world-protocol-envelope">协议功能与迁移映射 JSON</label>
+          <textarea id="world-protocol-envelope" class="code-field" rows="10">${escapeHTML(prettyJSON(protocolEnvelope))}</textarea>
+          <small>v5 只加载 protocol.features 与 required_features 明确启用的模块；未启用模块不会成为必填项。能力、资源、对象、持续效果、裁定和交互规则可继续在下方规则 JSON 中编辑。</small>
         </div>
         <div class="field field-span-2">
           <label for="world-description">简介</label>
@@ -1592,6 +1616,8 @@ function openWorldEditor(world = null) {
     `,
     onSave: async () => {
       const rules = parseJSONField("#world-rules", "裁定规则");
+      const protocol = parseJSONField("#world-protocol-envelope", "协议功能与迁移映射");
+      const schemaVersion = Number($("#world-schema-version").value);
       const characterCard = parseJSONField("#world-character-card", "玩家角色卡模板");
       characterCard.stats = characterCard.stats || {};
       characterCard.stats.mode = $("#world-stats-mode").value;
@@ -1625,17 +1651,19 @@ function openWorldEditor(world = null) {
         rules,
         initial_state: parseJSONField("#world-state", "初始世界状态"),
         archived: Boolean(item.archived),
-        world_schema_version: Number(
-          item.world_schema_version || item.rules?.world_schema_version || 3,
+        world_schema_version: schemaVersion,
+        minimum_plugin_version: schemaVersion >= 5 ? "0.11.0" : (
+          item.minimum_plugin_version || (characterCard.stats.mode === "preset_stack" ? "0.9.3" : "")
         ),
-        minimum_plugin_version:
-          item.minimum_plugin_version ||
-          (characterCard.stats.mode === "preset_stack" ? "0.9.3" : ""),
-        capabilities: {
+        protocol: schemaVersion >= 5 ? protocol.protocol : item.protocol,
+        required_features: schemaVersion >= 5 ? (protocol.required_features || []) : (item.required_features || []),
+        id_aliases: protocol.id_aliases || {},
+        numeric_policies: protocol.numeric_policies || {},
+        ...(schemaVersion < 5 ? {capabilities: {
           character_stats: characterCard.stats.mode !== "none",
           attribute_checks: rules.resolution.mode === "attribute",
           dice_resolution: ["dice_only", "attribute"].includes(rules.resolution.mode),
-        },
+        }} : {}),
       };
       await bridge.apiPost("worlds/save", payload);
       toast(world ? "世界包已更新" : "世界包已创建", "success");
@@ -2235,6 +2263,7 @@ async function openSessionDetail(sessionId) {
   const roster = detail.roster || [];
   const timing = detail.instance_config?.time_rules || {};
   const ruleState = detail.rule_state || {};
+  const controlState = detail.control || { mode: "auto", phase: "auto", beat_no: 0 };
   const progress = ruleState.progress || {};
   const sessionCharacters = detail.session_characters || [];
   const memories = detail.memories || [];
@@ -2321,6 +2350,17 @@ async function openSessionDetail(sessionId) {
           </div>`
         : ""
     }
+    <div class="notice ${controlState.mode === "dm" ? "notice-warning" : ""}" style="margin-top:14px">
+      <div><strong>叙事控制：${controlState.mode === "dm" ? "DM 主持" : "AI 自动"}</strong>
+        <span>活动 DM：${escapeHTML(controlState.active_dm_user_id || "无")} · 阶段：${escapeHTML(controlState.phase || "auto")} · 已推进 ${escapeHTML(controlState.beat_no || 0)} 段</span></div>
+      <div class="table-actions">
+        <button class="action-button" data-session-detail-action="dm-enable" ${readonly ? "disabled" : ""}>开启/接管</button>
+        <button class="action-button" data-session-detail-action="dm-directive" ${controlState.mode !== "dm" || readonly ? "disabled" : ""}>一次性指引</button>
+        <button class="action-button" data-session-detail-action="dm-direct" ${controlState.mode !== "dm" || readonly ? "disabled" : ""}>原文插入</button>
+        <button class="action-button is-danger" data-session-detail-action="dm-disable" ${controlState.mode !== "dm" || readonly ? "disabled" : ""}>恢复自动</button>
+      </div>
+      <small>AI 辅助推进和玩家/NPC 交棒使用群命令；这里与同一主持状态、存档和审计链联动。</small>
+    </div>
     <div class="tabbar">
       <button class="tab-button is-active" data-session-tab="state">总览与规则</button>
       <button class="tab-button" data-session-tab="roster">准备与角色 ${escapeHTML(
@@ -3666,6 +3706,8 @@ async function handleWorldAction(button) {
           <div class="detail-card"><span>数值</span><strong>${escapeHTML(summary.stats_mode || "unknown")}</strong></div>
           <div class="detail-card"><span>裁定</span><strong>${escapeHTML(summary.resolution_mode || "unknown")}</strong></div>
           <div class="detail-card"><span>结果</span><strong>${report.compatible ? "可导入" : "需修复"}</strong></div>
+          <div class="detail-card"><span>注册实体</span><strong>${escapeHTML(summary.entity_count || 0)}</strong></div>
+          <div class="detail-card"><span>功能模块</span><strong>${escapeHTML(Object.keys(summary.feature_versions || {}).length)}</strong></div>
         </div>
         <div class="session-stack" style="margin-top:18px">
           ${(report.issues || []).map((item) => `<div class="session-row"><div><div class="session-name">${escapeHTML(item.level.toUpperCase())} · ${escapeHTML(item.message)}</div><div class="session-meta">${escapeHTML(item.path)} · ${escapeHTML(item.code)}</div></div></div>`).join("") || '<div class="empty-state compact"><span>未发现兼容性问题</span></div>'}
@@ -3674,6 +3716,17 @@ async function handleWorldAction(button) {
         <div class="command-list">${(report.tests || []).map((item) => `<code>${item.status === "passed" ? "✓" : "×"} ${escapeHTML(item.name)}</code>`).join("")}</div>
       `,
     });
+  }
+  if (action === "simulate") openRuleSimulator(world);
+  if (action === "up" || action === "down") {
+    const index = app.worlds.findIndex((item) => item.id === world.id);
+    const neighbor = app.worlds[index + (action === "up" ? -1 : 1)];
+    if (!neighbor) return;
+    const currentOrder = Number(world.sort_order || world.display_no || index + 1);
+    const neighborOrder = Number(neighbor.sort_order || neighbor.display_no || index + 2);
+    await bridge.apiPost("worlds/order", { id: world.id, sort_order: neighborOrder });
+    await bridge.apiPost("worlds/order", { id: neighbor.id, sort_order: currentOrder });
+    await loadCore();
   }
   if (action === "archive") {
     const ok = await confirmAction(
@@ -3691,6 +3744,37 @@ async function handleWorldAction(button) {
     toast("世界包已恢复", "success");
     await loadCore();
   }
+}
+
+function openRuleSimulator(world) {
+  const definitions = world.rules?.capabilities?.definitions || [];
+  const first = Array.isArray(definitions) ? definitions[0] : null;
+  const capabilityRef = first ? `capability:${first.capability_id || first.id}` : "";
+  openEditor({
+    title: `${world.name} · 规则模拟器`,
+    kicker: "DRY RUN · 不修改存档",
+    body: `
+      <div class="field"><label for="rule-sim-intent">行动意图 JSON</label>
+        <textarea id="rule-sim-intent" class="code-field" rows="10">${escapeHTML(prettyJSON({actor_ref: "character:preview", action_type: "freeform", capability_ref: capabilityRef, targets: [], parameters: {}, declared_intent: "预览规则执行"}))}</textarea></div>
+      <div class="field"><label for="rule-sim-context">受控上下文 JSON</label>
+        <textarea id="rule-sim-context" class="code-field" rows="12">${escapeHTML(prettyJSON({actor: {refs: {}, capabilities: capabilityRef ? [{capability_ref: capabilityRef, available: true}] : []}, target: {refs: {}}, scene: {refs: {}}, state: {refs: {}, tags: [], references: []}}))}</textarea></div>
+      <button type="button" class="button button-primary" id="run-rule-simulation">执行只读模拟</button>
+      <div class="template-preview" id="rule-sim-result"><span>结果会逐步显示读取值、命中规则、裁定步骤与拟提交操作。</span></div>
+    `,
+  });
+  $("#run-rule-simulation").addEventListener("click", async () => {
+    try {
+      const response = await bridge.apiPost("worlds/simulate", {
+        world_ref: world.id,
+        intent: parseJSONField("#rule-sim-intent", "行动意图"),
+        context: parseJSONField("#rule-sim-context", "模拟上下文"),
+      });
+      $("#rule-sim-result").innerHTML = `<pre>${escapeHTML(prettyJSON(response.result || {}))}</pre>`;
+      toast("规则模拟完成，未修改任何存档", "success");
+    } catch (error) {
+      showError(error);
+    }
+  });
 }
 
 function openGroupRemarkEditor(button) {
@@ -3827,7 +3911,29 @@ async function handleSessionDetailAction(button) {
   if (!detail) return;
   const sessionId = detail.session.id;
   const action = button.dataset.sessionDetailAction;
-  if (action === "download-diagnostics") {
+  if (action === "dm-enable") {
+    const dmUserId = window.prompt("活动 DM 的 QQ 用户 ID", detail.control?.active_dm_user_id || "")?.trim();
+    if (!dmUserId) return;
+    await bridge.apiPost("sessions/action", { session_id: sessionId, action: "dm_enable", dm_user_id: dmUserId });
+    toast("主持模式已开启", "success");
+    await openSessionDetail(sessionId);
+  } else if (action === "dm-directive") {
+    const directive = window.prompt("下一次 AI 主持推进的一次性导演指引", detail.control?.directive || "")?.trim();
+    if (!directive) return;
+    await bridge.apiPost("sessions/action", { session_id: sessionId, action: "dm_directive", dm_user_id: detail.control?.active_dm_user_id, directive });
+    toast("一次性指引已保存", "success");
+    await openSessionDetail(sessionId);
+  } else if (action === "dm-direct") {
+    const narrative = window.prompt("按原文插入的正式剧情（不会自动修改机械状态）", "")?.trim();
+    if (!narrative) return;
+    await bridge.apiPost("sessions/action", { session_id: sessionId, action: "dm_direct", dm_user_id: detail.control?.active_dm_user_id, narrative });
+    toast("主持原文已提交", "success");
+    await openSessionDetail(sessionId);
+  } else if (action === "dm-disable") {
+    await bridge.apiPost("sessions/action", { session_id: sessionId, action: "dm_disable" });
+    toast("已恢复 AI 自动模式", "success");
+    await openSessionDetail(sessionId);
+  } else if (action === "download-diagnostics") {
     await withBusy(button, async () => {
       await bridge.download(
         "sessions/diagnostics",
@@ -4594,7 +4700,7 @@ $("#export-backup-button").addEventListener("click", async (event) => {
       await bridge.download(
         "backup/export",
         {},
-        "backup_tavern_v0.9.3.zip",
+        "backup_tavern_v0.11.2.zip",
       );
     });
     toast("备份已生成", "success");
@@ -4644,12 +4750,79 @@ function _readImportSource(fileInput, text) {
   });
 }
 
+function isWorldImportConflict(error) {
+  return /^导入冲突/.test(String(error?.message || ""));
+}
+
+async function submitWorldImport(parsed, importMode) {
+  const resp = await bridge.apiPost("worlds/import", {
+    world: parsed,
+    import_mode: importMode,
+  });
+  const world = resp?.item || (app.worlds || []).find((w) => w.slug === parsed.slug);
+  const importLabels = {
+    updated: "世界包已更新",
+    copied: "世界包已另存副本",
+    identical: "相同内容已存在",
+    created: "世界包已导入并创建世界",
+  };
+  toast(importLabels[resp?.mode] || "世界包导入完成", "success");
+  await loadCore();
+  return world;
+}
+
+// 0.11.1：导入遇到「同 slug、同内容版本但内容不同」冲突时，
+// 弹出明确的三选一决策弹窗（覆盖为新修订 / 另存副本 / 取消），
+// 而不是只把 409 错误文案原样展示。
+function openWorldImportConflictDialog(parsed) {
+  openEditor({
+    title: "世界包导入冲突",
+    kicker: "WORLD CONFLICT",
+    body: `
+      <p class="field-hint">同一 slug 已存在且内容版本相同，但内容不同。为避免静默覆盖，请选择处理方式：</p>
+      <div class="import-actions">
+        <button type="button" class="button button-primary" id="wc-override">覆盖为新修订</button>
+        <button type="button" class="button" id="wc-copy">另存副本</button>
+        <button type="button" class="action-button" id="wc-cancel">取消</button>
+      </div>
+      <div class="import-result" id="wc-result" hidden></div>
+    `,
+  });
+  const finish = async (mode) => {
+    const resultEl = $("#wc-result");
+    resultEl.hidden = true;
+    resultEl.className = "import-result";
+    try {
+      const world = await submitWorldImport(parsed, mode);
+      $("#editor-modal").close();
+      if (world) openWorldEditor(world);
+    } catch (error) {
+      resultEl.hidden = false;
+      resultEl.classList.add("is-error");
+      resultEl.textContent = error?.message || String(error);
+      showError(error);
+    }
+  };
+  $("#wc-override").addEventListener("click", () => finish("force_revision"));
+  $("#wc-copy").addEventListener("click", () => finish("copy"));
+  $("#wc-cancel").addEventListener("click", () => $("#editor-modal").close());
+}
+
 function openWorldPackageImportDialog() {
   const body = `
     <p class="field-hint">导入<b>世界包</b> JSON（必须包含 <code>slug</code> / <code>name</code> / <code>system_prompt</code>）。按 <code>slug</code> 新建或更新世界，导入后会<strong>直接打开该世界</strong>。</p>
     <div class="field">
       <label for="wp-import-file">世界包 JSON 文件</label>
       <input type="file" id="wp-import-file" accept=".json,application/json" />
+    </div>
+    <div class="field">
+      <label for="wp-import-mode">同一 slug 的处理方式</label>
+      <select id="wp-import-mode">
+        <option value="auto">自动判断（推荐）</option>
+        <option value="force_revision">覆盖为同一世界的新修订</option>
+        <option value="copy">另存为独立副本</option>
+      </select>
+      <small>内容完全相同不会重复导入；更新会保留 WORLD 编号，副本会获得新编号。</small>
     </div>
     <div class="field">
       <label for="wp-import-text">或粘贴 JSON 文本</label>
@@ -4683,10 +4856,7 @@ function openWorldPackageImportDialog() {
       const submit = $("#wp-import-submit");
       submit.disabled = true;
       try {
-        const resp = await bridge.apiPost("worlds/import", parsed);
-        const world = resp?.item || (app.worlds || []).find((w) => w.slug === parsed.slug);
-        toast(resp?.mode === "updated" ? "世界包已更新" : "世界包已导入并创建世界", "success");
-        await loadCore();
+        const world = await submitWorldImport(parsed, $("#wp-import-mode").value);
         if (world) {
           openWorldEditor(world);
         } else {
@@ -4696,6 +4866,10 @@ function openWorldPackageImportDialog() {
         submit.disabled = false;
       }
     } catch (error) {
+      if (isWorldImportConflict(error)) {
+        openWorldImportConflictDialog(parsed);
+        return;
+      }
       resultEl.hidden = false;
       resultEl.classList.add("is-error");
       resultEl.textContent = error?.message || String(error);

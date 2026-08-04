@@ -3,13 +3,18 @@
 from ..card_wizard import (
     LAST_MESSAGE_KEY,
     choose_option,
+    choose_options,
     clear_field_and_dependents,
     field_visible,
     navigate_page,
     preset_options,
     store_preset_snapshot,
+    store_preset_snapshots,
 )
 from ..database_support import *
+from ..capability_service import CapabilityService
+from ..entity_registry import EntityRegistry, module_value
+from ..resolution_receipts import content_hash
 
 
 class CharacterRepositoryMixin:
@@ -318,6 +323,70 @@ class CharacterRepositoryMixin:
                         """,
                         (existing["id"],),
                     ).fetchone()
+                    now = utc_now()
+                    # expires_at 为空串表示「不限时」，永远不判过期。
+                    if (
+                        code_row
+                        and code_row["expires_at"]
+                        and code_row["expires_at"] <= now
+                    ):
+                        connection.execute(
+                            "UPDATE card_binding_codes SET status = 'expired' WHERE id = ?",
+                            (code_row["id"],),
+                        )
+                        code_row = None
+                    renewed = False
+                    if (
+                        not code_row
+                        and existing["card_status"] in {CARD_UNCREATED, CARD_DRAFT}
+                        and not str(existing["private_origin"] or "")
+                    ):
+                        config_row = connection.execute(
+                            "SELECT time_rules_json FROM instance_configs WHERE session_id = ?",
+                            (session_id,),
+                        ).fetchone()
+                        time_rules = normalize_time_rules(
+                            json_load(config_row["time_rules_json"] if config_row else "", {})
+                        )
+                        code = ""
+                        for _ in range(20):
+                            candidate = secrets.token_hex(3).upper()
+                            if not connection.execute(
+                                "SELECT 1 FROM card_binding_codes WHERE code = ?",
+                                (candidate,),
+                            ).fetchone():
+                                code = candidate
+                                break
+                        if not code:
+                            raise RuntimeError("无法生成唯一建卡码")
+                        expires_at = deadline_after(time_rules["card_code_ttl_seconds"])
+                        connection.execute(
+                            """
+                            INSERT INTO card_binding_codes(
+                                id, participant_id, code, status, expires_at, created_at
+                            ) VALUES (?, ?, ?, 'active', ?, ?)
+                            """,
+                            (new_id("cardcode"), existing["id"], code, expires_at, now),
+                        )
+                        self._create_timer(
+                            connection,
+                            session_id=session_id,
+                            participant_id=existing["id"],
+                            timer_type="card_code",
+                            timeout_seconds=time_rules["card_code_ttl_seconds"],
+                            reminder_seconds=None,
+                            action={"code": code, "renewed": True},
+                        )
+                        self._insert_audit(
+                            connection,
+                            session_id,
+                            user_id,
+                            "card.code_reissued",
+                            existing["id"],
+                            {"reason": "join_after_expiry"},
+                        )
+                        code_row = {"code": code, "expires_at": expires_at}
+                        renewed = True
                     connection.execute("COMMIT")
                     result = self._participant(existing)
                     result["joined"] = False
@@ -327,6 +396,7 @@ class CharacterRepositoryMixin:
                     result["binding_expires_at"] = (
                         code_row["expires_at"] if code_row else ""
                     )
+                    result["binding_code_reissued"] = renewed
                     return result
                 if existing:
                     raise ValueError(
@@ -719,7 +789,8 @@ class CharacterRepositoryMixin:
                 ).fetchone()
                 if not code_row or code_row["status"] != "active":
                     raise ValueError("建卡码不存在或已使用")
-                if code_row["expires_at"] <= now:
+                # 空串表示「不限时」，不参与过期判定。
+                if code_row["expires_at"] and code_row["expires_at"] <= now:
                     connection.execute(
                         """
                         UPDATE card_binding_codes
@@ -727,7 +798,61 @@ class CharacterRepositoryMixin:
                         """,
                         (code_row["id"],),
                     )
-                    raise ValueError("建卡码已过期，请回群重新发送 /酒馆 加入")
+                    config = connection.execute(
+                        "SELECT time_rules_json FROM instance_configs WHERE session_id = ?",
+                        (code_row["session_id"],),
+                    ).fetchone()
+                    time_rules = normalize_time_rules(
+                        json_load(config["time_rules_json"] if config else "", {})
+                    )
+                    replacement = ""
+                    for _ in range(20):
+                        candidate = secrets.token_hex(3).upper()
+                        if not connection.execute(
+                            "SELECT 1 FROM card_binding_codes WHERE code = ?",
+                            (candidate,),
+                        ).fetchone():
+                            replacement = candidate
+                            break
+                    if not replacement:
+                        raise RuntimeError("无法生成唯一建卡码")
+                    expires_at = deadline_after(time_rules["card_code_ttl_seconds"])
+                    connection.execute(
+                        """
+                        INSERT INTO card_binding_codes(
+                            id, participant_id, code, status, expires_at, created_at
+                        ) VALUES (?, ?, ?, 'active', ?, ?)
+                        """,
+                        (
+                            new_id("cardcode"), code_row["participant_id"],
+                            replacement, expires_at, now,
+                        ),
+                    )
+                    self._create_timer(
+                        connection,
+                        session_id=code_row["session_id"],
+                        participant_id=code_row["participant_id"],
+                        timer_type="card_code",
+                        timeout_seconds=time_rules["card_code_ttl_seconds"],
+                        reminder_seconds=None,
+                        action={"code": replacement, "renewed": True},
+                    )
+                    self._insert_audit(
+                        connection,
+                        code_row["session_id"],
+                        private_user_id,
+                        "card.code_reissued",
+                        code_row["participant_id"],
+                        {"reason": "expired_code_submitted"},
+                    )
+                    connection.execute("COMMIT")
+                    return {
+                        "session_id": code_row["session_id"],
+                        "participant_id": code_row["participant_id"],
+                        "binding_code_reissued": True,
+                        "binding_code": replacement,
+                        "binding_expires_at": expires_at,
+                    }
 
                 conflict = connection.execute(
                     """
@@ -1084,9 +1209,8 @@ class CharacterRepositoryMixin:
                         (now, row["draft_id"]),
                     )
                     raise ValueError("角色卡草稿已过期，请回群重新申请")
-                template = card_template(
-                    json_load(row["world_snapshot_json"], {})
-                )
+                world_snapshot = json_load(row["world_snapshot_json"], {})
+                template = card_template(world_snapshot)
                 fields_def = template["fields"]
                 step = min(max(0, int(row["current_step"])), len(fields_def))
                 fields = json_load(row["fields_json"], {})
@@ -1154,22 +1278,35 @@ class CharacterRepositoryMixin:
                         "world": json_load(row["world_snapshot_json"], {}),
                         "page_changed": True,
                     }
+                multi_presets = (
+                    choose_options(template, definition, fields, value)
+                    if options and definition.get("type") == "multi_select"
+                    else []
+                )
                 selected_preset = (
                     choose_option(template, definition, fields, value)
-                    if options
+                    if options and definition.get("type") != "multi_select"
                     else None
                 )
                 raw_value = (
-                    selected_preset["value"] if selected_preset else value
+                    selected_preset["value"]
+                    if selected_preset
+                    else value
                 )
-                text = clean_card_field(
-                    raw_value,
-                    label=str(definition["label"]),
-                    max_chars=int(definition["max_chars"]),
-                )
-                if definition["required"] and not text:
-                    raise ValueError(f"{definition['label']}不能为空")
-                stored_value: Any = text
+                if definition.get("type") == "multi_select" and options:
+                    stored_value = [str(item["value"]) for item in multi_presets]
+                    if definition["required"] and not stored_value:
+                        raise ValueError(f"{definition['label']}不能为空")
+                    text = "、".join(stored_value)
+                else:
+                    text = clean_card_field(
+                        raw_value,
+                        label=str(definition["label"]),
+                        max_chars=int(definition["max_chars"]),
+                    )
+                    if definition["required"] and not text:
+                        raise ValueError(f"{definition['label']}不能为空")
+                    stored_value = text
                 if definition.get("type") == "integer":
                     try:
                         stored_value = int(text)
@@ -1226,6 +1363,14 @@ class CharacterRepositoryMixin:
                 fields[field_key] = stored_value
                 if selected_preset:
                     store_preset_snapshot(fields, field_key, selected_preset)
+                elif multi_presets:
+                    store_preset_snapshots(fields, field_key, multi_presets)
+                if template.get("preset_dimensions"):
+                    validate_preset_selection(
+                        template,
+                        fields,
+                        require_complete=False,
+                    )
                 stack_resolved = None
                 if profession_mode and field_key == "profession":
                     resolved = resolve_profession_stats(
@@ -1396,9 +1541,8 @@ class CharacterRepositoryMixin:
                         (now, row["draft_id"]),
                     )
                     raise ValueError("角色卡草稿已过期，请回群重新申请")
-                template = card_template(
-                    json_load(row["world_snapshot_json"], {})
-                )
+                world_snapshot = json_load(row["world_snapshot_json"], {})
+                template = card_template(world_snapshot)
                 fields = json_load(row["fields_json"], {})
                 if not isinstance(fields, dict):
                     fields = {}
@@ -1698,7 +1842,8 @@ class CharacterRepositoryMixin:
                     """
                     SELECT pt.*, d.id AS draft_id, d.fields_json,
                            d.current_step, d.status AS draft_status,
-                           ic.world_snapshot_json, ic.time_rules_json
+                           ic.world_snapshot_json, ic.time_rules_json,
+                           ic.world_revision
                     FROM participants pt
                     JOIN character_card_drafts d
                       ON d.participant_id = pt.id
@@ -1713,9 +1858,8 @@ class CharacterRepositoryMixin:
                 ).fetchone()
                 if not row:
                     raise DatabaseNotFoundError("当前私聊没有可确认的角色卡")
-                template = card_template(
-                    json_load(row["world_snapshot_json"], {})
-                )
+                world_snapshot = json_load(row["world_snapshot_json"], {})
+                template = card_template(world_snapshot)
                 fields = json_load(row["fields_json"], {})
                 if not isinstance(fields, dict):
                     fields = {}
@@ -1725,6 +1869,14 @@ class CharacterRepositoryMixin:
                 for definition in template["fields"]:
                     key = str(definition["key"])
                     if key not in fields:
+                        continue
+                    if isinstance(fields[key], list):
+                        minimum = int(definition.get("min_choices", 0) or 0)
+                        maximum = int(definition.get("max_choices", 100) or 100)
+                        if not minimum <= len(fields[key]) <= maximum:
+                            raise ValueError(
+                                f"{definition['label']}必须选择 {minimum}—{maximum} 项"
+                            )
                         continue
                     clean_card_field(
                         fields[key],
@@ -1746,6 +1898,16 @@ class CharacterRepositoryMixin:
                 ]
                 if missing:
                     raise ValueError("尚未填写：" + "、".join(missing))
+                if template.get("preset_dimensions"):
+                    validate_preset_selection(
+                        template,
+                        fields,
+                        require_complete=True,
+                    )
+                    fields["_resolved_boundaries"] = resolve_character_presets(
+                        world_snapshot,
+                        fields,
+                    )
                 character_name = clean_card_field(
                     fields.get("name") or row["display_name"],
                     label="角色姓名",
@@ -1931,6 +2093,82 @@ class CharacterRepositoryMixin:
                         now,
                     ),
                 )
+                initial_runtime_state: dict[str, Any] = {}
+                protocol = world_snapshot.get("protocol")
+                protocol = protocol if isinstance(protocol, Mapping) else {}
+                features = protocol.get("features")
+                features = features if isinstance(features, Mapping) else {}
+                if int(world_snapshot.get("world_schema_version", 0) or 0) >= 5 and "resources" in features:
+                    resource_module = module_value(world_snapshot, "resources", {})
+                    resource_module = resource_module if isinstance(resource_module, Mapping) else {}
+                    definitions = resource_module.get("definitions", resource_module.get("items", []))
+                    if isinstance(definitions, Sequence) and not isinstance(definitions, (str, bytes)):
+                        refs: dict[str, Any] = {}
+                        for definition in definitions:
+                            if not isinstance(definition, Mapping):
+                                continue
+                            resource_id = str(definition.get("resource_id") or definition.get("id") or "")
+                            if resource_id and "initial_value" in definition:
+                                refs[f"resource:{resource_id}"] = definition["initial_value"]
+                        if refs:
+                            initial_runtime_state["refs"] = refs
+                if int(world_snapshot.get("world_schema_version", 0) or 0) >= 5 and "capabilities" in features:
+                    registry = EntityRegistry(world_snapshot)
+                    service = CapabilityService(world_snapshot, registry)
+                    preset_values: dict[str, Any] = {}
+                    preset_refs = fields.get("_preset_refs", {})
+                    if isinstance(preset_refs, Mapping):
+                        for dimension, selected in preset_refs.items():
+                            if isinstance(selected, Mapping):
+                                preset_values[f"custom:preset.{dimension}"] = str(
+                                    selected.get("id")
+                                    or selected.get("snapshot", {}).get("id")
+                                    or ""
+                                )
+                    actor_ref = f"character:{row['id']}"
+                    migration_operation_id = (
+                        f"card_capabilities:{row['session_id']}:{row['id']}:{row['world_revision']}"
+                    )
+                    grants = service.initial_grants(preset_values)
+                    granted: list[str] = []
+                    for grant in grants:
+                        capability_ref = str(grant.get("capability_ref") or grant.get("target_ref") or "")
+                        source_ref = str(grant.get("source_ref") or "character_card")
+                        connection.execute(
+                            """
+                            INSERT OR IGNORE INTO actor_capability_instances(
+                                id, session_id, actor_ref, capability_ref,
+                                definition_version, source_ref, state_json,
+                                persistence_scope, available, created_at, updated_at
+                            ) VALUES (?, ?, ?, ?, 1, ?, '{}', ?, 1, ?, ?)
+                            """,
+                            (
+                                new_id("capability_instance"), row["session_id"], actor_ref,
+                                capability_ref, source_ref,
+                                str(grant.get("persistence_scope") or "campaign"), now, now,
+                            ),
+                        )
+                        granted.append(capability_ref)
+                    migration_payload = {
+                        "character_card_version_id": version_id,
+                        "world_revision": int(row["world_revision"]),
+                        "actor_ref": actor_ref,
+                        "preset_values": preset_values,
+                        "granted_capabilities": granted,
+                    }
+                    connection.execute(
+                        """
+                        INSERT OR IGNORE INTO migration_receipts(
+                            id, migration_type, source_version, target_version,
+                            session_id, operation_id, receipt_json, confirmed_by, created_at
+                        ) VALUES (?, 'character_capabilities', ?, 'v5', ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            new_id("migration"), str(template.get("version") or ""),
+                            row["session_id"], migration_operation_id,
+                            json_dump(migration_payload), row["private_user_id"], now,
+                        ),
+                    )
                 participation_status = (
                     PARTICIPANT_ACTIVE
                     if status == CARD_APPROVED
@@ -1983,7 +2221,7 @@ class CharacterRepositoryMixin:
                     INSERT INTO character_runtime_states(
                         id, session_id, participant_id, character_card_id,
                         state_json, revision, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, '{}', 1, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, 1, ?, ?)
                     ON CONFLICT(session_id, participant_id) DO UPDATE SET
                         character_card_id = excluded.character_card_id,
                         revision = revision + 1,
@@ -1994,6 +2232,7 @@ class CharacterRepositoryMixin:
                         row["session_id"],
                         row["id"],
                         card_id,
+                        json_dump(initial_runtime_state),
                         now,
                         now,
                     ),

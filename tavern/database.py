@@ -11,7 +11,43 @@ from .repositories import (
     WorkflowRepositoryMixin,
     TimerRepositoryMixin,
     AdminRepositoryMixin,
+    ControlRepositoryMixin,
 )
+
+
+class _ManagedConnection:
+    """把 sqlite3.Connection 的 with 语义补全为「退出即关闭」。
+
+    sqlite3 连接作为上下文管理器只管理事务、不会关闭连接；全仓
+    ``with self._connect() as connection:`` 约 140 处都依赖该写法。
+    此前连接要等 GC 才释放句柄，Windows 下临时目录清理（测试/备份）
+    会因文件仍被占用抛 PermissionError；这里在退出时显式 commit/rollback
+    并 close，行为等价且确定性关闭。
+    """
+
+    __slots__ = ("connection",)
+
+    def __init__(self, connection: sqlite3.Connection) -> None:
+        self.connection = connection
+
+    def __enter__(self) -> sqlite3.Connection:
+        return self.connection
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
+        try:
+            if exc_type is not None:
+                try:
+                    self.connection.rollback()
+                except sqlite3.Error:
+                    pass
+            else:
+                self.connection.commit()
+        finally:
+            self.connection.close()
+        return False
+
+    def close(self) -> None:
+        self.connection.close()
 
 
 class TavernDatabase(
@@ -24,6 +60,7 @@ class TavernDatabase(
     WorkflowRepositoryMixin,
     TimerRepositoryMixin,
     AdminRepositoryMixin,
+    ControlRepositoryMixin,
 ):
     """SQLite persistence with short, explicit transactions.
 
@@ -91,6 +128,13 @@ class TavernDatabase(
         "_write_audit",
         "_cleanup",
         "_import_bundle",
+        "_enable_dm_mode",
+        "_set_dm_directive",
+        "_set_dm_handoff",
+        "_finish_dm_handoff",
+        "_disable_dm_mode",
+        "_commit_dm_beat",
+        "_resolve_action_intent",
     }
     _ALL_SESSION_MUTATIONS = {
         "_process_due_timers",
@@ -110,6 +154,8 @@ class TavernDatabase(
         # v0.9.x is a deliberate clean baseline. It never opens or mutates
         # catalog.sqlite3/tavern.sqlite3 created by older releases.
         self.path = self.data_dir / "catalog_v090.sqlite3"
+        self.migration_backup_path: Path | None = None
+        self._prepare_migration_backup()
         self._schema_lock = threading.Lock()
         self._initialize()
         self.storage = InstanceStorage(
@@ -120,7 +166,30 @@ class TavernDatabase(
         )
         self.storage.bootstrap()
 
-    def _connect(self) -> sqlite3.Connection:
+    def _prepare_migration_backup(self) -> None:
+        if not self.path.exists():
+            return
+        try:
+            # closing：sqlite3 连接上下文管理器不关闭连接，Windows 下
+            # 会让备份文件残留句柄导致目录清理失败。
+            with closing(sqlite3.connect(self.path)) as source:
+                row = source.execute(
+                    "SELECT value FROM tavern_meta WHERE key='schema_version'"
+                ).fetchone()
+                current = int(row[0]) if row else 0
+                if current >= DATABASE_SCHEMA_VERSION:
+                    return
+                target = self.data_dir / (
+                    f"catalog_v090.schema{current}.before_schema{DATABASE_SCHEMA_VERSION}."
+                    f"{uuid.uuid4().hex[:8]}.sqlite3"
+                )
+                with closing(sqlite3.connect(target)) as destination:
+                    source.backup(destination)
+                self.migration_backup_path = target
+        except (sqlite3.Error, OSError, TypeError, ValueError):
+            self.migration_backup_path = None
+
+    def _connect(self) -> _ManagedConnection:
         connection = sqlite3.connect(
             self.path,
             timeout=15,
@@ -131,11 +200,11 @@ class TavernDatabase(
         connection.execute("PRAGMA busy_timeout = 15000")
         connection.execute("PRAGMA journal_mode = WAL")
         connection.execute("PRAGMA synchronous = NORMAL")
-        return connection
+        return _ManagedConnection(connection)
 
     def _initialize(self) -> None:
         with self._schema_lock:
-            with closing(self._connect()) as connection:
+            with self._connect() as connection:
                 connection.executescript(
                     """
                     CREATE TABLE IF NOT EXISTS tavern_meta (
@@ -146,6 +215,8 @@ class TavernDatabase(
                     CREATE TABLE IF NOT EXISTS worlds (
                         id TEXT PRIMARY KEY,
                         slug TEXT NOT NULL UNIQUE,
+                        display_no INTEGER NOT NULL,
+                        sort_order INTEGER NOT NULL,
                         name TEXT NOT NULL,
                         description TEXT NOT NULL DEFAULT '',
                         system_prompt TEXT NOT NULL,
@@ -229,6 +300,11 @@ class TavernDatabase(
 
                     CREATE INDEX IF NOT EXISTS idx_events_session_seq
                         ON events(session_id, seq DESC);
+
+                    -- 0.11.1：恢复存档的 MAX(seq)…AND created_at<=? 查询
+                    -- 此前无法利用 session 索引，会整段全扫。
+                    CREATE INDEX IF NOT EXISTS idx_events_created_at
+                        ON events(created_at);
 
                     CREATE TABLE IF NOT EXISTS memories (
                         id TEXT PRIMARY KEY,
@@ -653,6 +729,27 @@ class TavernDatabase(
                         updated_at TEXT NOT NULL
                     );
 
+                    CREATE TABLE IF NOT EXISTS dm_control_states (
+                        session_id TEXT PRIMARY KEY REFERENCES sessions(id)
+                            ON DELETE CASCADE,
+                        mode TEXT NOT NULL DEFAULT 'auto'
+                            CHECK(mode IN ('auto', 'dm')),
+                        active_dm_user_id TEXT NOT NULL DEFAULT '',
+                        phase TEXT NOT NULL DEFAULT 'auto'
+                            CHECK(phase IN (
+                                'auto', 'awaiting_dm', 'generating',
+                                'player_handoff', 'npc_handoff'
+                            )),
+                        directive TEXT NOT NULL DEFAULT '',
+                        beat_no INTEGER NOT NULL DEFAULT 0,
+                        current_actor_type TEXT NOT NULL DEFAULT '',
+                        current_actor_ref TEXT NOT NULL DEFAULT '',
+                        preserved_turn_json TEXT NOT NULL DEFAULT '{}',
+                        revision INTEGER NOT NULL DEFAULT 1,
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL
+                    );
+
                     CREATE TABLE IF NOT EXISTS session_characters (
                         id TEXT PRIMARY KEY,
                         session_id TEXT NOT NULL REFERENCES sessions(id)
@@ -850,6 +947,126 @@ class TavernDatabase(
                     CREATE INDEX IF NOT EXISTS idx_operations_session_status
                     ON operation_receipts(session_id, status, updated_at DESC);
 
+                    CREATE TABLE IF NOT EXISTS world_feature_versions (
+                        world_id TEXT NOT NULL REFERENCES worlds(id) ON DELETE CASCADE,
+                        world_revision INTEGER NOT NULL,
+                        feature_name TEXT NOT NULL,
+                        feature_version TEXT NOT NULL,
+                        required INTEGER NOT NULL DEFAULT 0,
+                        created_at TEXT NOT NULL,
+                        PRIMARY KEY(world_id, world_revision, feature_name)
+                    );
+
+                    CREATE TABLE IF NOT EXISTS world_entity_registry (
+                        world_id TEXT NOT NULL REFERENCES worlds(id) ON DELETE CASCADE,
+                        world_revision INTEGER NOT NULL,
+                        entity_ref TEXT NOT NULL,
+                        entity_type TEXT NOT NULL,
+                        label TEXT NOT NULL DEFAULT '',
+                        definition_json TEXT NOT NULL DEFAULT '{}',
+                        content_hash TEXT NOT NULL,
+                        visibility TEXT NOT NULL DEFAULT 'world',
+                        created_at TEXT NOT NULL,
+                        PRIMARY KEY(world_id, world_revision, entity_ref)
+                    );
+
+                    CREATE TABLE IF NOT EXISTS world_rule_revisions (
+                        id TEXT PRIMARY KEY,
+                        world_id TEXT NOT NULL REFERENCES worlds(id) ON DELETE CASCADE,
+                        world_revision INTEGER NOT NULL,
+                        content_hash TEXT NOT NULL,
+                        rules_json TEXT NOT NULL,
+                        created_at TEXT NOT NULL,
+                        UNIQUE(world_id, world_revision)
+                    );
+
+                    CREATE TABLE IF NOT EXISTS world_snapshots (
+                        id TEXT PRIMARY KEY,
+                        world_id TEXT NOT NULL REFERENCES worlds(id) ON DELETE RESTRICT,
+                        world_revision INTEGER NOT NULL,
+                        content_hash TEXT NOT NULL,
+                        snapshot_json TEXT NOT NULL,
+                        created_at TEXT NOT NULL,
+                        UNIQUE(world_id, world_revision, content_hash)
+                    );
+
+                    CREATE TABLE IF NOT EXISTS actor_capability_instances (
+                        id TEXT PRIMARY KEY,
+                        session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                        actor_ref TEXT NOT NULL,
+                        capability_ref TEXT NOT NULL,
+                        definition_version INTEGER NOT NULL DEFAULT 1,
+                        source_ref TEXT NOT NULL DEFAULT '',
+                        state_json TEXT NOT NULL DEFAULT '{}',
+                        persistence_scope TEXT NOT NULL DEFAULT 'campaign',
+                        available INTEGER NOT NULL DEFAULT 1,
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL,
+                        UNIQUE(session_id, actor_ref, capability_ref, source_ref)
+                    );
+
+                    CREATE TABLE IF NOT EXISTS runtime_effect_instances (
+                        id TEXT PRIMARY KEY,
+                        session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                        target_ref TEXT NOT NULL,
+                        effect_ref TEXT NOT NULL,
+                        source_ref TEXT NOT NULL DEFAULT '',
+                        state_json TEXT NOT NULL DEFAULT '{}',
+                        duration_json TEXT NOT NULL DEFAULT '{}',
+                        persistence_scope TEXT NOT NULL DEFAULT 'session',
+                        status TEXT NOT NULL DEFAULT 'active',
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL
+                    );
+
+                    CREATE TABLE IF NOT EXISTS operation_commits (
+                        operation_id TEXT PRIMARY KEY,
+                        session_id TEXT NOT NULL DEFAULT '',
+                        input_hash TEXT NOT NULL,
+                        status TEXT NOT NULL,
+                        result_json TEXT NOT NULL DEFAULT '{}',
+                        rollback_json TEXT NOT NULL DEFAULT '{}',
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL
+                    );
+
+                    CREATE TABLE IF NOT EXISTS resolution_receipts (
+                        receipt_id TEXT PRIMARY KEY,
+                        operation_id TEXT NOT NULL UNIQUE,
+                        session_id TEXT NOT NULL DEFAULT '',
+                        world_snapshot_id TEXT NOT NULL DEFAULT '',
+                        content_hash TEXT NOT NULL,
+                        receipt_json TEXT NOT NULL,
+                        public_projection_json TEXT NOT NULL DEFAULT '{}',
+                        created_at TEXT NOT NULL
+                    );
+
+                    CREATE TABLE IF NOT EXISTS migration_receipts (
+                        id TEXT PRIMARY KEY,
+                        migration_type TEXT NOT NULL,
+                        source_version TEXT NOT NULL DEFAULT '',
+                        target_version TEXT NOT NULL DEFAULT '',
+                        world_id TEXT NOT NULL DEFAULT '',
+                        session_id TEXT NOT NULL DEFAULT '',
+                        operation_id TEXT NOT NULL DEFAULT '',
+                        receipt_json TEXT NOT NULL,
+                        confirmed_by TEXT NOT NULL DEFAULT '',
+                        created_at TEXT NOT NULL
+                    );
+
+                    CREATE INDEX IF NOT EXISTS idx_world_features_revision
+                    ON world_feature_versions(world_id, world_revision);
+                    CREATE INDEX IF NOT EXISTS idx_world_entities_type
+                    ON world_entity_registry(world_id, world_revision, entity_type);
+                    CREATE INDEX IF NOT EXISTS idx_actor_capabilities
+                    ON actor_capability_instances(session_id, actor_ref, available);
+                    CREATE INDEX IF NOT EXISTS idx_runtime_effect_target
+                    ON runtime_effect_instances(session_id, target_ref, status);
+                    CREATE INDEX IF NOT EXISTS idx_resolution_receipts_session
+                    ON resolution_receipts(session_id, created_at DESC);
+                    CREATE UNIQUE INDEX IF NOT EXISTS idx_migration_operation
+                    ON migration_receipts(operation_id) WHERE operation_id <> '';
+
                     CREATE TABLE IF NOT EXISTS card_revision_requests (
                         id TEXT PRIMARY KEY,
                         session_id TEXT NOT NULL REFERENCES sessions(id)
@@ -963,6 +1180,7 @@ class TavernDatabase(
                     );
                     """
                 )
+                self._migrate_schema_10(connection)
                 connection.execute(
                     """
                     INSERT INTO tavern_meta(key, value)
@@ -972,6 +1190,79 @@ class TavernDatabase(
                     (str(DATABASE_SCHEMA_VERSION),),
                 )
                 self._seed_default_world(connection)
+                self._backfill_world_revisions(connection)
+
+    def _migrate_schema_10(self, connection: sqlite3.Connection) -> None:
+        """Idempotently add stable world numbering and record deterministic backfill."""
+
+        columns = {
+            str(row["name"])
+            for row in connection.execute("PRAGMA table_info(worlds)").fetchall()
+        }
+        if "display_no" not in columns:
+            connection.execute("ALTER TABLE worlds ADD COLUMN display_no INTEGER")
+        if "sort_order" not in columns:
+            connection.execute("ALTER TABLE worlds ADD COLUMN sort_order INTEGER")
+        rows = connection.execute(
+            "SELECT id, slug, display_no, sort_order FROM worlds ORDER BY created_at ASC, id ASC"
+        ).fetchall()
+        declared = {
+            int(row["display_no"])
+            for row in rows
+            if row["display_no"] is not None and int(row["display_no"]) > 0
+        }
+        used: set[int] = set()
+        next_number = max(declared, default=0) + 1
+        mapping: list[dict[str, Any]] = []
+        for row in rows:
+            display_no = int(row["display_no"] or 0)
+            if display_no <= 0 or display_no in used:
+                while next_number in used:
+                    next_number += 1
+                display_no = next_number
+                next_number += 1
+            used.add(display_no)
+            sort_order = int(row["sort_order"] or display_no)
+            connection.execute(
+                "UPDATE worlds SET display_no=?, sort_order=? WHERE id=?",
+                (display_no, sort_order, row["id"]),
+            )
+            mapping.append(
+                {"world_id": row["id"], "slug": row["slug"],
+                 "display_no": display_no, "sort_order": sort_order}
+            )
+        connection.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_worlds_display_no ON worlds(display_no)"
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_worlds_sort ON worlds(archived, sort_order, display_no)"
+        )
+        next_display_no = max(used, default=0) + 1
+        current_counter = connection.execute(
+            "SELECT value FROM tavern_meta WHERE key='next_world_display_no'"
+        ).fetchone()
+        if current_counter:
+            try:
+                next_display_no = max(next_display_no, int(current_counter["value"]))
+            except (TypeError, ValueError):
+                pass
+        connection.execute(
+            """
+            INSERT INTO tavern_meta(key, value) VALUES ('next_world_display_no', ?)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value
+            """,
+            (str(next_display_no),),
+        )
+        if mapping:
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO migration_receipts(
+                    id, migration_type, source_version, target_version,
+                    receipt_json, created_at
+                ) VALUES ('schema_9_to_10', 'database_schema', '9', '10', ?, ?)
+                """,
+                (json_dump({"worlds": mapping}), utc_now()),
+            )
 
     @staticmethod
     def _stable_key(value: Any, fallback: str = "") -> str:
@@ -989,18 +1280,25 @@ class TavernDatabase(
             return
         now = utc_now()
         world_id = new_id("world")
+        display_no = int(
+            connection.execute(
+                "SELECT COALESCE(MAX(display_no), 0) + 1 FROM worlds"
+            ).fetchone()[0]
+        )
         connection.execute(
             """
             INSERT INTO worlds(
-                id, slug, name, description, system_prompt, rules_json,
+                id, slug, display_no, sort_order, name, description, system_prompt, rules_json,
                 extensions_json,
                 opening_scene, initial_state_json, archived, revision,
                 created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 1, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 1, ?, ?)
             """,
             (
                 world_id,
                 DEFAULT_WORLD["slug"],
+                display_no,
+                display_no,
                 DEFAULT_WORLD["name"],
                 DEFAULT_WORLD["description"],
                 DEFAULT_WORLD["system_prompt"],
@@ -1042,6 +1340,33 @@ class TavernDatabase(
                     now,
                     now,
                 ),
+            )
+        row = connection.execute(
+            "SELECT * FROM worlds WHERE id=?", (world_id,)
+        ).fetchone()
+        if row is not None:
+            self._persist_world_revision(
+                connection, row, self._world(row), now
+            )
+
+    def _backfill_world_revisions(self, connection: sqlite3.Connection) -> None:
+        """Give pre-v0.11 worlds an immutable first rule revision and snapshot."""
+
+        now = utc_now()
+        for row in connection.execute(
+            "SELECT * FROM worlds ORDER BY display_no ASC, id ASC"
+        ).fetchall():
+            exists = connection.execute(
+                """
+                SELECT 1 FROM world_snapshots
+                WHERE world_id=? AND world_revision=?
+                """,
+                (row["id"], row["revision"]),
+            ).fetchone()
+            if exists:
+                continue
+            self._persist_world_revision(
+                connection, row, self._world(row), now
             )
 
     @staticmethod
@@ -1145,6 +1470,8 @@ class TavernDatabase(
             args,
             result,
         )
+        # 0.11.1 暂缓：文件同步仍保持内联执行（整库拷贝 + 裁剪 + VACUUM
+        # 的成本为已知限制，后台线程方案会与测试/停机清理产生句柄竞争）。
         for session_id in sorted(session_ids):
             try:
                 self.storage.sync_session(session_id)
@@ -1242,6 +1569,8 @@ class TavernDatabase(
         result = {
             "id": row["id"],
             "slug": row["slug"],
+            "display_no": int(row["display_no"]),
+            "sort_order": int(row["sort_order"]),
             "name": row["name"],
             "description": row["description"],
             "system_prompt": row["system_prompt"],

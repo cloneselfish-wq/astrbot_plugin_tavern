@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from copy import deepcopy
+import re
 from typing import Any
 
 
@@ -244,6 +245,43 @@ def choose_option(
     raise ValueError("必须从当前步骤显示的预设项中选择")
 
 
+def choose_options(
+    template: Mapping[str, Any],
+    field: Mapping[str, Any],
+    values: Mapping[str, Any],
+    submitted: str,
+) -> list[dict[str, Any]]:
+    """Resolve a multi-select answer while preserving the player's order."""
+
+    page = paged_options(template, field, values)
+    tokens = [
+        token.strip()
+        for token in re.split(r"[,，、;；\s]+", str(submitted or "").strip())
+        if token.strip()
+    ]
+    if not tokens:
+        return []
+    result: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for token in tokens:
+        if token.isdigit():
+            ordinal = int(token)
+            if not 1 <= ordinal <= len(page["items"]):
+                raise ValueError("序号不在当前页，请从本页显示的序号中选择")
+            option = dict(page["items"][ordinal - 1])
+        else:
+            option = choose_option(template, field, values, token)
+        identity = str(option.get("id") or "").casefold()
+        if identity and identity not in seen:
+            result.append(option)
+            seen.add(identity)
+    minimum = max(0, int(field.get("min_choices", 0) or 0))
+    maximum = max(minimum, int(field.get("max_choices", 100) or 100))
+    if len(result) < minimum or len(result) > maximum:
+        raise ValueError(f"本项必须选择 {minimum}—{maximum} 个预设")
+    return result
+
+
 def store_preset_snapshot(
     values: dict[str, Any], field_key: str, option: Mapping[str, Any]
 ) -> None:
@@ -256,6 +294,23 @@ def store_preset_snapshot(
         "label": str(option.get("label") or ""),
         "snapshot": deepcopy(dict(source)) if isinstance(source, Mapping) else {},
     }
+    values[PRESET_REFS_KEY] = refs
+
+
+def store_preset_snapshots(
+    values: dict[str, Any], field_key: str, options: Sequence[Mapping[str, Any]]
+) -> None:
+    refs = values.get(PRESET_REFS_KEY)
+    refs = dict(refs) if isinstance(refs, Mapping) else {}
+    refs[field_key] = [
+        {
+            "id": str(option.get("id") or ""),
+            "value": str(option.get("value") or ""),
+            "label": str(option.get("label") or ""),
+            "snapshot": deepcopy(dict(option.get("source") or {})),
+        }
+        for option in options
+    ]
     values[PRESET_REFS_KEY] = refs
 
 
@@ -305,6 +360,7 @@ __all__ = [
     "PRESET_REFS_KEY",
     "WIZARD_PAGE_KEY",
     "choose_option",
+    "choose_options",
     "clear_field_and_dependents",
     "current_page",
     "field_visible",
@@ -313,4 +369,5 @@ __all__ = [
     "preset_options",
     "preset_source_exists",
     "store_preset_snapshot",
+    "store_preset_snapshots",
 ]

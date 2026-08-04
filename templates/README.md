@@ -1,21 +1,26 @@
 # 通用世界包与 NPC 模板
 
-本目录随 AI 酒馆 `v0.9.3` 发布，模板包版本为 `1.2.0`。这里的文件既供人工复制填写，也供 AI 在明确字段边界下生成或修改世界内容。
+本目录随 AI 酒馆 `v0.11.0` 发布，模板包版本为 `3.0.0`。这里的文件既供人工复制填写，也供 AI 在明确字段边界下生成或修改世界内容。
 
 ## 文件说明
 
 | 文件 | 用途 | 当前接口 |
 |---|---|---|
-| `template-manifest.json` | 机器可读的兼容清单与发布同步规则 | 插件 0.9.3 |
-| `world-package.template.json` | 可直接通过严格体检的手动属性世界包 | 世界协议 v3、角色卡模板 v4 |
+| `template-manifest.json` | 机器可读的兼容清单与发布同步规则 | 插件 0.11.0 |
+| `world-package.template.json` | 可直接通过严格体检的手动属性世界包 | 世界协议 v4、角色卡模板 v5 |
 | `world-package-preset-stack.template.json` | 多个建卡预设共同生成属性的完整示例 | `preset_stack`、全组合体检 |
-| `npc-import.template.json` | 可直接提交到常驻 NPC 导入入口的载荷 | NPC 导入模板 v1 |
+| `world-package-capabilities.template.json` | 可选能力定义、授予与成长变更 | 世界协议 v5、`capabilities@1.0` |
+| `world-package-interaction-rules.template.json` | 不预设世界观语义的通用关系匹配 | 世界协议 v5、`interaction_rules@1.0` |
+| `world-package-v5-full-example.json` | 五层运行时与全部可选模块综合示例 | 世界协议 v5、角色卡模板 v6 |
+| `migration-v4-to-v5.example.json` | 先预检、再克隆应用的声明式迁移 | 不热改运行中副本 |
+| `id-aliases.example.json` | 改名时保留稳定引用的别名表示例 | 导入阶段校验闭环和冲突 |
+| `npc-import.template.json` | 可直接提交到常驻 NPC 导入入口的载荷 | NPC 导入模板 v2 |
 
 模板文件只包含声明式 JSON，不能放入 Python、JavaScript、模板表达式、网络请求或任何可执行代码。
 
 ## 推荐使用顺序
 
-1. 复制 `world-package.template.json`，重命名为自己的世界包文件。
+1. 旧式世界复制 `world-package.template.json`；需要通用规则底座时复制 `world-package-v5-full-example.json`。
 2. 修改 `slug`、`name`、简介、世界规律、角色卡预设、属性、检定策略、开场四选项与初始状态。
 3. 在管理台执行世界包体检；必须消除全部错误后再导入。
 4. 复制 `npc-import.template.json`，把 `world_slug` 改为已导入世界的 `slug`。
@@ -30,6 +35,9 @@
 - `name`、`description`、`system_prompt`、`opening_scene`：替换全部示例文字，明确世界常识、能力来源、代价、上限、知识边界、因果连续性和玩家自主权。
 - `world_content_version`：只表示该世界内容的版本，不等于插件版本或世界协议版本。
 - `preset_sets`：为种族、职业、地区、身份、阵营、学院等预设分配不重复的稳定 `id`。建卡只会在进入对应字段时展示该预设源。
+- `preset_dimensions`：声明性别、性格、职业、出身、信仰等通用维度，以及选择模式、顺序、前置、互斥和每项效果。
+- `knowledge_boundary` / `knowledge_profiles`：定义世界知识硬上限和每种预设能够授予的知识档案。
+- `content_boundary` / `content_profiles`：定义世界内容硬边界和预设附加限制；预设不得放宽世界限制。
 - `fields`：每个字段的 `key` 必须唯一；选择字段使用 `preset_source` 或内联 `options`，不要把完整选项名单塞进标题或提示词。
 - `stats`：选择 `none`、`manual`、`preset` 或 `preset_stack`。修改属性时同步更新检定允许属性、修正表、预算和相关选项。
 - `resolution`：骰制必须已经注册；风险通过 `difficulty_policy` 映射 DC；结果档位由 `outcome_policy` 固定计算。
@@ -107,7 +115,7 @@
 
 ## 上下文与生成速度
 
-`v0.9.3` 会自动按任务裁剪上下文：故事生成不携带建卡预设、职业基础属性、开场选项或完整事件池；A—D 选项与选项修复使用独立的精简提示。模板默认采用最近 6 回合、6 条相关记忆、6 名活动 NPC 和 8 条故事账本。世界作者应把稳定事实放进 `system_prompt` 的简明世界常识、记忆或故事账本，不要把同一段设定同时复制到多个规则字段。
+`v0.11.0` 会自动按任务裁剪上下文：故事生成不携带建卡预设、职业基础属性、开场选项或完整事件池；A—D 选项与选项修复使用独立的精简提示。启用 v5 能力模块时，叙事模型只收到当前角色可用能力的最小投影。模板默认采用最近 6 回合、6 条相关记忆、6 名活动 NPC 和 8 条故事账本。世界作者应把稳定事实放进 `system_prompt` 的简明世界常识、记忆或故事账本，不要把同一段设定同时复制到多个规则字段。
 
 内部属性键建议继续使用英文或 ASCII 稳定 ID，例如 `charisma`；玩家可见名称使用中文 `label`，例如“魅力”。插件保存稳定 ID，并在选项、骰点与恢复展示时读取中文标签，不要把内部 ID 直接写进选项正文。
 
@@ -133,7 +141,7 @@ NPC 导入文件顶层必须是对象：
 - `limitations`：能力上限、知识盲区与资源条件
 - `private_direction` / `prompt`：隐藏动机、秘密和透露条件
 
-`v0.9.3` 的管理台导入会在目标世界内按 NPC 名称判断更新或新建，因此已有 NPC 改名可能生成新记录。`slug` 当前用于作者侧稳定标记和内置播种参考，不能替代导入时的名称匹配；修改前应先核对目标世界已有 NPC。
+`v0.11.0` 的 NPC v2 导入优先按稳定 `slug` 更新，改显示名不会创建重复角色；只为兼容缺少 `slug` 的 v1 包才按名称回退匹配。v5 世界还会校验 `capability_refs`、`resource_refs`、`runtime_effect_refs`、`object_refs` 是否已在该世界注册。
 
 ## 交给 AI 修改时的要求
 

@@ -13,6 +13,8 @@ from .lifecycle import (
     validate_card_template_config,
 )
 from .world_contract import WORLD_SCHEMA_VERSION, validate_world_contract
+from .entity_registry import EntityRegistry
+from .capability_service import CapabilityService
 from .stat_generation import (
     calculate_preset_stack_stats,
     stat_generation_config,
@@ -284,6 +286,25 @@ def inspect_world_package(world: Mapping[str, Any]) -> dict[str, Any]:
                 "未填写面向玩家的世界简介",
             )
         )
+
+    entity_count = 0
+    feature_versions: dict[str, str] = {}
+    if contract and int(contract.get("version", 0)) >= 5:
+        try:
+            registry = EntityRegistry(world)
+            entity_count = len(registry.items())
+            feature_versions = dict(contract.get("protocol", {}).get("features", {}))
+            tests.append(
+                {"name": "v5 实体引用注册", "status": "passed",
+                 "detail": {"entity_count": entity_count}}
+            )
+            cycles = CapabilityService(world, registry).progression_cycles()
+            if cycles:
+                raise ValueError("能力成长关系存在循环：" + " -> ".join(cycles[0]))
+            tests.append({"name": "能力成长循环检查", "status": "passed"})
+        except Exception as exc:
+            issues.append(_issue("error", "protocol", "v5_registry_invalid", str(exc)))
+            tests.append({"name": "v5 实体与能力图", "status": "failed"})
     if len(str(world.get("system_prompt") or "")) > 30000:
         issues.append(
             _issue(
@@ -314,6 +335,8 @@ def inspect_world_package(world: Mapping[str, Any]) -> dict[str, Any]:
             "danger_levels": len(contract.get("danger_levels", [])) if contract else 0,
             "npc_count": len(world.get("characters", [])) if isinstance(world.get("characters"), list) else 0,
             "capabilities": capabilities,
+            "feature_versions": feature_versions,
+            "entity_count": entity_count,
             "errors": errors,
             "warnings": warnings,
             "migrations": 0,

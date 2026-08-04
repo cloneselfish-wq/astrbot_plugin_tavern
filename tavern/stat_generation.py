@@ -100,7 +100,7 @@ def validate_stat_generation_config(
     if config["mode"] != PRESET_STACK_MODE:
         raise ValueError("stat_generation.mode 必须是 preset_stack")
     if config["allow_manual_edit"]:
-        raise ValueError("v0.9.3 的 preset_stack 必须设置 allow_manual_edit=false")
+        raise ValueError("preset_stack 必须设置 allow_manual_edit=false")
 
     attributes = _attribute_index(template)
     attribute_keys = set(attributes)

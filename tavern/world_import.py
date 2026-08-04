@@ -21,7 +21,15 @@ _RUNTIME_ONLY_FIELDS = {
     "player_limits",
     "time_rules",
 }
-_DATABASE_MANAGED_FIELDS = {"created_at", "updated_at"}
+_DATABASE_MANAGED_FIELDS = {
+    "created_at",
+    "updated_at",
+    # These values belong to the local catalog.  They are intentionally not
+    # part of a portable package hash: importing a package must never steal a
+    # destination catalog's stable display number or administrator ordering.
+    "display_no",
+    "sort_order",
+}
 
 
 def _world_package_fields(
@@ -56,7 +64,12 @@ def world_import_payload(payload: dict[str, Any]) -> dict[str, Any]:
     result.setdefault("description", "")
     result.setdefault("opening_scene", "")
     result.setdefault("world_schema_version", 0)
-    result.setdefault("capabilities", {})
+    rules = result.get("rules")
+    rules = rules if isinstance(rules, Mapping) else {}
+    # The database exposes this legacy/top-level mirror for every world.  Use
+    # the declared rules module as the canonical default so content hashes are
+    # stable without ever replacing a real module with an empty object.
+    result.setdefault("capabilities", dict(rules.get("capabilities") or {}))
     result.setdefault("minimum_plugin_version", "")
     return result
 

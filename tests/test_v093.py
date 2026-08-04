@@ -80,10 +80,10 @@ class FakeContext:
 class V093ContractTests(unittest.TestCase):
     def test_versions_are_single_current_baseline(self) -> None:
         metadata = yaml.safe_load((ROOT / "metadata.yaml").read_text("utf-8"))
-        self.assertEqual(PLUGIN_VERSION, "0.9.3")
-        self.assertEqual(metadata["version"], "v0.9.3")
+        self.assertEqual(PLUGIN_VERSION, "0.10.0")
+        self.assertEqual(metadata["version"], "v0.10.0")
         self.assertEqual(metadata["author"], "Ghostberry")
-        self.assertEqual(DATABASE_SCHEMA_VERSION, 8)
+        self.assertEqual(DATABASE_SCHEMA_VERSION, 9)
 
     def test_builtin_world_passes_strict_preflight(self) -> None:
         report = inspect_world_package(DEFAULT_WORLD)
@@ -148,9 +148,9 @@ class V093ContractTests(unittest.TestCase):
         tide = json.loads(TIDE_WORLD_PATH.read_text("utf-8"))
         report = inspect_world_package(tide)
         self.assertTrue(report["compatible"], report["issues"])
-        self.assertEqual(tide["world_content_version"], "1.1.0")
-        self.assertEqual(tide["minimum_plugin_version"], "0.9.3")
-        self.assertEqual(report["summary"]["schema_version"], 3)
+        self.assertEqual(tide["world_content_version"], "2.0.0")
+        self.assertEqual(tide["minimum_plugin_version"], "0.10.0")
+        self.assertEqual(report["summary"]["schema_version"], 4)
         self.assertEqual(report["summary"]["stats_mode"], "preset_stack")
         self.assertEqual(report["summary"]["preset_stack_combinations"], 630)
         validation = validate_stat_generation_config(card_template(tide))
@@ -159,8 +159,8 @@ class V093ContractTests(unittest.TestCase):
     def test_world_import_keeps_preset_stack_minimum_plugin_version(self) -> None:
         tide = json.loads(TIDE_WORLD_PATH.read_text("utf-8"))
         imported = world_import_payload(tide)
-        self.assertEqual(imported["minimum_plugin_version"], "0.9.3")
-        self.assertEqual(imported["world_content_version"], "1.1.0")
+        self.assertEqual(imported["minimum_plugin_version"], "0.10.0")
+        self.assertEqual(imported["world_content_version"], "2.0.0")
         self.assertEqual(imported["template_metadata"], tide["template_metadata"])
         validate_world_contract(imported)
 
@@ -196,8 +196,8 @@ class V093ContractTests(unittest.TestCase):
             "initial_state": tide["initial_state"],
         }
         merged = world_edit_payload(submitted, current)
-        self.assertEqual(merged["minimum_plugin_version"], "0.9.3")
-        self.assertEqual(merged["world_content_version"], "1.1.0")
+        self.assertEqual(merged["minimum_plugin_version"], "0.10.0")
+        self.assertEqual(merged["world_content_version"], "2.0.0")
         self.assertEqual(merged["template_metadata"], tide["template_metadata"])
         self.assertNotIn("card_template", merged)
         self.assertNotIn("player_limits", merged)
@@ -487,7 +487,7 @@ class V093ContractTests(unittest.TestCase):
             else:
                 world["world_schema_version"] = value
                 world["rules"]["world_schema_version"] = value
-            with self.assertRaisesRegex(ValueError, "仅接受世界包协议 v2 或 v3"):
+            with self.assertRaisesRegex(ValueError, "仅接受世界包协议 v2、v3 或 v4"):
                 validate_world_contract(world)
 
     def test_world_migration_never_hot_replaces(self) -> None:
@@ -526,8 +526,8 @@ class V093ContractTests(unittest.TestCase):
         html = (ROOT / "pages/console/index.html").read_text("utf-8")
         style = (ROOT / "pages/console/style.css").read_text("utf-8")
         logo = (ROOT / "logo.svg").read_text("utf-8")
-        self.assertIn("style.css?v=0.9.3-savefix2", html)
-        self.assertIn("app.js?v=0.9.3-savefix2", html)
+        self.assertIn("style.css?v=0.10.0", html)
+        self.assertIn("app.js?v=0.10.0", html)
         self.assertIn("button-secondary", html)
         self.assertIn(".button-secondary", style)
         self.assertIn("viewBox=\"0 0 256 256\"", logo)
@@ -560,7 +560,7 @@ class V093DatabaseTests(unittest.IsolatedAsyncioTestCase):
             schema = connection.execute(
                 "SELECT value FROM tavern_meta WHERE key='schema_version'"
             ).fetchone()[0]
-        self.assertEqual(int(schema), 8)
+        self.assertEqual(int(schema), 9)
 
     async def test_private_card_message_is_consumed_once(self) -> None:
         await self.database.transition_session(
@@ -717,10 +717,10 @@ class V093DatabaseTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_current_backup_only_and_round_trip(self) -> None:
         bundle = await self.database.export_bundle()
-        self.assertEqual(bundle["schema_version"], 8)
+        self.assertEqual(bundle["schema_version"], 9)
         old = copy.deepcopy(bundle)
         old["schema_version"] = 7
-        with self.assertRaisesRegex(ValueError, "仅接受 Schema 8"):
+        with self.assertRaisesRegex(ValueError, "仅接受 Schema 9"):
             self.database.validate_bundle(old)
         self.database.validate_bundle(bundle)
 
@@ -764,8 +764,8 @@ class V093DatabaseTests(unittest.IsolatedAsyncioTestCase):
             world_edit_payload(submitted, imported), "admin"
         )
         restored = await self.database.get_world(saved["id"])
-        self.assertEqual(restored["minimum_plugin_version"], "0.9.3")
-        self.assertEqual(restored["world_content_version"], "1.1.0")
+        self.assertEqual(restored["minimum_plugin_version"], "0.10.0")
+        self.assertEqual(restored["world_content_version"], "2.0.0")
         self.assertEqual(
             restored["rules"]["character_card"]["stat_generation"]["mode"],
             "preset_stack",
@@ -786,7 +786,7 @@ class V093DatabaseTests(unittest.IsolatedAsyncioTestCase):
     async def test_diagnostics_redact_private_origin(self) -> None:
         report = await build_diagnostic_report(self.database, self.session["id"])
         self.assertEqual(report["session"]["unified_origin"], "[REDACTED]")
-        self.assertEqual(report["database_schema_version"], 8)
+        self.assertEqual(report["database_schema_version"], 9)
 
     async def test_public_api_does_not_expose_connection(self) -> None:
         hooks = HookRegistry()

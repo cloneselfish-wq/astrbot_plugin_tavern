@@ -155,7 +155,7 @@ def next_timestamped_path(
 class InstanceStorage:
     """Materialize a recoverable database and manifest for each story run.
 
-    The Schema 8 catalog is the transaction coordinator. Every successful
+    The Schema 10 catalog is the transaction coordinator. Every successful
     session mutation refreshes a self-contained, single-session SQLite
     database, so a damaged catalog can be reconstructed from manifests and
     instance databases without relying on one monolithic story file.
@@ -576,6 +576,7 @@ class InstanceStorage:
                         """
                     ).fetchall()
                 ]
+                columns_by_table: dict[str, set[str]] = {}
                 for table in tables:
                     columns = {
                         str(row["name"])
@@ -583,11 +584,27 @@ class InstanceStorage:
                             f'PRAGMA table_info("{table}")'
                         ).fetchall()
                     }
+                    columns_by_table[table] = columns
                     if "session_id" in columns and table != "sessions":
                         connection.execute(
                             f'DELETE FROM "{table}" '
                             "WHERE session_id <> ?",
                             (session_id,),
+                        )
+
+                # 世界级子表必须先于 DELETE FROM worlds 清理：
+                # world_snapshots 使用 ON DELETE RESTRICT（database.py），
+                # 直接删其它世界会触发 FOREIGN KEY constraint failed，
+                # 在克隆/多世界场景下表现为“副本文件同步异常”。
+                for table, columns in columns_by_table.items():
+                    if (
+                        "world_id" in columns
+                        and table not in {"worlds", "sessions"}
+                    ):
+                        connection.execute(
+                            f'DELETE FROM "{table}" '
+                            "WHERE world_id <> ?",
+                            (world_id,),
                         )
 
                 if "group_registry" in tables:

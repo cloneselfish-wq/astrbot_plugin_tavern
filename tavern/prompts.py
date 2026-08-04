@@ -231,6 +231,7 @@ def system_prompt(
     world: Mapping[str, Any],
     *,
     allow_check: bool = True,
+    capability_projection: Sequence[Mapping[str, Any]] | None = None,
 ) -> str:
     """Purpose-built narrative system prompt without card-authoring duplication."""
     contract = world_contract(world)
@@ -238,6 +239,24 @@ def system_prompt(
         "dice_only",
         "attribute",
     }
+    projection = [
+        {
+            "capability_ref": item.get("capability_ref"),
+            "available": bool(item.get("available", True)),
+            "state": item.get("state", {}),
+        }
+        for item in (capability_projection or ())
+        if isinstance(item, Mapping) and item.get("capability_ref")
+    ]
+    capability_block = ""
+    if projection:
+        capability_block = (
+            "<available_capabilities>\n"
+            f"{_json(projection)}\n"
+            "Only these projected capabilities may be narrated as currently usable. "
+            "The plugin remains authoritative for costs, targets, constraints and effects.\n"
+            "</available_capabilities>\n\n"
+        )
     return (
         f"{CORE_NARRATOR_RULES}\n\n"
         "<world_definition>\n"
@@ -246,6 +265,7 @@ def system_prompt(
         "<narrative_world_rules>\n"
         f"{_json(compact_world_rules(world))}\n"
         "</narrative_world_rules>\n\n"
+        f"{capability_block}"
         "<required_output_schema>\n"
         f"{_json(_schema_for(allow_check=effective_allow_check))}\n"
         "</required_output_schema>\n"
@@ -539,6 +559,32 @@ def planning_prompt(
         "<player_input trust=\"untrusted\">\n"
         f"{_json(player_input)}\n"
         "</player_input>\n"
+    )
+
+
+def dm_beat_prompt(
+    *,
+    world: Mapping[str, Any],
+    session: Mapping[str, Any],
+    instruction: str,
+    directive: str,
+    events: Sequence[Mapping[str, Any]],
+    memories: Sequence[Mapping[str, Any]],
+) -> str:
+    """Build the trusted DM-only narrative request for one non-player beat."""
+    return (
+        "生成一段主持推进。必须返回 mode=resolve，check=null；"
+        "不得生成 next_choices 或 group_decision，不得推进玩家行动指针、"
+        "玩家轮次或行动倒计时。可以提交与本段叙事严格一致的 state_patch、"
+        "memories、npc_ops、clock_ops、ledger_ops 与 status_ops。"
+        "不得伪造机器骰点，不得替玩家角色决定思想、感情、立场、主动台词"
+        "或未经选择的行动。主持指令服从插件安全规则、世界硬规则、已锁定"
+        "事实、内容边界与知识边界；一次性指引仅作用于本次生成。"
+        "正文使用简洁白描，建议 100—500 个中文可见字符。\n\n"
+        f"{_runtime_sections(world=world, session=session, player={}, events=events, memories=memories)}\n\n"
+        '<dm_instruction trust="host" priority="below-safety-and-world">\n'
+        f"{_json({'directive': directive, 'instruction': instruction})}\n"
+        "</dm_instruction>\n"
     )
 
 

@@ -1,10 +1,10 @@
 {
   "display_name": "AI Tavern · Multiplayer RPG Engine",
-  "desc": "An AI-hosted group-chat RPG with world preflight, versioned character sheets, idempotent turns, targeted recovery, redacted diagnostics, and isolated saves.",
+  "desc": "A multiplayer narrative engine with World Protocol v5, declarative capabilities and interactions, replayable rulings, and isolated saves.",
   "pages": {
     "console": {
       "title": "Tavern Console",
-      "description": "Manage world preflight, isolated story runs, character revisions, NPCs, memories, recovery, diagnostics, saves, access, and model chains."
+      "description": "Manage world preflight, stable numbering, rule simulation, isolated runs, capabilities, NPCs, recovery, receipts, and model chains."
     }
   }
 }

@@ -26,6 +26,7 @@ from .prompts import (
     choice_generation_prompt,
     choice_repair_prompt,
     choice_system_prompt,
+    dm_beat_prompt,
     planning_prompt,
     repair_prompt,
     system_prompt,
@@ -48,6 +49,11 @@ from .narrative_quality import inspect_narrative
 
 
 logger = logging.getLogger(__name__)
+
+# 0.11.1：单次结构化生成（检定/选项/直述）的全局模型调用上限。
+# 默认 json_repair_attempts=1 时正常路径仅 1-2 次调用；此上限用于兜底
+# 多 provider × 多 repair 叠加造成分钟级延迟的场景。
+_MAX_TOTAL_MODEL_ATTEMPTS = 8
 
 
 def _builtin_d20_provider(
@@ -181,6 +187,13 @@ class TavernEngine:
                 lock = asyncio.Lock()
                 self._locks[session_id] = lock
             return lock
+
+    async def release_session_lock(self, session_id: str) -> None:
+        """0.11.1：副本关闭/完结/删除后回收会话锁，避免 _locks 无限增长。"""
+        async with self._locks_guard:
+            lock = self._locks.get(session_id)
+            if lock is not None and not lock.locked():
+                self._locks.pop(session_id, None)
 
     @staticmethod
     def _usage_value(source: Any, *names: str) -> int:
@@ -921,10 +934,40 @@ class TavernEngine:
         if inspiration_mode and not selected.get("requires_check"):
             raise TavernEngineError("该选项不需要检定，不能消耗灵感点")
         flavor = clean_text(flavor_text, max_chars=160)
+        acting_user_id = str(participant["group_user_id"])
+        if bool(selected.get("collective")):
+            # 0.11.2：全队行动选项 → 由引擎直接发起集体表决，
+            # 不再依赖叙事模型自行生成 group_decision（模型未生成时
+            # 旧逻辑会把整轮判为“未提交”，玩家陷入死胡同）。
+            await self.database.create_group_vote(
+                session_id,
+                group_decision={
+                    "question": (
+                        f"是否执行全队行动：{selected['text']}"
+                        + (f"\n补充说明：{flavor}" if flavor else "")
+                    ),
+                    "options": [
+                        {"key": "A", "text": "同意执行（推进）"},
+                        {"key": "B", "text": "暂缓，先处理当前局面"},
+                    ],
+                },
+                suspended_user_id=acting_user_id,
+                actor_id=sender_id,
+            )
+            return EngineReply(
+                text=(
+                    "🌐 【集体表决】已发起全员投票，等待全体成员表决。\n"
+                    f"表决事项：{selected['text']}\n\n"
+                    "💬 请全体成员发送：/酒馆 投票 A（同意执行）"
+                    "或 B（暂缓）。\n"
+                    "投票不消耗个人行动机会。"
+                ),
+                session=await self.database.get_session(session_id),
+                turn=await self.database.get_turn_status(session_id),
+            )
         content = f"选择 {key}：{selected['text']}"
         if flavor:
             content += f"\n演绎偏好：{flavor}"
-        acting_user_id = str(participant["group_user_id"])
         return await self.process(
             event=event,
             session_id=session_id,
@@ -948,6 +991,271 @@ class TavernEngine:
             },
             progress=progress,
         )
+
+    async def process_vote_resolution(
+        self,
+        *,
+        event: Any,
+        session_id: str,
+        vote: Mapping[str, Any],
+        progress: Callable[[str], Any] | None = None,
+    ) -> EngineReply:
+        """0.11.2：集体表决通过后，把表决结果作为已定事实推进剧情并生成新选项。
+
+        修复：旧实现中 `/酒馆 投票` 的“表决通过”分支只发送确认文本，
+        从不生成后续叙事与新选项（WebUI 只读展示所以“看起来正常”）。
+        """
+        config = self.config_provider()
+        lock = await self._session_lock(session_id)
+        async with lock:
+            session = await self.database.get_session(session_id)
+            if session["state"] != "running":
+                raise TavernEngineError("酒馆当前不在运行状态")
+            try:
+                instance = await self.database.get_instance_config(
+                    session_id
+                )
+                world = dict(instance["world_snapshot"])
+            except Exception:
+                world = await self.database.get_world(session["world_id"])
+            events = await self.database.recent_events(
+                session_id,
+                config.recent_turns * 2 + 6,
+            )
+            roster = await self.database.list_roster(session_id)
+            turn = await self.database.get_turn_status(session_id)
+            session = dict(session)
+            session["roster"] = roster
+            session["turn_status"] = turn
+            session["next_actor"] = self._next_actor(turn, roster)
+            memories = await self.database.list_memories(
+                session_id,
+                "",
+                config.recent_turns * 2 + 6,
+            )
+            winner_key = str(vote.get("winner_key") or "")
+            winning_text = ""
+            for option in (vote.get("options") or []):
+                if (
+                    isinstance(option, Mapping)
+                    and str(option.get("key")) == winner_key
+                ):
+                    winning_text = str(option.get("text") or "")
+                    break
+            if not winning_text:
+                winning_text = winner_key
+            vote_input = f"队伍已表决通过：{winning_text}"
+            providers = await self._story_providers(event, config)
+            system = system_prompt(
+                world,
+                allow_check=False,
+                capability_projection=[],
+            )
+            prompt = planning_prompt(
+                world=world,
+                session=session,
+                player={},
+                player_input=vote_input,
+                events=events,
+                memories=memories,
+                allow_checks=False,
+                workflow={},
+            )
+            resolution, used_provider_id = await self._generate_resolution(
+                session_id=session_id,
+                request_type="vote_resolution",
+                world=world,
+                provider_ids=providers,
+                system=system,
+                prompt=prompt,
+                config=config,
+            )
+            if resolution.mode != "resolve":
+                raise TavernEngineError("模型未完成表决后的最终裁定")
+            if resolution.check is not None:
+                raise TavernEngineError(
+                    "表决结果落实不应产生新的检定"
+                )
+            new_state = apply_state_patch(
+                session.get("world_state"),
+                resolution.state_patch,
+            )
+            next_participant = next(
+                (
+                    item
+                    for item in roster
+                    if str(item.get("id") or "")
+                    == str(session["next_actor"].get("id") or "")
+                ),
+                session["next_actor"],
+            )
+            resolution = await self._ensure_next_choices(
+                resolution=resolution,
+                provider_ids=self._provider_order(
+                    used_provider_id,
+                    tuple(providers),
+                ),
+                world=world,
+                session=session,
+                participant=next_participant,
+                roster=roster,
+                events=events,
+                candidate_state=new_state,
+                config=config,
+            )
+            narrative = resolution.narrative.strip()
+            if len(narrative) > config.max_output_chars:
+                narrative = (
+                    narrative[: config.max_output_chars].rstrip() + "…"
+                )
+            updated = await self.database.commit_vote_resolution(
+                session_id=session_id,
+                expected_revision=session["revision"],
+                narrative=narrative,
+                world_state=new_state,
+                memories=resolution.memories,
+                model_payload={**dict(resolution.raw)},
+                workflow={
+                    "vote_id": str(vote.get("id") or ""),
+                    "next_choices": [
+                        dict(item) for item in resolution.next_choices
+                    ],
+                },
+                vote_id=str(vote.get("id") or ""),
+            )
+            story_body = self._format_story_paragraphs(narrative)
+            story_output = f"🌐 【集体决定】\n\n{story_body}"
+            next_turn = await self.database.get_turn_status(session_id)
+            next_name = (
+                str(next_turn.get("current_name") or "")
+                or str(next_turn.get("current_user_id") or "")
+                or "等待玩家加入"
+            )
+            turn_output = (
+                f"⚔️ 【回合秩序】第 {next_turn.get('round_no', 1)} 轮 · "
+                f"当前：{next_name}"
+            )
+            if resolution.next_choices:
+                turn_output += "\n\n" + format_choices(
+                    next_participant.get("character_name")
+                    or next_participant.get("display_name")
+                    or next_name,
+                    resolution.next_choices,
+                    rerolls_left=1,
+                )
+            return EngineReply(
+                text=f"{story_output}\n\n{turn_output}",
+                session=updated,
+                turn=next_turn,
+                story_text=story_output,
+                turn_text=turn_output,
+            )
+
+    async def process_dm_beat(
+        self,
+        *,
+        event: Any,
+        session_id: str,
+        dm_user_id: str,
+        instruction: str,
+        progress: Callable[[str], Any] | None = None,
+    ) -> dict[str, Any]:
+        """Generate and atomically commit a DM beat without consuming a player turn."""
+        config = self.config_provider()
+        text = clean_text(instruction, max_chars=config.max_input_chars)
+        if not text:
+            raise TavernEngineError("主持推进方向不能为空")
+        lock = await self._session_lock(session_id)
+        async with lock:
+            session = await self.database.get_session(session_id)
+            control = await self.database.get_control_state(session_id)
+            if session["state"] != "running":
+                raise TavernEngineError("暂停或非运行状态不能主持推进")
+            if control["mode"] != "dm":
+                raise TavernEngineError("当前未开启主持模式")
+            if str(control["active_dm_user_id"]) != str(dm_user_id):
+                raise TavernEngineError("只有当前活动 DM 可以推进剧情")
+            try:
+                instance = await self.database.get_instance_config(session_id)
+                world = dict(instance["world_snapshot"])
+            except Exception:
+                world = await self.database.get_world(session["world_id"])
+            roster = await self.database.list_roster(session_id)
+            turn = await self.database.get_turn_status(session_id)
+            session = dict(session)
+            session["roster"] = roster
+            session["turn_status"] = turn
+            session["next_actor"] = {}
+            session["return_requests"] = await self.database.list_return_requests(session_id)
+            session["session_characters"] = await self.database.list_session_characters(
+                session_id, include_archived=False, context_only=True
+            )
+            session["story_ledger"] = await self.database.list_story_ledger(session_id)
+            session["scene_clocks"] = await self.database.list_scene_clocks(session_id)
+            rule_state = await self.database.get_session_rule_state(session_id)
+            session["content_boundaries"] = rule_state.get("content_boundaries", {})
+            events = await self.database.recent_events(
+                session_id, config.recent_turns * 2 + 6
+            )
+            memories = await self.database.list_memories(
+                session_id, text, config.memory_limit
+            )
+            providers = await self._story_providers(event, config)
+            await self._emit_progress(progress, "【主持推进】已收到导演指令，正在生成……")
+            resolution, provider_id = await self._generate_resolution(
+                session_id=session_id,
+                request_type="dm_beat",
+                world=world,
+                provider_ids=providers,
+                system=system_prompt(world, allow_check=False),
+                prompt=dm_beat_prompt(
+                    world=world,
+                    session=session,
+                    instruction=text,
+                    directive=str(control.get("directive") or ""),
+                    events=events,
+                    memories=memories,
+                ),
+                config=config,
+            )
+            if resolution.mode != "resolve" or resolution.check is not None:
+                raise TavernEngineError("主持推进不得申请检定")
+            if resolution.group_decision:
+                raise TavernEngineError("主持推进不得直接创建集体投票")
+            narrative = clean_text(
+                resolution.narrative, max_chars=config.max_output_chars
+            )
+            new_state = apply_state_patch(
+                session.get("world_state"), resolution.state_patch
+            )
+            workflow = {
+                "npc_ops": [dict(item) for item in resolution.npc_ops],
+                "clock_ops": [dict(item) for item in resolution.clock_ops],
+                "ledger_ops": [dict(item) for item in resolution.ledger_ops],
+                "status_ops": [dict(item) for item in resolution.status_ops],
+                "assist_ops": [dict(item) for item in resolution.assist_ops],
+            }
+            result = await self.database.commit_dm_beat(
+                session_id=session_id,
+                expected_revision=int(session["revision"]),
+                dm_user_id=dm_user_id,
+                instruction=text,
+                narrative=narrative,
+                world_state=new_state,
+                memories=[dict(item) for item in resolution.memories],
+                model_payload={**dict(resolution.raw), "_provider": provider_id},
+                workflow=workflow,
+            )
+            await self.broker.publish(
+                {
+                    "type": "dm_control",
+                    "hook": "dm_beat_committed",
+                    "session_id": session_id,
+                    "beat_no": result["beat_no"],
+                    "actor": dm_user_id,
+                }
+            )
+            return result
 
     async def reroll_choices(
         self,
@@ -1306,9 +1614,16 @@ class TavernEngine:
                 and world_contract(world)["resolution"]["mode"]
                 in {"dice_only", "attribute"}
             )
+            capability_projection = []
+            if acting_participant:
+                capability_projection = await self.database.list_actor_capabilities(
+                    session_id,
+                    f"character:{acting_participant.get('id')}",
+                )
             system = system_prompt(
                 world,
                 allow_check=allow_unlocked_check,
+                capability_projection=capability_projection,
             )
             first_prompt = planning_prompt(
                 world=world,
@@ -1518,15 +1833,30 @@ class TavernEngine:
                             "",
                         ),
                     }
-                operation_id = (
-                    "dice:"
-                    + session_id
-                    + ":"
-                    + str(
+                operation_id = operation_key(
+                    session_id,
+                    "dice",
+                    turn_no=operation_turn,
+                    actor_id=sender_id,
+                    source_id=str(
                         workflow.get("choice_set_id")
                         if workflow
                         else session["revision"]
-                    )
+                    ),
+                    # 0.11.2：骰值锁定键必须含检定类别与所选选项。
+                    # 旧实现只含 session_id+choice_set_id，导致同选项集内
+                    # “魅力检定”与“信仰检定”命中同一键、复用上一轮骰值。
+                    payload={
+                        "selected_key": (
+                            str(workflow.get("selected_key") or "")
+                            if workflow
+                            else ""
+                        ),
+                        "stat": str(check_request.stat or "").casefold(),
+                        "check_type": str(
+                            check_request.check_type or ""
+                        ).casefold(),
+                    },
                 )
                 receipt = await self.database.get_operation_receipt(
                     operation_id
@@ -1535,15 +1865,27 @@ class TavernEngine:
                     locked_request = self._check_request_from_payload(
                         receipt["request"]
                     )
-                    if (
-                        locked_request.inspiration_mode
-                        != check_request.inspiration_mode
-                    ):
-                        raise TavernEngineError(
-                            "本次检定的骰池已经锁定，不能在重试时更换灵感用法"
-                        )
-                    check_request = locked_request
-                    dice = self._dice_result_from_payload(receipt["result"])
+                    same_category = (
+                        str(locked_request.stat or "").casefold()
+                        == str(check_request.stat or "").casefold()
+                        and str(
+                            locked_request.check_type or ""
+                        ).casefold()
+                        == str(check_request.check_type or "").casefold()
+                    )
+                    if not same_category:
+                        # 0.11.2 双保险：即使键碰撞，类别不同也绝不复用旧骰值。
+                        receipt = None
+                    else:
+                        if (
+                            locked_request.inspiration_mode
+                            != check_request.inspiration_mode
+                        ):
+                            raise TavernEngineError(
+                                "本次检定的骰池已经锁定，不能在重试时更换灵感用法"
+                            )
+                        check_request = locked_request
+                        dice = self._dice_result_from_payload(receipt["result"])
                 else:
                     if check_type in {"group", "resistance"}:
                         requested_ids = set(check_request.participant_ids)
@@ -1681,7 +2023,11 @@ class TavernEngine:
                         request_type="story_checked",
                         world=world,
                         provider_ids=second_stage_providers,
-                        system=system_prompt(world, allow_check=False),
+                        system=system_prompt(
+                            world,
+                            allow_check=False,
+                            capability_projection=capability_projection,
+                        ),
                         prompt=check_prompt,
                         config=config,
                         expected_actor=session["next_actor"],
@@ -1854,21 +2200,18 @@ class TavernEngine:
                     auto_snapshot_interval=config.auto_snapshot_interval,
                     store_model_payload=config.store_model_payloads,
                     workflow=commit_workflow,
+                    # 0.11.1：回执完成并入提交事务，避免已提交回合
+                    # 因跨事务崩溃被永久误判为“处理中”。
+                    operation_id=turn_operation_id,
+                    operation_result={
+                        "turn_no": operation_turn,
+                        "quality": quality,
+                    },
                 )
             except DatabaseConflictError as exc:
                 raise TavernBusyError(
                     "本轮状态刚被其他操作更新，请重新提交行动"
                 ) from exc
-            await self.database.update_operation(
-                turn_operation_id,
-                status="completed",
-                phase="committed",
-                result={
-                    "turn_no": updated_session["turn_no"],
-                    "session_revision": updated_session["revision"],
-                    "quality": quality,
-                },
-            )
 
             await self.broker.publish(
                 {
@@ -2098,11 +2441,19 @@ class TavernEngine:
         choice_system = choice_system_prompt(world)
         failures: list[str] = []
         attempts = config.json_repair_attempts + 1
+        total_attempts = 0
         for provider_id in provider_ids:
             current_prompt = prompt
             last_error = ""
             timed_out = False
             for attempt in range(attempts):
+                if total_attempts >= _MAX_TOTAL_MODEL_ATTEMPTS:
+                    failures.append(
+                        f"{provider_id}：达到全局模型重试上限"
+                    )
+                    timed_out = True
+                    break
+                total_attempts += 1
                 try:
                     response = await asyncio.wait_for(
                         self._llm_generate_metered(
@@ -2206,11 +2557,19 @@ class TavernEngine:
         attempts = config.json_repair_attempts + 1
         original_prompt = prompt
         failures: list[str] = []
+        total_attempts = 0
         for provider_id in provider_ids:
             current_prompt = prompt
             last_error = ""
             provider_failed = False
             for attempt in range(attempts):
+                if total_attempts >= _MAX_TOTAL_MODEL_ATTEMPTS:
+                    failures.append(
+                        f"{provider_id}：达到全局模型重试上限"
+                    )
+                    provider_failed = True
+                    break
+                total_attempts += 1
                 try:
                     response = await asyncio.wait_for(
                         self._llm_generate_metered(

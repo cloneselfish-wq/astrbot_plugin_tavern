@@ -18,6 +18,23 @@ SUPPORTED_EVENTS = frozenset(
         "vote_completed",
         "story_generated",
         "session_finished",
+        "dm_mode_enabled",
+        "dm_mode_disabled",
+        "dm_assigned",
+        "dm_directive_saved",
+        "dm_beat_started",
+        "dm_beat_committed",
+        "dm_narrative_appended",
+        "dm_handoff_started",
+        "dm_handoff_completed",
+        "dm_taken_over",
+        "preset_dimension_selected",
+        "preset_selection_rejected",
+        "character_presets_resolved",
+        "knowledge_boundary_resolved",
+        "content_boundary_resolved",
+        "knowledge_access_denied",
+        "content_boundary_blocked",
     }
 )
 
