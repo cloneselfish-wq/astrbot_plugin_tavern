@@ -631,8 +631,13 @@ class InstanceStorage:
                         WHERE session_id = ?
                           AND character_card_id IS NOT NULL
                           AND character_card_id <> ''
+                        UNION
+                        SELECT character_card_id FROM card_revision_requests
+                        WHERE session_id = ?
+                          AND character_card_id IS NOT NULL
+                          AND character_card_id <> ''
                         """,
-                        (session_id, session_id),
+                        (session_id, session_id, session_id),
                     ).fetchall()
                 }
                 used_version_ids = {
@@ -643,8 +648,18 @@ class InstanceStorage:
                         WHERE session_id = ?
                           AND character_version_id IS NOT NULL
                           AND character_version_id <> ''
+                        UNION
+                        SELECT base_version_id FROM card_revision_requests
+                        WHERE session_id = ?
+                          AND base_version_id IS NOT NULL
+                          AND base_version_id <> ''
+                        UNION
+                        SELECT candidate_version_id FROM card_revision_requests
+                        WHERE session_id = ?
+                          AND candidate_version_id IS NOT NULL
+                          AND candidate_version_id <> ''
                         """,
-                        (session_id,),
+                        (session_id, session_id, session_id),
                     ).fetchall()
                 }
                 self._delete_not_in(
@@ -962,8 +977,12 @@ class InstanceStorage:
             expected = str(
                 indexed["storage"].get("last_checksum") or ""
             )
+            # A14（审计 #14）：副本修订号未变化时跳过校验和读取（快路径）。
+            last_revision = int(indexed["storage"].get("last_synced_revision") or 0)
+            current_revision = int(indexed["session"].get("revision") or 0)
             if (
-                indexed["storage"].get("sync_status") == "ready"
+                last_revision >= current_revision
+                and indexed["storage"].get("sync_status") == "ready"
                 and expected
                 and database_path.exists()
                 and manifest_path.exists()
@@ -982,8 +1001,20 @@ class InstanceStorage:
                     }
                 )
                 continue
-            result = self.sync_session(session_id)
-            results.append(result)
+            try:
+                result = self.sync_session(session_id)
+                results.append(result)
+            except (sqlite3.DatabaseError, OSError) as exc:
+                # 单个副本的存储同步失败不应阻断插件整体加载：
+                # 记录错误并继续，控制台「群会话 / 副本实时仪表盘」会展示
+                # storage_sync_status=error 与 last_error，便于后续修复。
+                self._record_sync_error(session_id, exc)
+                results.append(
+                    {
+                        "session_id": session_id,
+                        "error": str(exc)[:1000],
+                    }
+                )
         return results
 
     def sync_group(self, platform_id: str, group_id: str) -> Path | None:

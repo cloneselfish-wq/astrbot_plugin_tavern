@@ -3,6 +3,7 @@ from __future__ import annotations
 import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
 from unittest.mock import patch
 
@@ -99,7 +100,7 @@ class V05PersistenceTests(unittest.IsolatedAsyncioTestCase):
         self.temp_dir.cleanup()
 
     async def test_schema_four_contains_multiplayer_immersion_tables(self) -> None:
-        with sqlite3.connect(self.database.path) as connection:
+        with closing(sqlite3.connect(self.database.path)) as connection:
             version = int(
                 connection.execute(
                     "SELECT value FROM tavern_meta WHERE key = 'schema_version'"
@@ -270,4 +271,3 @@ class V05PersistenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(cloned_memories[0]["content"], "旅队已经取得铜钥匙。")
         snapshots = await self.database.list_snapshots(clone["id"])
         self.assertTrue(any(item["name"] == "branch-origin" for item in snapshots))
-

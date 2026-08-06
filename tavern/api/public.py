@@ -97,6 +97,124 @@ class TavernPublicAPI:
             receipt_id, public_only=public_only
         )
 
+
+    # ── A16：可选经济系统（世界包 economy 块驱动；未启用时返回 ok=False）──
+    async def economy_state(self, session_id: str) -> dict[str, Any]:
+        return await self._database.economy_state(session_id)
+
+    async def economy_enable(
+        self, session_id: str, enabled: bool, actor_id: str
+    ) -> dict[str, Any]:
+        return await self._database.set_economy_enabled(
+            session_id, enabled, actor_id
+        )
+
+    async def economy_balance(
+        self, session_id: str, owner_type: str, owner_ref: str, currency_id: str
+    ) -> dict[str, Any]:
+        return await self._database.economy_balance(
+            session_id, owner_type, owner_ref, currency_id
+        )
+
+    async def economy_credit(
+        self,
+        session_id: str,
+        operation_id: str,
+        currency_id: str,
+        amount: Any,
+        owner_type: str,
+        owner_ref: str,
+        reason: str = "",
+        source: str = "api",
+        actor_id: str = "",
+    ) -> dict[str, Any]:
+        return await self._database.economy_apply(
+            session_id=session_id,
+            operation_id=operation_id,
+            kind="credit",
+            currency_id=currency_id,
+            amount=amount,
+            to_owner=(owner_type, owner_ref),
+            reason=reason,
+            source=source,
+            actor_id=actor_id,
+        )
+
+    async def economy_debit(
+        self,
+        session_id: str,
+        operation_id: str,
+        currency_id: str,
+        amount: Any,
+        owner_type: str,
+        owner_ref: str,
+        reason: str = "",
+        source: str = "api",
+        actor_id: str = "",
+    ) -> dict[str, Any]:
+        return await self._database.economy_apply(
+            session_id=session_id,
+            operation_id=operation_id,
+            kind="debit",
+            currency_id=currency_id,
+            amount=amount,
+            from_owner=(owner_type, owner_ref),
+            reason=reason,
+            source=source,
+            actor_id=actor_id,
+        )
+
+    async def economy_transfer(
+        self,
+        session_id: str,
+        operation_id: str,
+        currency_id: str,
+        amount: Any,
+        from_owner: tuple[str, str],
+        to_owner: tuple[str, str],
+        reason: str = "",
+        source: str = "api",
+        actor_id: str = "",
+    ) -> dict[str, Any]:
+        return await self._database.economy_transfer(
+            session_id=session_id,
+            operation_id=operation_id,
+            currency_id=currency_id,
+            amount=amount,
+            from_owner=from_owner,
+            to_owner=to_owner,
+            reason=reason,
+            source=source,
+            actor_id=actor_id,
+        )
+
+    async def economy_exchange(
+        self,
+        session_id: str,
+        operation_id: str,
+        currency_id: str,
+        amount: Any,
+        from_owner: tuple[str, str],
+        to_owner: tuple[str, str, str],
+        source: str = "api",
+        actor_id: str = "",
+    ) -> dict[str, Any]:
+        return await self._database.economy_exchange(
+            session_id=session_id,
+            operation_id=operation_id,
+            currency_id=currency_id,
+            amount=amount,
+            from_owner=from_owner,
+            to_owner=to_owner,
+            source=source,
+            actor_id=actor_id,
+        )
+
+    async def economy_transactions(
+        self, session_id: str, limit: int = 50
+    ) -> list[dict[str, Any]]:
+        return await self._database.economy_list_transactions(session_id, limit)
+
     async def get_control_state(self, session_id: str) -> dict[str, Any]:
         return await self._database.get_control_state(session_id)
 
@@ -192,6 +310,37 @@ class TavernPublicAPI:
         resolved: Mapping[str, Any], content_tags: Any
     ) -> dict[str, Any]:
         return check_content_permission(resolved, content_tags)
+
+    async def resolve_element_reaction(
+        self,
+        world: Mapping[str, Any],
+        source_element: str,
+        target_ref: str,
+        target_element: str | None = None,
+        context: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        """解析一次「属性元素反应」（只读、不落库）。
+
+        世界包需声明 ``elemental`` 块；若声明了 ``resolver``，则优先走已注册的
+        ``element_resolver`` 扩展点，异常或未命中时回退声明式表。
+        """
+        from .elemental import parse, resolve
+
+        parsed = parse(world)
+        provider = None
+        resolver_name = str(parsed.get("resolver") or "")
+        if resolver_name:
+            provider = self.extensions.resolve(
+                "element_resolver", resolver_name
+            )
+        return resolve(
+            parsed,
+            source_element,
+            target_ref,
+            target_element=target_element,
+            context=context,
+            resolver=provider,
+        )
 
     async def export_diagnostic(
         self,

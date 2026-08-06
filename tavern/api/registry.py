@@ -15,6 +15,7 @@ class ExtensionRegistry:
             "narrative_guard",
             "summary_provider",
             "admin_action",
+            "element_resolver",
         }
     )
 
@@ -63,3 +64,6 @@ class ExtensionRegistry:
 
     def register_admin_action(self, name: str, provider: Callable[..., Any]) -> None:
         self.register("admin_action", name, provider)
+
+    def register_element_resolver(self, name: str, provider: Callable[..., Any]) -> None:
+        self.register("element_resolver", name, provider)

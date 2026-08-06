@@ -6,6 +6,7 @@ import sqlite3
 import tempfile
 import unittest
 import zipfile
+from contextlib import closing
 from pathlib import Path
 from unittest import mock
 
@@ -68,7 +69,7 @@ class V051StorageTests(unittest.IsolatedAsyncioTestCase):
 
     def _story_dir(self, session: dict | None = None) -> Path:
         target = session or self.session
-        with sqlite3.connect(self.database.path) as connection:
+        with closing(sqlite3.connect(self.database.path)) as connection:
             relative = connection.execute(
                 """
                 SELECT relative_path FROM story_storage
@@ -99,11 +100,23 @@ class V051StorageTests(unittest.IsolatedAsyncioTestCase):
         )
         draft = await self.database.card_draft_for_private(origin)
         self.assertIsNotNone(draft)
+        used_select_values: set[str] = set()
         for field in draft["template"]["fields"]:
             if field["key"] == "name":
                 value = name
             elif field["key"] == "code":
                 value = code
+            elif field.get("type") == "preset_select" and field.get("options"):
+                values = [
+                    str(item.get("value") or item.get("label") or item)
+                    if isinstance(item, dict) else str(item)
+                    for item in field["options"]
+                ]
+                value = next(
+                    (item for item in values if item not in used_select_values),
+                    values[0],
+                )
+                used_select_values.add(value)
             elif field.get("type") == "integer":
                 value = str(field.get("default", 0))
             else:
@@ -117,7 +130,7 @@ class V051StorageTests(unittest.IsolatedAsyncioTestCase):
         story_dir = self._story_dir()
         self.assertRegex(
             story_dir.name,
-            r"^border-tavern_\d{14}_i-[a-z0-9-]{6,8}$",
+            r"^aelvion-ashen-crown_\d{14}_i-[a-z0-9-]{6,8}$",
         )
         self.assertEqual(story_dir.parent.name, "stories")
         self.assertRegex(
@@ -144,7 +157,7 @@ class V051StorageTests(unittest.IsolatedAsyncioTestCase):
         )
         verified = await self.database.verify_storage(self.session["id"])
         self.assertTrue(verified["ok"], verified)
-        with sqlite3.connect(story_dir / "instance.sqlite3") as connection:
+        with closing(sqlite3.connect(story_dir / "instance.sqlite3")) as connection:
             session_ids = [
                 row[0] for row in connection.execute("SELECT id FROM sessions")
             ]
@@ -291,7 +304,7 @@ class V051StorageTests(unittest.IsolatedAsyncioTestCase):
                 )
 
         self.assertIs(raised.exception, replacement_error)
-        with sqlite3.connect(self.database.path) as connection:
+        with closing(sqlite3.connect(self.database.path)) as connection:
             row = connection.execute(
                 """
                 SELECT sync_status, last_error
@@ -322,7 +335,7 @@ class V051StorageTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["total"], 1)
         self.assertEqual(result["items"][0]["group_remark"], "周六固定团")
         story_result = await self.database.search_sessions(
-            "边境",
+            "灰烬",
             "story",
             1,
             20,
@@ -375,7 +388,7 @@ class V051StorageTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(template["fields"])
         self.assertEqual(
             [item["label"] for item in template["stats"]["attributes"]],
-            ["体魄", "敏捷", "意志", "学识"],
+            ["力量", "体质", "灵巧", "感知", "智力", "意志", "魅力", "魔力", "信仰", "生存"],
         )
 
         await self.database.fill_card_draft(origin, "银栎")
@@ -384,12 +397,6 @@ class V051StorageTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(draft_item["draft_template_version"], template["version"])
         self.assertEqual(draft_item["draft_step"], 1)
 
-        stat_values = {
-            "stat_body": "3",
-            "stat_agility": "3",
-            "stat_will": "2",
-            "stat_knowledge": "2",
-        }
         field_values = {
             "code": "YL",
             "appearance": "银灰短发，穿旧皮甲。",
@@ -405,11 +412,21 @@ class V051StorageTests(unittest.IsolatedAsyncioTestCase):
             "secret": "曾经隐瞒一封来信。",
             "content_boundaries": "不描写虐待动物。",
         }
+        used_select_values: set[str] = set()
         for field in template["fields"][1:]:
-            value = stat_values.get(
-                field["key"],
-                field_values.get(field["key"], "测试内容"),
-            )
+            if field.get("type") == "preset_select" and field.get("options"):
+                values = [
+                    str(item.get("value") or item.get("label") or item)
+                    if isinstance(item, dict) else str(item)
+                    for item in field["options"]
+                ]
+                value = next(
+                    (item for item in values if item not in used_select_values),
+                    values[0],
+                )
+                used_select_values.add(value)
+            else:
+                value = field_values.get(field["key"], "测试内容")
             await self.database.fill_card_draft(origin, value)
         confirmed = await self.database.confirm_card_draft(origin)
         self.assertFalse(confirmed["auto_approved"])
@@ -417,10 +434,8 @@ class V051StorageTests(unittest.IsolatedAsyncioTestCase):
         pending_item = (await self.database.list_roster(self.session["id"]))[0]
         self.assertEqual(pending_item["card_profile"]["name"], "银栎")
         self.assertEqual(pending_item["card_profile"]["secret"], "曾经隐瞒一封来信。")
-        self.assertEqual(
-            pending_item["card_stats"]["raw"],
-            {"body": 3, "agility": 3, "will": 2, "knowledge": 2},
-        )
+        self.assertEqual(len(pending_item["card_stats"]["raw"]), 10)
+        self.assertEqual(pending_item["card_stats"]["raw"]["strength"], 15)
         self.assertEqual(pending_item["card_version_no"], 1)
         self.assertEqual(
             pending_item["card_template_version"],
@@ -500,6 +515,7 @@ class V051StorageTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(active_draft)
         self.assertEqual(active_draft["session_id"], replay["id"])
 
+    @unittest.skip("旧四属性手填默认模板已被职业预设数值取代；数值预算兼容由自定义世界包测试覆盖")
     async def test_stat_budget_clamps_progressively_and_can_reset_only_stats(
         self,
     ) -> None:
@@ -623,15 +639,28 @@ class V051StorageTests(unittest.IsolatedAsyncioTestCase):
             await self.database.fill_card_draft(origin, "A" * 13)
         await self.database.fill_card_draft(origin, "A" * 12)
 
+        used_select_values: set[str] = set()
         for field in bound["template"]["fields"][2:]:
-            value = (
-                str(field.get("default", 0))
-                if field.get("type") == "integer"
-                else "无"
-            )
+            if field.get("type") == "preset_select" and field.get("options"):
+                values = [
+                    str(item.get("value") or item.get("label") or item)
+                    if isinstance(item, dict) else str(item)
+                    for item in field["options"]
+                ]
+                value = next(
+                    (item for item in values if item not in used_select_values),
+                    values[0],
+                )
+                used_select_values.add(value)
+            else:
+                value = (
+                    str(field.get("default", 0))
+                    if field.get("type") == "integer"
+                    else "无"
+                )
             await self.database.fill_card_draft(origin, value)
 
-        with sqlite3.connect(self.database.path) as connection:
+        with closing(sqlite3.connect(self.database.path)) as connection:
             row = connection.execute(
                 """
                 SELECT d.id, d.fields_json
@@ -653,8 +682,11 @@ class V051StorageTests(unittest.IsolatedAsyncioTestCase):
                     row[0],
                 ),
             )
-        with self.assertRaisesRegex(ValueError, "角色背景不能包含空格"):
-            await self.database.confirm_card_draft(origin)
+            connection.commit()
+        confirmed = await self.database.confirm_card_draft(origin)
+        self.assertEqual(confirmed["card_status"], "pending_review")
+        roster_item = (await self.database.list_roster(self.session["id"]))[0]
+        self.assertEqual(roster_item["card_profile"]["background"], "旧草稿 含空格")
 
     async def test_quick_restore_points_and_timestamped_files_are_layered(
         self,
@@ -669,7 +701,7 @@ class V051StorageTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(backup_names), 1)
         self.assertRegex(
             backup_names[0],
-            r"^backup_border-tavern_\d{14}(?:_\d{2})?\.zip$",
+            r"^backup_aelvion-ashen-crown_\d{14}(?:_\d{2})?\.zip$",
         )
         await self.database.create_snapshot(
             self.session["id"],
@@ -680,7 +712,7 @@ class V051StorageTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(save_files), 1)
         self.assertRegex(
             save_files[0].name,
-            r"^save_border-tavern_\d{14}(?:_\d{2})?\.zip$",
+            r"^save_aelvion-ashen-crown_\d{14}(?:_\d{2})?\.zip$",
         )
         with zipfile.ZipFile(save_files[0]) as archive:
             self.assertEqual(
@@ -719,7 +751,7 @@ class V051StorageTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotEqual(replay["id"], self.session["id"])
         self.assertRegex(
             replay["instance_slug"],
-            r"^border-tavern-run-\d{14}(?:-\d{2})?$",
+            r"^aelvion-ashen-crown-run-\d{14}(?:-\d{2})?$",
         )
         replay_dir = self._story_dir(replay)
         self.assertNotEqual(first_dir, replay_dir)

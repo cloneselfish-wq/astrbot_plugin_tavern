@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import importlib
 import io
+import json
 import re
 import shutil
 import sys
@@ -219,6 +220,15 @@ class PluginShellTests(unittest.IsolatedAsyncioTestCase):
             sys.path.remove(str(ROOT.parent))
         self.temp_dir.cleanup()
 
+    async def _enable_timer_announcements(self, session_id: str) -> None:
+        instance = await self.plugin.database.get_instance_config(session_id)
+        rules = dict(instance.get("time_rules") or {})
+        rules["announce_timeouts"] = True
+        await self.plugin.database.execute_write(
+            "UPDATE instance_configs SET time_rules_json=? WHERE session_id=?",
+            (json.dumps(rules, ensure_ascii=False), session_id),
+        )
+
     async def test_plugin_registers_native_web_routes(self) -> None:
         paths = {route[0] for route in self.context.routes}
         self.assertGreaterEqual(len(paths), 20)
@@ -230,6 +240,43 @@ class PluginShellTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("/astrbot_plugin_tavern/groups/remark", paths)
         self.assertIn("/astrbot_plugin_tavern/backup/import/<mode>", paths)
         self.assertIn("/astrbot_plugin_tavern/events", paths)
+
+    async def test_extensions_route_registers_async_handler_and_returns_catalog(self) -> None:
+        request = sys.modules["astrbot.api.web"].request
+        request.username = "dashboard-admin"
+        route = next(
+            item
+            for item in self.context.routes
+            if item[0] == "/astrbot_plugin_tavern/extensions"
+        )
+        self.assertTrue(callable(route[1]))
+        response = await route[1]()
+        self.assertIn("dice_system", response["kinds"])
+        self.assertIn("d20", response["kinds"]["dice_system"])
+        self.assertFalse(response["partial"])
+
+    async def test_extensions_endpoint_isolates_one_unserializable_item(self) -> None:
+        request = sys.modules["astrbot.api.web"].request
+        request.username = "dashboard-admin"
+
+        class BadName:
+            def __str__(self):
+                raise RuntimeError("broken extension metadata")
+
+        class PartialRegistry:
+            @staticmethod
+            def list():
+                return {"admin_action": ["healthy", BadName()]}
+
+        original = self.plugin.web_console._extension_registry
+        self.plugin.web_console._extension_registry = PartialRegistry()
+        try:
+            response = await self.plugin.web_console.extensions()
+        finally:
+            self.plugin.web_console._extension_registry = original
+        self.assertEqual(response["kinds"]["admin_action"], ["healthy"])
+        self.assertTrue(response["partial"])
+        self.assertEqual(len(response["errors"]), 1)
 
     async def test_timer_notice_mentions_target_and_shows_remaining_time(
         self,
@@ -243,6 +290,7 @@ class PluginShellTests(unittest.IsolatedAsyncioTestCase):
             DEFAULT_WORLD_SLUG,
             "admin-1",
         )
+        await self._enable_timer_announcements(session["id"])
         await self.plugin._send_timer_notice(
             {
                 "kind": "reminder",
@@ -264,22 +312,17 @@ class PluginShellTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.context.sent_messages), 1)
         origin, chain = self.context.sent_messages[0]
         self.assertEqual(origin, "qq:group-timer-notice")
-        mentions = [
-            component
-            for component in chain.chain
-            if hasattr(component, "qq")
-        ]
-        self.assertEqual(len(mentions), 1)
-        self.assertEqual(mentions[0].qq, "target-user")
+        self.assertFalse(any(hasattr(component, "qq") for component in chain.chain))
         text = "".join(
             str(component.text)
             for component in chain.chain
             if hasattr(component, "text")
         )
         self.assertIn("行动回合剩余 1分30秒", text)
+        self.assertIn("@白鸦", text)
         self.assertIn("请及时完成本回合操作", text)
 
-    async def test_qq_official_timer_notice_uses_real_mention_protocol(
+    async def test_qq_official_timer_notice_uses_portable_text_mention(
         self,
     ) -> None:
         from astrbot_plugin_tavern.tavern.constants import DEFAULT_WORLD_SLUG
@@ -292,6 +335,7 @@ class PluginShellTests(unittest.IsolatedAsyncioTestCase):
             DEFAULT_WORLD_SLUG,
             "admin-1",
         )
+        await self._enable_timer_announcements(session["id"])
         await self.plugin._send_timer_notice(
             {
                 "kind": "reminder",
@@ -317,10 +361,8 @@ class PluginShellTests(unittest.IsolatedAsyncioTestCase):
             for component in chain.chain
             if hasattr(component, "text")
         )
-        self.assertIn(
-            '<qqbot-at-user id="MEMBER_OPENID_1" />',
-            text,
-        )
+        self.assertIn("@白鸦", text)
+        self.assertNotIn("qqbot-at-user", text)
         self.assertIn("行动回合剩余 1分", text)
 
     async def test_card_countdown_notice_is_private_without_group_mention(
@@ -475,7 +517,7 @@ class PluginShellTests(unittest.IsolatedAsyncioTestCase):
             command=ParsedCommand(
                 matched=True,
                 action="start",
-                argument="border-tavern",
+                argument="aelvion-ashen-crown",
             ),
             config=config,
             group_id="group-shell",
@@ -502,7 +544,7 @@ class PluginShellTests(unittest.IsolatedAsyncioTestCase):
             command=ParsedCommand(
                 matched=True,
                 action="start",
-                argument="border-tavern",
+                argument="aelvion-ashen-crown",
             ),
             config=config,
             group_id="group-shell",
@@ -904,7 +946,7 @@ class PluginShellTests(unittest.IsolatedAsyncioTestCase):
             command=ParsedCommand(
                 matched=True,
                 action="start",
-                argument="border-tavern",
+                argument="aelvion-ashen-crown",
             ),
             config=TavernConfig.from_mapping(self.config),
             group_id=group_id,
@@ -912,7 +954,7 @@ class PluginShellTests(unittest.IsolatedAsyncioTestCase):
             sender_id="admin-1",
         )
         self.assertIn("酒馆已开启", started)
-        self.assertIn("副本标识：border-tavern", started)
+        self.assertIn("副本标识：aelvion-ashen-crown", started)
 
     def test_instance_list_includes_intro_and_paginates_five_at_a_time(
         self,
@@ -946,7 +988,7 @@ class PluginShellTests(unittest.IsolatedAsyncioTestCase):
             2,
         )
         self.assertIsNone(
-            self.module.parse_instance_list_page("border-tavern")
+            self.module.parse_instance_list_page("aelvion-ashen-crown")
         )
 
     async def test_start_page_argument_only_reads_requested_page(
@@ -955,21 +997,23 @@ class PluginShellTests(unittest.IsolatedAsyncioTestCase):
         from astrbot_plugin_tavern.tavern.config import TavernConfig
         from astrbot_plugin_tavern.tavern.security import ParsedCommand
 
+        base_world = await self.plugin.database.get_world(
+            "aelvion-ashen-crown"
+        )
+        for internal_key in (
+            "id", "revision", "display_no", "sort_order",
+            "created_at", "updated_at", "archived",
+        ):
+            base_world.pop(internal_key, None)
         for index in range(1, 7):
             await self.plugin.database.save_world(
                 {
+                    **base_world,
                     "slug": f"page-world-{index}",
                     "name": f"分页世界 {index}",
                     "description": f"分页简介 {index}",
                     "system_prompt": "保持因果一致。",
                     "opening_scene": "故事尚未开始。",
-                    "rules": {"resolution": "d20"},
-                    "initial_state": {
-                        "location": "起点",
-                        "facts": [],
-                        "inventory": {},
-                        "relationships": {},
-                    },
                 },
                 "admin-1",
             )
@@ -1008,7 +1052,7 @@ class PluginShellTests(unittest.IsolatedAsyncioTestCase):
             "qq",
             "group-shell",
             "qq:group-shell",
-            "border-tavern",
+            "aelvion-ashen-crown",
             "admin-1",
             "main-copy",
             "主线副本",
@@ -1022,7 +1066,7 @@ class PluginShellTests(unittest.IsolatedAsyncioTestCase):
             "qq",
             "group-shell",
             "qq:group-shell",
-            "border-tavern",
+            "aelvion-ashen-crown",
             "admin-1",
             "second-copy",
             "二周目副本",
@@ -1051,7 +1095,7 @@ class PluginShellTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("二周目副本", response)
         self.assertIn("（second-copy）", response)
         self.assertIn("简介：", response)
-        self.assertIn("一座位于诸界夹缝中的中立酒馆", response)
+        self.assertIn("灰月异象", response)
         self.assertNotIn("酒馆已开启", response)
         after_items = await self.plugin.database.list_group_sessions(
             "qq",
@@ -1133,6 +1177,7 @@ class PluginShellTests(unittest.IsolatedAsyncioTestCase):
                 "强制终止",
                 "维护",
                 "状态",
+                "主持",
                 "安全暂停",
                 "存档",
                 "删档",
@@ -1143,6 +1188,9 @@ class PluginShellTests(unittest.IsolatedAsyncioTestCase):
                 "加入",
                 "建卡",
                 "填写",
+                "上一步",
+                "修改",
+                "当前步骤",
                 "预览",
                 "重填数值",
                 "建卡提醒",
@@ -1158,6 +1206,7 @@ class PluginShellTests(unittest.IsolatedAsyncioTestCase):
                 "灵感重投",
                 "重整选项",
                 "投票",
+                "全队",
                 "暂离",
                 "返回队列",
                 "申请返场",
@@ -1215,11 +1264,23 @@ class PluginShellTests(unittest.IsolatedAsyncioTestCase):
                 user_id,
                 origin,
             )
+            used_select_values: set[str] = set()
             for field in bound["template"]["fields"]:
                 if field["key"] == "name":
                     value = f"待审角色{index + 1}"
                 elif field["key"] == "code":
                     value = f"R{index + 1}"
+                elif field.get("type") == "preset_select" and field.get("options"):
+                    values = [
+                        str(item.get("value") or item.get("label") or item)
+                        if isinstance(item, dict) else str(item)
+                        for item in field["options"]
+                    ]
+                    value = next(
+                        (item for item in values if item not in used_select_values),
+                        values[0],
+                    )
+                    used_select_values.add(value)
                 elif field.get("type") == "integer":
                     value = str(field.get("default", 0))
                 elif field.get("private"):
@@ -1300,7 +1361,7 @@ class PluginShellTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("审核用公开内容", detail)
         self.assertIn("已填写，群聊中隐藏", detail)
         self.assertNotIn("审核用私密内容", detail)
-        self.assertIn("体魄", detail)
+        self.assertIn("最终属性", detail)
 
         approved = await self.plugin._handle_command(
             event=event,
@@ -1322,6 +1383,7 @@ class PluginShellTests(unittest.IsolatedAsyncioTestCase):
             1,
         )
 
+    @unittest.skip("旧四属性手填默认模板已被职业预设数值取代；通用数值向导由独立世界包夹具覆盖")
     async def test_private_stat_prompt_and_native_reset_keep_profile(
         self,
     ) -> None:
@@ -1568,7 +1630,7 @@ class PluginShellTests(unittest.IsolatedAsyncioTestCase):
             )
         )
 
-        event.message_str = "酒馆 开启 border-tavern"
+        event.message_str = "酒馆 开启 aelvion-ashen-crown"
         started_responses = [
             item async for item in self.plugin.tavern_start(event)
         ]
@@ -1659,7 +1721,7 @@ class PluginShellTests(unittest.IsolatedAsyncioTestCase):
         self,
     ) -> None:
         class Event:
-            message_str = "酒馆 开启 border-tavern"
+            message_str = "酒馆 开启 aelvion-ashen-crown"
             unified_msg_origin = "qq:group-shell"
             message_obj = SimpleNamespace(group_id="group-shell")
 
@@ -1742,7 +1804,7 @@ class PluginShellTests(unittest.IsolatedAsyncioTestCase):
             command=ParsedCommand(
                 matched=True,
                 action="start",
-                argument="border-tavern",
+                argument="aelvion-ashen-crown",
             ),
             config=TavernConfig.from_mapping(self.config),
             group_id="group-shell",
@@ -1812,7 +1874,8 @@ class PluginShellTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(event.stopped)
         self.assertEqual(yielded, [])
         self.plugin.engine.process_choice.assert_awaited_once()
-        self.assertEqual(len(self.context.sent_messages), 3)
+        # B1 统一为纯文本链路：叙事与选项各发送一次，不再额外尝试富卡片。
+        self.assertEqual(len(self.context.sent_messages), 2)
         texts = [
             "".join(
                 str(component.text)
@@ -1821,9 +1884,8 @@ class PluginShellTests(unittest.IsolatedAsyncioTestCase):
             )
             for _, chain in self.context.sent_messages
         ]
-        self.assertIn("后续内容正在生成中", texts[0])
-        self.assertIn("修复后的故事正文", texts[1])
-        self.assertIn("第2轮", texts[2])
+        self.assertIn("修复后的故事正文", texts[0])
+        self.assertIn("第2轮", texts[1])
         self.assertTrue(
             all(
                 origin == event.unified_msg_origin
@@ -1863,11 +1925,23 @@ class PluginShellTests(unittest.IsolatedAsyncioTestCase):
         draft = await self.plugin.database.card_draft_for_private(
             private_origin
         )
+        used_select_values: set[str] = set()
         for field in draft["template"]["fields"]:
             if field["key"] == "name":
                 value = "同步角色"
             elif field["key"] == "code":
                 value = "SYNC"
+            elif field.get("type") == "preset_select" and field.get("options"):
+                values = [
+                    str(item.get("value") or item.get("label") or item)
+                    if isinstance(item, dict) else str(item)
+                    for item in field["options"]
+                ]
+                value = next(
+                    (item for item in values if item not in used_select_values),
+                    values[0],
+                )
+                used_select_values.add(value)
             elif field.get("type") == "integer":
                 value = str(field.get("default", 0))
             else:

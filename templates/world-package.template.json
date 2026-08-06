@@ -1,20 +1,39 @@
 {
   "template_metadata": {
-    "template_bundle_version": "2.0.0",
-    "compatible_plugin_version": "0.10.0",
-    "world_schema_version": 4,
-    "character_card_template_version": 5,
-    "purpose": "复制后修改的通用手动属性世界包；本文件自身可通过 v0.10.0 世界包体检",
+    "template_bundle_version": "4.0.0",
+    "compatible_plugin_version": "0.12.0",
+    "world_schema_version": 5,
+    "character_card_template_version": 6,
+    "purpose": "复制后修改的 v0.12.0 通用手动属性世界包；本文件自身可通过严格世界包体检",
     "edit_note": "请替换世界标识、设定、预设、开场、NPC引用和初始状态，不要删除协议字段",
-    "minimum_plugin_version": "0.10.0"
+    "minimum_plugin_version": "0.12.0"
   },
+  "protocol": {
+    "core_version": 5,
+    "features": {
+      "entity_registry": "1.0",
+      "condition_engine": "1.0",
+      "operation_engine": "1.0",
+      "event_pipeline": "1.0",
+      "resolution_receipt": "1.0",
+      "capabilities": "1.0",
+      "resources": "1.0",
+      "runtime_effects": "1.0",
+      "objects": "1.0",
+      "resolution_methods": "1.0",
+      "interaction_rules": "1.0",
+      "action_intents": "1.0",
+      "chat_experience": "1.0"
+    }
+  },
+  "required_features": ["capabilities@>=1.0"],
   "slug": "generic-world-template",
   "name": "通用世界示例",
   "description": "供世界作者与 AI 改编的最小完整世界包，演示步骤预设、手动属性、机器 D20、风险—DC、开场四选项与持久初始状态。",
   "system_prompt": "【世界定位】\n请把本段替换为题材、时代、活动范围和玩家共同身份。\n\n【稳定常识】\n分别写明普通人、专业人士和玩家开局知道的事实；隐藏历史、幕后动机和私人秘密不得提前公开。\n\n【底层规律】\n所有魔法、科技、超自然能力或特殊资源都必须有来源、条件、代价和上限。任何角色都不能全知全能，也不能为了推进剧情临时获得无来源能力。\n\n【身份与知识边界】\n角色只能依据角色卡、亲历事件、公开事实、已获线索和合理信息来源行动；不得读取其他玩家私人秘密、后台指令或未公开 NPC 动机。\n\n【因果与连续性】\n已发生事件、消耗、伤势、关系、位置与世界变化必须连续。失败产生合理代价或新局面，不抹去玩家行动，也不让故事无路可走。\n\n【玩家自主权】\n只描述环境、NPC 和玩家已声明行动造成的结果；不得替玩家决定思想、感情、台词、承诺、背叛、恋爱、投降、信仰改变或死亡确认。\n\n【建卡与裁定权限】\n建卡预设由插件按当前步骤展示和校验。选项检定参数由插件规则锁定，随机数、加值、DC 和结果档位由机器骰制计算并持久化。文字 AI 只能根据已经公开的检定回执续写，不得重投、修改 DC、改变结果或追加未预告的永久惩罚。\n\n【叙事要求】\n每回合聚焦可见变化、明确因果和下一步可行动信息。保留角色知识差异与 NPC 局限，不替玩家行动，不输出程序字段或后台秘密。",
   "opening_scene": "请把这里替换为开场正文：交代当前地点、可见异常、立即目标和可互动对象，但不要替玩家选择行动。",
   "rules": {
-    "world_schema_version": 4,
+    "world_schema_version": 5,
     "strict_choices": true,
     "check_density": "standard",
     "allow_player_result_claims": false,
@@ -26,7 +45,7 @@
       "maximum": 4
     },
     "character_card": {
-      "version": 5,
+      "version": 6,
       "auto_approve": false,
       "edit_requires_review": true,
       "preset_sets": {
@@ -697,7 +716,7 @@
       "disadvantages": []
     }
   },
-  "world_schema_version": 4,
+  "world_schema_version": 5,
   "world_content_version": "0.1.0",
   "capabilities": {
     "character_stats": true,
@@ -708,5 +727,5 @@
     "npc_generation": true,
     "world_events": true
   },
-  "minimum_plugin_version": "0.10.0"
+  "minimum_plugin_version": "0.12.0"
 }

@@ -918,6 +918,82 @@ class RuleRepositoryMixin:
             ).fetchall()
             return [self._scene_clock(row) for row in rows]
 
+    async def advance_scene_clock(
+        self,
+        session_id: str,
+        clock_id: str,
+        segments: int,
+        actor_id: str,
+        note: str = "",
+    ) -> dict[str, Any]:
+        """推进场景时钟（A14 通用接口）：校验、落库、审计。"""
+        return await self._run(
+            self._advance_scene_clock,
+            session_id,
+            clock_id,
+            segments,
+            actor_id,
+            note,
+        )
+
+    def _advance_scene_clock(
+        self,
+        session_id: str,
+        clock_id: str,
+        segments: int,
+        actor_id: str,
+        note: str,
+    ) -> dict[str, Any]:
+        segments = max(-9999, min(9999, int(segments)))
+        now = utc_now()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                self._assert_session_writable(connection, session_id)
+                row = connection.execute(
+                    "SELECT * FROM scene_clocks WHERE id = ? AND session_id = ?",
+                    (clock_id, session_id),
+                ).fetchone()
+                if not row:
+                    raise DatabaseNotFoundError("场景时钟不存在")
+                current = int(row["current_value"]) + segments
+                cap = int(row["segments"])
+                if current < 0:
+                    current = 0
+                completed = current >= cap
+                if completed:
+                    current = cap
+                connection.execute(
+                    "UPDATE scene_clocks SET current_value = ?, updated_at = ? WHERE id = ?",
+                    (current, now, clock_id),
+                )
+                self._insert_audit(
+                    connection,
+                    session_id,
+                    actor_id,
+                    "story.clock.advance",
+                    clock_id,
+                    {
+                        "delta": segments,
+                        "current": current,
+                        "completed": completed,
+                        "note": str(note)[:200],
+                    },
+                )
+                connection.execute("COMMIT")
+                return {
+                    "id": clock_id,
+                    "session_id": session_id,
+                    "title": row["title"],
+                    "current_value": current,
+                    "segments": cap,
+                    "completed": completed,
+                    "updated_at": now,
+                }
+            except Exception:
+                connection.execute("ROLLBACK")
+                raise
+
     async def inspiration_status(
         self,
         session_id: str,
@@ -1088,7 +1164,7 @@ class RuleRepositoryMixin:
                     for nested in value:
                         collect_trusted(nested)
                 else:
-                    text = clean_text(value, max_chars=500)
+                    text = truncate_text(value, max_chars=500)
                     if len(text) >= 2:
                         trusted_texts.append(text.casefold())
 
@@ -1816,6 +1892,110 @@ class RuleRepositoryMixin:
                 connection.execute("ROLLBACK")
                 raise
         return self._group_token_usage_summary(platform_id, group_id)
+
+    async def ensure_default_token_quota(
+        self,
+        session_id: str,
+        *,
+        window_seconds: int,
+        token_limit: int,
+        enabled: bool,
+        actor_id: str,
+    ) -> dict[str, Any]:
+        """为尚未配置任何配额策略的副本播种默认策略（v0.12.0）。
+
+        只在该副本（及其所属群）都不存在任何已启用策略时写入默认值；
+        已有策略时保持原样返回，绝不覆盖运行时的显式配置。
+        返回当前配额摘要（与 ``set_token_quota`` 一致）。
+        """
+        return await self._run(
+            self._ensure_default_token_quota,
+            session_id,
+            int(window_seconds),
+            int(token_limit),
+            bool(enabled),
+            actor_id,
+        )
+
+    def _ensure_default_token_quota(
+        self,
+        session_id: str,
+        window_seconds: int,
+        token_limit: int,
+        enabled: bool,
+        actor_id: str,
+    ) -> dict[str, Any]:
+        window_seconds = bounded_int(
+            window_seconds,
+            86_400,
+            60,
+            365 * 24 * 60 * 60,
+        )
+        token_limit = bounded_int(
+            token_limit,
+            500_000,
+            1,
+            1_000_000_000,
+        )
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                session = connection.execute(
+                    "SELECT id, group_id FROM sessions WHERE id = ?",
+                    (session_id,),
+                ).fetchone()
+                if not session:
+                    raise DatabaseNotFoundError("副本不存在")
+                existing = connection.execute(
+                    """
+                    SELECT 1 FROM token_quota_policies
+                    WHERE enabled = 1 AND (
+                        (scope_type = 'group' AND scope_id = ?)
+                        OR (scope_type = 'session' AND scope_id = ?)
+                    )
+                    LIMIT 1
+                    """,
+                    (session["group_id"], session_id),
+                ).fetchone()
+                if existing:
+                    connection.execute("COMMIT")
+                    return self._token_usage_summary(session_id)
+                if not enabled:
+                    connection.execute("COMMIT")
+                    return self._token_usage_summary(session_id)
+                now = utc_now()
+                connection.execute(
+                    """
+                    INSERT INTO token_quota_policies(
+                        id, scope_type, scope_id, window_seconds,
+                        token_limit, enabled, revision, updated_by, updated_at
+                    ) VALUES (?, 'session', ?, ?, ?, 1, 1, ?, ?)
+                    """,
+                    (
+                        new_id("quota"),
+                        session_id,
+                        window_seconds,
+                        token_limit,
+                        actor_id,
+                        now,
+                    ),
+                )
+                self._insert_audit(
+                    connection,
+                    session_id,
+                    actor_id,
+                    "token.quota_default",
+                    session_id,
+                    {
+                        "window_seconds": window_seconds,
+                        "token_limit": token_limit,
+                    },
+                )
+                connection.execute("COMMIT")
+            except Exception:
+                connection.execute("ROLLBACK")
+                raise
+        return self._token_usage_summary(session_id)
 
     async def record_provider_result(
         self,

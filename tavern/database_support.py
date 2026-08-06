@@ -73,7 +73,7 @@ from .stat_generation import (
 from .resolution import memory_fingerprint
 from .presets import resolve_character_presets, validate_preset_selection
 from .world_contract import validate_world_contract
-from .security import clean_text, validate_platform_id, validate_slug
+from .security import clean_text, truncate_text, validate_platform_id, validate_slug
 from .storage import (
     InstanceStorage,
     next_timestamped_path,

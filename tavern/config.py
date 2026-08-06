@@ -94,10 +94,35 @@ class TavernConfig:
     store_model_payloads: bool = False
     debug: bool = False
 
-    rich_cards_enabled: bool = True
-    rich_card_mode: str = "auto"  # auto | markdown | ark | text
-    # 留空 = 自动取当前正在游玩的副本 / 世界名作为卡片标题。
-    rich_card_title: str = ""
+    # Token 配额默认值（v0.12.0）：新建副本无策略时用于播种默认策略。
+    token_quota_enabled: bool = False
+    token_quota_window_seconds: int = 86400
+    token_quota_token_limit: int = 400000
+
+    # 世界包远程市场（0.12.0-A3，#4）。
+    world_market_enabled: bool = False
+    world_market_remote_manifest_url: str = ""
+    world_market_allowed_hosts: tuple[str, ...] = (
+        "raw.githubusercontent.com",
+        "github.com",
+        "objects.githubusercontent.com",
+        "codeload.github.com",
+    )
+    world_market_cache_ttl_seconds: int = 600
+    world_market_max_package_bytes: int = 2_000_000
+    world_market_verify_sha256: bool = True
+
+    # 自动备份（v0.12.0-A15）：后台按间隔导出完整 ZIP 备份并保留最近 N 份。
+    auto_backup_enabled: bool = False
+    auto_backup_interval_hours: float = 24.0
+    auto_backup_keep_count: int = 7
+
+    # Webhook 事件通知（v0.12.0-A15）：将酒馆事件推送到外部地址。
+    webhook_enabled: bool = False
+    webhook_urls: tuple[str, ...] = ()
+    webhook_secret: str = ""
+    webhook_events: tuple[str, ...] = ()  # 空 = 推送全部事件
+    webhook_timeout_seconds: float = 10.0
 
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any] | None) -> "TavernConfig":
@@ -106,7 +131,12 @@ class TavernConfig:
         model = _mapping(root.get("model"))
         runtime = _mapping(root.get("runtime"))
         advanced = _mapping(root.get("advanced"))
-        rich = _mapping(root.get("rich"))
+        # B1：旧版 rich 配置刻意只读忽略。保留旧键不会导致升级失败，
+        # 但运行时与 WebUI 不再暴露 QQ 专属富卡片分支。
+        token_quota = _mapping(root.get("token_quota"))
+        world_market = _mapping(root.get("world_market"))
+        auto_backup = _mapping(root.get("auto_backup"))
+        webhook = _mapping(root.get("webhook"))
 
         behavior = str(
             security.get("unauthorized_command_behavior", "silent")
@@ -225,15 +255,56 @@ class TavernConfig:
                 advanced.get("store_model_payloads", False)
             ),
             debug=bool(advanced.get("debug", False)),
-            rich_cards_enabled=bool(rich.get("enabled", True)),
-            rich_card_mode=(
-                str(rich.get("mode", "auto")).strip().lower()
-                if str(rich.get("mode", "auto")).strip().lower()
-                in {"auto", "markdown", "ark", "text"}
-                else "auto"
+            token_quota_enabled=bool(
+                token_quota.get("enabled", False)
             ),
-            # 留空即自动跟随当前副本 / 世界名，不再回填固定文案。
-            rich_card_title=str(rich.get("title", "") or "").strip(),
+            token_quota_window_seconds=_bounded_int(
+                token_quota.get("window_seconds"), 86400, 60, 30 * 86400
+            ),
+            token_quota_token_limit=_bounded_int(
+                token_quota.get("token_limit"), 400000, 1000, 10_000_000
+            ),
+            world_market_enabled=bool(
+                world_market.get("enabled", False)
+            ),
+            world_market_remote_manifest_url=str(
+                world_market.get("remote_manifest_url", "") or ""
+            ).strip(),
+            world_market_allowed_hosts=(
+                tuple(
+                    _strings(world_market.get("allowed_hosts"))
+                )
+                or (
+                    "raw.githubusercontent.com",
+                    "github.com",
+                    "objects.githubusercontent.com",
+                    "codeload.github.com",
+                )
+            ),
+            world_market_cache_ttl_seconds=_bounded_int(
+                world_market.get("cache_ttl_seconds"), 600, 30, 86_400
+            ),
+            world_market_max_package_bytes=_bounded_int(
+                world_market.get("max_package_bytes"), 2_000_000,
+                10_000, 50_000_000,
+            ),
+            world_market_verify_sha256=bool(
+                world_market.get("verify_sha256", True)
+            ),
+            auto_backup_enabled=bool(auto_backup.get("enabled", False)),
+            auto_backup_interval_hours=_bounded_float(
+                auto_backup.get("interval_hours"), 24.0, 1.0, 24 * 30
+            ),
+            auto_backup_keep_count=_bounded_int(
+                auto_backup.get("keep_count"), 7, 1, 365
+            ),
+            webhook_enabled=bool(webhook.get("enabled", False)),
+            webhook_urls=_strings(webhook.get("urls")),
+            webhook_secret=str(webhook.get("secret") or "").strip(),
+            webhook_events=_strings(webhook.get("events")),
+            webhook_timeout_seconds=_bounded_float(
+                webhook.get("timeout_seconds"), 10.0, 1.0, 120.0
+            ),
         )
 
     def is_admin(self, sender_id: str) -> bool:
@@ -299,5 +370,30 @@ class TavernConfig:
                 "audit_retention_days": self.audit_retention_days,
                 "store_model_payloads": self.store_model_payloads,
                 "debug": self.debug,
+            },
+            "token_quota": {
+                "enabled": self.token_quota_enabled,
+                "window_seconds": self.token_quota_window_seconds,
+                "token_limit": self.token_quota_token_limit,
+            },
+            "world_market": {
+                "enabled": self.world_market_enabled,
+                "remote_manifest_url": self.world_market_remote_manifest_url,
+                "allowed_hosts": list(self.world_market_allowed_hosts),
+                "cache_ttl_seconds": self.world_market_cache_ttl_seconds,
+                "max_package_bytes": self.world_market_max_package_bytes,
+                "verify_sha256": self.world_market_verify_sha256,
+            },
+            "auto_backup": {
+                "enabled": self.auto_backup_enabled,
+                "interval_hours": self.auto_backup_interval_hours,
+                "keep_count": self.auto_backup_keep_count,
+            },
+            "webhook": {
+                "enabled": self.webhook_enabled,
+                "urls": list(self.webhook_urls),
+                "secret": self.webhook_secret,
+                "events": list(self.webhook_events),
+                "timeout_seconds": self.webhook_timeout_seconds,
             },
         }

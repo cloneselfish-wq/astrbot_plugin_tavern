@@ -80,16 +80,16 @@ class FakeContext:
 class V093ContractTests(unittest.TestCase):
     def test_versions_are_single_current_baseline(self) -> None:
         metadata = yaml.safe_load((ROOT / "metadata.yaml").read_text("utf-8"))
-        self.assertEqual(PLUGIN_VERSION, "0.10.0")
-        self.assertEqual(metadata["version"], "v0.10.0")
+        self.assertEqual(PLUGIN_VERSION, "0.12.0")
+        self.assertEqual(metadata["version"], "0.12.0")
         self.assertEqual(metadata["author"], "Ghostberry")
-        self.assertEqual(DATABASE_SCHEMA_VERSION, 9)
+        self.assertEqual(DATABASE_SCHEMA_VERSION, 12)
 
     def test_builtin_world_passes_strict_preflight(self) -> None:
         report = inspect_world_package(DEFAULT_WORLD)
         self.assertTrue(report["compatible"])
-        self.assertEqual(DEFAULT_WORLD["world_content_version"], "1.2.0")
-        self.assertEqual(report["summary"]["schema_version"], 2)
+        self.assertEqual(DEFAULT_WORLD["world_content_version"], "3.0.0")
+        self.assertEqual(report["summary"]["schema_version"], 5)
         self.assertEqual(report["summary"]["stats_mode"], "preset")
         self.assertEqual(report["summary"]["migrations"], 0)
 
@@ -328,7 +328,7 @@ class V093ContractTests(unittest.TestCase):
             item for item in template["fields"] if item["key"] == "profession"
         )
         page = paged_options(template, profession, {})
-        self.assertEqual(len(page["items"]), 4)
+        self.assertEqual(len(page["items"]), 5)
         selected = choose_option(template, profession, {}, "knight")
         self.assertEqual(selected["value"], "骑士")
 
@@ -487,7 +487,7 @@ class V093ContractTests(unittest.TestCase):
             else:
                 world["world_schema_version"] = value
                 world["rules"]["world_schema_version"] = value
-            with self.assertRaisesRegex(ValueError, "仅接受世界包协议 v2、v3 或 v4"):
+            with self.assertRaisesRegex(ValueError, "仅接受世界包协议 v2、v3、v4 或 v5"):
                 validate_world_contract(world)
 
     def test_world_migration_never_hot_replaces(self) -> None:
@@ -526,8 +526,8 @@ class V093ContractTests(unittest.TestCase):
         html = (ROOT / "pages/console/index.html").read_text("utf-8")
         style = (ROOT / "pages/console/style.css").read_text("utf-8")
         logo = (ROOT / "logo.svg").read_text("utf-8")
-        self.assertIn("style.css?v=0.10.0", html)
-        self.assertIn("app.js?v=0.10.0", html)
+        self.assertIn("style.css?v=0.12.0", html)
+        self.assertIn("app.js?v=0.12.0", html)
         self.assertIn("button-secondary", html)
         self.assertIn(".button-secondary", style)
         self.assertIn("viewBox=\"0 0 256 256\"", logo)
@@ -560,7 +560,7 @@ class V093DatabaseTests(unittest.IsolatedAsyncioTestCase):
             schema = connection.execute(
                 "SELECT value FROM tavern_meta WHERE key='schema_version'"
             ).fetchone()[0]
-        self.assertEqual(int(schema), 9)
+        self.assertEqual(int(schema), DATABASE_SCHEMA_VERSION)
 
     async def test_private_card_message_is_consumed_once(self) -> None:
         await self.database.transition_session(
@@ -717,7 +717,7 @@ class V093DatabaseTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_current_backup_only_and_round_trip(self) -> None:
         bundle = await self.database.export_bundle()
-        self.assertEqual(bundle["schema_version"], 9)
+        self.assertEqual(bundle["schema_version"], DATABASE_SCHEMA_VERSION)
         old = copy.deepcopy(bundle)
         old["schema_version"] = 7
         with self.assertRaisesRegex(ValueError, "仅接受 Schema 9"):
@@ -786,7 +786,7 @@ class V093DatabaseTests(unittest.IsolatedAsyncioTestCase):
     async def test_diagnostics_redact_private_origin(self) -> None:
         report = await build_diagnostic_report(self.database, self.session["id"])
         self.assertEqual(report["session"]["unified_origin"], "[REDACTED]")
-        self.assertEqual(report["database_schema_version"], 9)
+        self.assertEqual(report["database_schema_version"], DATABASE_SCHEMA_VERSION)
 
     async def test_public_api_does_not_expose_connection(self) -> None:
         hooks = HookRegistry()

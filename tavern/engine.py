@@ -42,13 +42,26 @@ from .resolution import (
     roll_opposed_check,
     validate_resolution,
 )
+from .entity_resolver import (
+    build_participant_labels,
+    normalize_relationship_ops,
+)
 from .security import RateLimiter, clean_text
 from .world_contract import world_contract
 from .operations import operation_key, transport_event_id
 from .narrative_quality import inspect_narrative
+from .chat_experience import normalize_chat_experience
 
 
 logger = logging.getLogger(__name__)
+
+
+def _owner_tuple(owner_type: Any, owner_ref: Any) -> tuple[str, str] | None:
+    ot = str(owner_type or "").strip()
+    ore = str(owner_ref or "").strip()
+    if not ot or not ore:
+        return None
+    return (ot, ore)
 
 # 0.11.1：单次结构化生成（检定/选项/直述）的全局模型调用上限。
 # 默认 json_repair_attempts=1 时正常路径仅 1-2 次调用；此上限用于兜底
@@ -889,6 +902,8 @@ class TavernEngine:
         flavor_text: str = "",
         inspiration_mode: str = "",
         progress: Callable[[str], Any] | None = None,
+        operator_id: str = "",
+        force: bool = False,
     ) -> EngineReply:
         choice_set = await self.database.active_choice_set(session_id)
         if not choice_set:
@@ -907,7 +922,7 @@ class TavernEngine:
             sender_id,
             "choose",
         )
-        if not control["authorized"]:
+        if not control["authorized"] and not force:
             owner = (
                 participant.get("character_name")
                 or participant.get("display_name")
@@ -917,6 +932,14 @@ class TavernEngine:
                 f"当前选项属于 {owner}，本条内容未记录。",
                 turn=await self.database.get_turn_status(session_id),
             )
+        if force:
+            control = {
+                "authorized": True,
+                "mode": "admin_forced",
+                "controller_user_id": sender_id,
+                "source": "admin",
+                "forced": True,
+            }
         key = str(choice_key or "").strip().upper()
         selected = next(
             (
@@ -969,8 +992,11 @@ class TavernEngine:
                 "inspiration_mode": inspiration_mode,
                 "controller_user_id": sender_id,
                 "control_mode": control["mode"],
+                "control_source": control.get("source", ""),
             },
             progress=progress,
+            operator_id=operator_id,
+            force_actor=force,
         )
 
     async def process_vote_resolution(
@@ -1151,11 +1177,21 @@ class TavernEngine:
                         ).casefold(),
                     },
                 )
-                await self.database.lock_check_result(
+                locked_receipt = await self.database.lock_check_result(
                     dice_op_id,
                     session_id,
                     asdict(vote_check),
                     asdict(vote_dice),
+                )
+                # v0.12.0（缺陷修复）：与单人检定路径保持一致——
+                # 复用凭证中已锁定的检定与骰面。此前表决路径丢弃返回的
+                # 凭证，若模型调用失败后重试，会以「新骰面」生成叙事而
+                # 凭证仍保留「旧骰面」，导致回放与展示不一致。
+                vote_check = self._check_request_from_payload(
+                    locked_receipt["request"]
+                )
+                vote_dice = self._dice_result_from_payload(
+                    locked_receipt["result"]
                 )
             providers = await self._story_providers(event, config)
             system = system_prompt(
@@ -1202,7 +1238,15 @@ class TavernEngine:
                 )
             new_state = apply_state_patch(
                 session.get("world_state"),
-                resolution.state_patch,
+                self._normalize_state_patch_relationships(
+                    resolution.state_patch, roster
+                ),
+            )
+            await self._apply_economy_ops(
+                session_id=session_id,
+                ops=resolution.raw.get("economy_ops"),
+                operation_prefix=f"vote:{session.get('revision')}",
+                actor_id=str((vote or {}).get("actor_id") or ""),
             )
             next_participant = next(
                 (
@@ -1488,7 +1532,17 @@ class TavernEngine:
                 resolution.narrative, max_chars=config.max_output_chars
             )
             new_state = apply_state_patch(
-                session.get("world_state"), resolution.state_patch
+                session.get("world_state"),
+                self._normalize_state_patch_relationships(
+                    resolution.state_patch, roster
+                ),
+            )
+            await self._apply_economy_ops(
+                session_id=session_id,
+                ops=resolution.raw.get("economy_ops"),
+                operation_prefix=f"dm:{session.get('revision')}",
+                actor_id=dm_user_id,
+                source="dm",
             )
             workflow = {
                 "npc_ops": [dict(item) for item in resolution.npc_ops],
@@ -1594,6 +1648,8 @@ class TavernEngine:
         content: str,
         workflow: Mapping[str, Any] | None = None,
         progress: Callable[[str], Any] | None = None,
+        operator_id: str = "",
+        force_actor: bool = False,
     ) -> EngineReply:
         config = self.config_provider()
         text = clean_text(content, max_chars=config.max_input_chars)
@@ -1605,7 +1661,8 @@ class TavernEngine:
             raise TavernEngineError("酒馆当前不在运行状态")
         preflight_turn = await self.database.get_turn_status(session_id)
         if (
-            preflight_turn["current_user_id"]
+            not force_actor
+            and preflight_turn["current_user_id"]
             and preflight_turn["current_user_id"] != sender_id
         ):
             current = (
@@ -1631,6 +1688,8 @@ class TavernEngine:
             session = await self.database.get_session(session_id)
             if session["state"] != "running":
                 raise TavernEngineError("酒馆当前不在运行状态")
+            if int(session.get("input_locked") or 0) and not force_actor:
+                raise TavernEngineError("副本输入已被 DM 锁定，请等待解锁")
 
             remaining = self.rate_limiter.remaining(
                 session_id,
@@ -1658,7 +1717,7 @@ class TavernEngine:
                 raise TavernPlayerDisabledError("该玩家已被停用")
             session = joined_result["session"]
             turn = joined_result["turn"]
-            if turn["current_user_id"] != sender_id:
+            if not force_actor and turn["current_user_id"] != sender_id:
                 current = turn["current_name"] or turn["current_user_id"]
                 joined_note = "你已加入队尾；" if joined_result["joined"] else ""
                 raise TavernTurnOrderError(
@@ -1667,6 +1726,21 @@ class TavernEngine:
                     joined=joined_result["joined"],
                 )
             acting_round = int(turn["round_no"])
+            if operator_id and operator_id != sender_id:
+                try:
+                    await self.database.write_audit(
+                        session_id,
+                        operator_id,
+                        "turn.forced_choose",
+                        sender_id,
+                        {
+                            "actor_user_id": sender_id,
+                            "force": True,
+                            "operator_id": operator_id,
+                        },
+                    )
+                except Exception:
+                    logger.exception("AI 酒馆强制代选审计写入失败")
 
             for prefix in config.ooc_prefixes:
                 if text.lower().startswith(prefix.lower()):
@@ -1727,6 +1801,14 @@ class TavernEngine:
                 ),
                 None,
             )
+            if (
+                acting_participant
+                and int(acting_participant.get("action_locked") or 0)
+                and not force_actor
+            ):
+                raise TavernEngineError(
+                    "该角色的行动已被 DM 锁定，请等待解锁"
+                )
             player = dict(player)
             if acting_participant:
                 player.update(
@@ -2304,13 +2386,22 @@ class TavernEngine:
                 if resolution.mode != "resolve":
                     raise TavernEngineError("模型未完成检定后的最终裁定")
 
+            normalized_patch = self._normalize_state_patch_relationships(
+                resolution.state_patch, roster
+            )
             new_state = (
                 dict(session.get("world_state") or {})
                 if resolution.group_decision
                 else apply_state_patch(
                     session.get("world_state"),
-                    resolution.state_patch,
+                    normalized_patch,
                 )
+            )
+            await self._apply_economy_ops(
+                session_id=session_id,
+                ops=resolution.raw.get("economy_ops"),
+                operation_prefix=f"story:{session.get('revision')}",
+                actor_id=sender_id,
             )
             if workflow:
                 if workflow.get("requires_check") and first_mode != "check":
@@ -2454,6 +2545,10 @@ class TavernEngine:
                 else None
             )
             try:
+                experience = normalize_chat_experience(world)
+                checkpoint_interval = int(
+                    experience["continuity"].get("checkpoint_every_turns") or 0
+                )
                 updated_session = await self.database.commit_turn(
                     session_id=session_id,
                     expected_revision=session["revision"],
@@ -2469,7 +2564,11 @@ class TavernEngine:
                     check_payload=check_payload,
                     model_payload={**dict(resolution.raw), "_quality": quality},
                     director_note=resolution.director_note,
-                    auto_snapshot_interval=config.auto_snapshot_interval,
+                    auto_snapshot_interval=(
+                        checkpoint_interval
+                        if experience.get("enabled") and checkpoint_interval > 0
+                        else config.auto_snapshot_interval
+                    ),
                     store_model_payload=config.store_model_payloads,
                     workflow=commit_workflow,
                     # 0.11.1：回执完成并入提交事务，避免已提交回合
@@ -2579,6 +2678,68 @@ class TavernEngine:
                 turn_text=turn_output,
             )
 
+    async def _apply_economy_ops(
+        self,
+        *,
+        session_id: str,
+        ops: Any,
+        operation_prefix: str,
+        actor_id: str,
+        source: str = "story",
+    ) -> list[dict[str, Any]]:
+        """A16：应用模型/世界包提议的可选经济操作（未启用则忽略，不阻断回合）。"""
+        if not isinstance(ops, list) or not ops:
+            return []
+        try:
+            state = await self.database.economy_state(session_id)
+        except Exception:
+            return []
+        if not state.get("enabled"):
+            return []
+        results: list[dict[str, Any]] = []
+        for index, op in enumerate(ops):
+            if not isinstance(op, Mapping):
+                continue
+            try:
+                result = await self.database.economy_apply(
+                    session_id=session_id,
+                    operation_id=f"{operation_prefix}:econ:{index}",
+                    kind=str(op.get("kind") or "adjust"),
+                    currency_id=str(op.get("currency_id") or ""),
+                    amount=op.get("amount"),
+                    from_owner=_owner_tuple(
+                        op.get("from_owner_type"), op.get("from_owner_ref")
+                    ),
+                    to_owner=_owner_tuple(
+                        op.get("to_owner_type"), op.get("to_owner_ref")
+                    ),
+                    reason=str(op.get("reason") or ""),
+                    source=source,
+                    actor_id=actor_id,
+                    target_ref=str(op.get("target_ref") or ""),
+                )
+            except Exception as exc:  # noqa: BLE001 - 经济失败不阻断叙事
+                logger.warning("AI 酒馆经济操作失败：%s", exc)
+                result = {"ok": False, "message": str(exc)}
+            results.append(result)
+        return results
+
+    def _normalize_state_patch_relationships(
+        self,
+        state_patch: Mapping[str, Any],
+        roster: Any,
+    ) -> dict[str, Any]:
+        """A16：把 relationship_ops 的 source/target 规范化为稳定引用，
+        避免模型输出裸 UUID 后关系键无法解析（配合统一实体解析器）。"""
+        if not isinstance(state_patch, Mapping):
+            return dict(state_patch or {})
+        ops = state_patch.get("relationship_ops")
+        if not isinstance(ops, list) or not ops:
+            return dict(state_patch)
+        labels = build_participant_labels(roster)
+        normalized = normalize_relationship_ops(ops, labels)
+        return {**dict(state_patch), "relationship_ops": normalized}
+
     async def _ensure_next_choices(
         self,
         *,
@@ -2597,15 +2758,23 @@ class TavernEngine:
             resolution.raw.get("_next_choices_error") or ""
         )
         if resolution.next_choices:
-            choices = self._validate_choices_for_actor(
-                resolution.next_choices,
-                expected_actor=participant,
-                roster=roster,
-            )
-            return replace(
-                resolution,
-                next_choices=tuple(choices),
-            )
+            try:
+                choices = self._validate_choices_for_actor(
+                    resolution.next_choices,
+                    expected_actor=participant,
+                    roster=roster,
+                )
+                return replace(
+                    resolution,
+                    next_choices=tuple(choices),
+                )
+            except (TypeError, ValueError) as exc:
+                # A16：actor_id 与下一位行动角色不一致时不再硬失败，
+                # 进入专用修复/兜底路径（避免“正在生成”后误报身份错误）。
+                validation_error = str(exc)
+                logger.warning(
+                    "AI 酒馆选项 actor_id 校验失败，进入修复：%s", exc
+                )
 
         if raw_choices is not None:
             try:

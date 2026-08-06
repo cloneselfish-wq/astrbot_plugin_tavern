@@ -1054,8 +1054,41 @@ class WorkflowRepositoryMixin:
                 if not vote_row:
                     raise DatabaseNotFoundError("当前没有进行中的集体投票")
                 vote = self._vote(vote_row)
-                if user_id not in vote["eligible_user_ids"]:
+                # A16：代理投票——被托管人可代替角色投票，票记在角色名下。
+                operator_id = user_id
+                effective_user_id = user_id
+                now_check = utc_now()
+                grant = connection.execute(
+                    """
+                    SELECT d.owner_user_id, d.source, d.permissions_json
+                    FROM delegation_grants d
+                    WHERE d.session_id = ? AND d.delegate_user_id = ?
+                      AND d.status = 'active'
+                      AND d.expires_at IN ('', ?)
+                      AND 'vote' IN (
+                          SELECT value FROM json_each(d.permissions_json)
+                      )
+                    ORDER BY d.created_at DESC LIMIT 1
+                    """,
+                    (session_id, user_id, now_check),
+                ).fetchone()
+                if grant and str(grant["owner_user_id"]) in vote["eligible_user_ids"]:
+                    effective_user_id = str(grant["owner_user_id"])
+                if effective_user_id not in vote["eligible_user_ids"]:
                     raise PermissionError("你不在本次投票的有效成员名单中")
+                if effective_user_id != user_id:
+                    self._insert_audit(
+                        connection,
+                        session_id,
+                        user_id,
+                        "delegation.vote",
+                        str(vote_row["id"]),
+                        {
+                            "operator_user_id": operator_id,
+                            "ballot_user_id": effective_user_id,
+                            "source": str(grant["source"]),
+                        },
+                    )
                 valid_keys = {
                     str(item.get("key")) for item in vote["options"]
                 }
@@ -1077,7 +1110,7 @@ class WorkflowRepositoryMixin:
                     (
                         new_id("ballot"),
                         vote["id"],
-                        user_id,
+                        effective_user_id,
                         key,
                         now,
                         now,
@@ -2744,3 +2777,45 @@ class WorkflowRepositoryMixin:
             except Exception:
                 connection.execute("ROLLBACK")
                 raise
+
+    # ── A17：后台调整回合顺序前作废旧活跃选项 ─────────────────────
+    async def supersede_active_choices(
+        self,
+        session_id: str,
+        actor_id: str,
+    ) -> int:
+        """把当前活跃的 A–D 选项集标记为 superseded（防 actor_id 错位）。"""
+        return await self._run(
+            self._supersede_active_choices, session_id, actor_id
+        )
+
+    def _supersede_active_choices(
+        self,
+        session_id: str,
+        actor_id: str,
+    ) -> int:
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                now = utc_now()
+                cursor = connection.execute(
+                    """
+                    UPDATE choice_sets
+                    SET status = 'superseded', updated_at = ?
+                    WHERE session_id = ? AND status = 'active'
+                    """,
+                    (now, session_id),
+                )
+                self._insert_audit(
+                    connection,
+                    session_id,
+                    actor_id,
+                    "turn.choices_superseded",
+                    "",
+                    {"count": cursor.rowcount},
+                )
+                connection.execute("COMMIT")
+            except Exception:
+                connection.execute("ROLLBACK")
+                raise
+        return cursor.rowcount

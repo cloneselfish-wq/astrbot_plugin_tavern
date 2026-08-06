@@ -4,6 +4,7 @@ import json
 import tempfile
 import unittest
 import sqlite3
+from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -61,6 +62,29 @@ class VNextWorkflowTests(unittest.IsolatedAsyncioTestCase):
             SESSION_PREPARING,
             "admin",
         )
+        # These workflow regressions exercise the enabled countdown path.
+        # The built-in B1 world intentionally defaults countdowns to off.
+        await self.database.set_timer_policy(
+            self.session["id"], "all", True, "admin"
+        )
+        config = await self.database.get_instance_config(self.session["id"])
+        await self.database.save_instance_time_rules(
+            self.session["id"],
+            {
+                **config["time_rules"],
+                "card_completion_timeout_seconds": 600,
+                "preparation_timeout_seconds": 300,
+                "ready_timeout_seconds": 300,
+                "turn_timeout_seconds": 180,
+                "turn_reminder_seconds": 30,
+                "standby_timeout_seconds": 600,
+                "vote_round_one_seconds": 90,
+                "vote_round_two_seconds": 60,
+                "vote_reminder_seconds": 30,
+                "announce_timeouts": True,
+            },
+            "admin",
+        )
 
     async def asyncTearDown(self) -> None:
         self.temp_dir.cleanup()
@@ -100,11 +124,25 @@ class VNextWorkflowTests(unittest.IsolatedAsyncioTestCase):
             "weakness": "不擅长强行对抗，也缺乏贵族人脉。",
             "knowledge_boundary": "只知道边境常识，不知道隐秘魔法真相。",
         }
+        used_select_values: set[str] = set()
         for field in draft["template"]["fields"]:
-            value = stat_values.get(
-                field["key"],
-                fixed_values.get(field["key"], "无"),
-            )
+            options = field.get("options") or []
+            if field.get("type") == "preset_select" and options:
+                values = [
+                    str(item.get("value") or item.get("label") or item)
+                    if isinstance(item, dict) else str(item)
+                    for item in options
+                ]
+                value = next(
+                    (item for item in values if item not in used_select_values),
+                    values[0],
+                )
+                used_select_values.add(value)
+            else:
+                value = stat_values.get(
+                    field["key"],
+                    fixed_values.get(field["key"], "无"),
+                )
             await self.database.fill_card_draft(origin, value)
         confirmed = await self.database.confirm_card_draft(origin)
         if not confirmed["auto_approved"]:
@@ -205,9 +243,10 @@ class VNextWorkflowTests(unittest.IsolatedAsyncioTestCase):
             {
                 "text": "借助绳索翻越断桥",
                 "risk": "dangerous",
+                "danger_id": "dangerous",
                 "requires_check": True,
                 "check_type": "standard",
-                "check_stat": "敏捷",
+                "check_stat": "灵巧",
                 "difficulty": 15,
                 "known_consequences": "失败可能跌落并受伤",
                 "advantage_sources": ["装备：绳索"],
@@ -254,9 +293,9 @@ class VNextWorkflowTests(unittest.IsolatedAsyncioTestCase):
             },
             ensure_ascii=False,
         )
-        context = FakeNarratorContext(
-            [premature_resolution, checked_resolution]
-        )
+        # 检定参数已由选项提前锁定，B1 会直接投骰并只请求一次
+        # 检定后裁定，不再先让模型重复申请检定。
+        context = FakeNarratorContext([checked_resolution])
         engine = TavernEngine(
             context=context,
             database=self.database,
@@ -279,24 +318,20 @@ class VNextWorkflowTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertIsNotNone(reply.dice)
-        self.assertEqual(reply.dice.difficulty, 15)
+        self.assertEqual(reply.dice.difficulty, 13)
         self.assertEqual(reply.session["turn_no"], 1)
-        self.assertNotEqual(
-            reply.session["world_state"].get("location"),
-            "断桥另一侧",
+        self.assertEqual(
+            reply.session["world_state"].get("scene_summary"),
+            "断桥尝试已经得到裁定。",
         )
-        self.assertEqual(len(context.calls), 2)
-        self.assertIn(
-            "本条行动来自插件已锁定的必检选项",
-            context.calls[0]["prompt"],
-        )
-        self.assertIn(
-            '"requires_check": true',
-            context.calls[0]["prompt"],
-        )
+        self.assertEqual(len(context.calls), 1)
         self.assertIn(
             "<authoritative_check>",
-            context.calls[1]["prompt"],
+            context.calls[0]["prompt"],
+        )
+        self.assertIn(
+            '"difficulty":13',
+            context.calls[0]["prompt"],
         )
         self.assertNotIn("未经检定便越过", reply.text)
 
@@ -339,10 +374,10 @@ class VNextWorkflowTests(unittest.IsolatedAsyncioTestCase):
         modifier = await self.database.authoritative_modifier(
             self.session["id"],
             "user-1",
-            "体魄",
+            "力量",
         )
         self.assertTrue(modifier["matched"])
-        self.assertEqual(modifier["modifier"], 0)
+        self.assertEqual(modifier["modifier"], 5)
         unknown = await self.database.authoritative_modifier(
             self.session["id"],
             "user-1",
@@ -383,12 +418,14 @@ class VNextWorkflowTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertTrue(second["resolved"])
         self.assertEqual(second["vote"]["winner_key"], "A")
-        choice = await self.database.active_choice_set(self.session["id"])
-        self.assertEqual(
-            choice["participant"]["group_user_id"],
-            suspended,
+        # 表决通过后由上层生成“集体决定”的续写与新选项；数据库层
+        # 只保留行动指针，不能让旧个人选项继续可用。
+        self.assertIsNone(
+            await self.database.active_choice_set(self.session["id"])
         )
         session = await self.database.get_session(self.session["id"])
+        turn = await self.database.get_turn_status(self.session["id"])
+        self.assertEqual(turn["current_user_id"], suspended)
         self.assertIn(
             "队伍多数决定：前往北方废墟",
             session["world_state"]["facts"],
@@ -469,6 +506,7 @@ class VNextWorkflowTests(unittest.IsolatedAsyncioTestCase):
             {
                 **config["time_rules"],
                 "turn_timeout_seconds": 120,
+                "turn_reminder_seconds": 30,
                 "all_idle_pause_seconds": None,
             },
             "admin",
@@ -586,6 +624,10 @@ class VNextWorkflowTests(unittest.IsolatedAsyncioTestCase):
             reserved["binding_code"],
             "private-card-timer-user",
             private_origin,
+        )
+        await self.database.set_card_completion_reminder(
+            private_origin,
+            True,
         )
         timer = next(
             item
@@ -990,7 +1032,7 @@ class VNextWorkflowTests(unittest.IsolatedAsyncioTestCase):
         upgraded = TavernDatabase(self.data_dir)
         self.assertIsNotNone(upgraded.migration_backup_path)
         self.assertTrue(upgraded.migration_backup_path.exists())
-        with sqlite3.connect(upgraded.migration_backup_path) as connection:
+        with closing(sqlite3.connect(upgraded.migration_backup_path)) as connection:
             version = connection.execute(
                 """
                 SELECT value FROM tavern_meta
@@ -1019,7 +1061,8 @@ class VNextWorkflowTests(unittest.IsolatedAsyncioTestCase):
                 ).fetchall()
             }
         self.assertEqual(version, DATABASE_SCHEMA_VERSION)
-        self.assertEqual(version, 6)
+        # A15：schema 已演进到 10，保留“至少 6”的历史语义（计时/配额表自 6 起）。
+        self.assertGreaterEqual(version, 6)
         self.assertTrue(
             {
                 "timer_policies",
@@ -1294,10 +1337,11 @@ class VNextWorkflowTests(unittest.IsolatedAsyncioTestCase):
         checked_choices[0].update(
             {
                 "risk": "dangerous",
+                "danger_id": "dangerous",
                 "requires_check": True,
                 "check_type": "standard",
-                "check_stat": "敏捷",
-                "difficulty": 14,
+                "check_stat": "灵巧",
+                "difficulty": 13,
                 "known_consequences": "失败会滑倒并失去位置优势",
             }
         )
@@ -1312,11 +1356,12 @@ class VNextWorkflowTests(unittest.IsolatedAsyncioTestCase):
                 "mode": "check",
                 "narrative": "",
                 "check": {
-                    "stat": "敏捷",
+                    "stat": "灵巧",
                     "reason": "越过湿滑断桥",
-                    "difficulty": 14,
+                    "difficulty": 13,
                     "modifier": 0,
-                    "risk": "dangerous",
+                "risk": "dangerous",
+                "danger_id": "dangerous",
                 },
             },
             ensure_ascii=False,
@@ -1335,7 +1380,7 @@ class VNextWorkflowTests(unittest.IsolatedAsyncioTestCase):
             },
             ensure_ascii=False,
         )
-        context = FakeNarratorContext([planning, checked, "坏选项"])
+        context = FakeNarratorContext([checked, "坏选项"])
         engine = TavernEngine(
             context=context,
             database=self.database,
@@ -1343,7 +1388,7 @@ class VNextWorkflowTests(unittest.IsolatedAsyncioTestCase):
                 user_cooldown_seconds=0,
                 json_repair_attempts=0,
                 request_timeout_seconds=5,
-                enforce_mobile_output=True,
+                enforce_mobile_output=False,
             ),
             broker=EventBroker(),
         )
@@ -1360,7 +1405,7 @@ class VNextWorkflowTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertIsNotNone(reply.dice)
         self.assertEqual(mocked_roll.call_count, 1)
-        self.assertEqual(len(context.calls), 3)
+        self.assertEqual(len(context.calls), 2)
         active = await self.database.active_choice_set(self.session["id"])
         self.assertTrue(
             all(item["actor_id"] == second["id"] for item in active["choices"])
@@ -1418,7 +1463,7 @@ class VNextWorkflowTests(unittest.IsolatedAsyncioTestCase):
             sender_name=first["character_name"],
             choice_key="A",
         )
-        self.assertEqual(len(context.calls), 1)
+        self.assertEqual(len(context.calls), 0)
         self.assertIsNotNone(
             await self.database.active_vote(self.session["id"])
         )
@@ -1548,6 +1593,12 @@ class VNextWorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(vote["deadline_at"], vote_timer["deadline_at"])
 
     async def test_timer_policy_freezes_and_resumes_category(self) -> None:
+        await self.database.set_timer_policy(
+            self.session["id"],
+            "all",
+            True,
+            "admin",
+        )
         reserved = await self.database.reserve_participant(
             self.session["id"],
             "timer-user",

@@ -1,6 +1,8 @@
 {
-  "template_bundle_version": "3.0.0",
-  "compatible_plugin_version": "0.11.4",
+  "template_bundle_version": "4.0.0",
+  "compatible_plugin_version": "0.12.0",
+  "world_schema_version": 5,
+  "character_card_template_version": 6,
   "world_schema_versions": [
     2,
     3,
@@ -24,7 +26,8 @@
     "objects": "1.0",
     "resolution_methods": "1.0",
     "interaction_rules": "1.0",
-    "action_intents": "1.0"
+    "action_intents": "1.0",
+    "chat_experience": "1.0"
   },
   "files": {
     "instructions": "templates/README.md",
@@ -35,7 +38,8 @@
     "v5_full_example": "templates/world-package-v5-full-example.json",
     "npc_import": "templates/npc-import.template.json",
     "v4_to_v5_migration": "templates/migration-v4-to-v5.example.json",
-    "id_aliases": "templates/id-aliases.example.json"
+    "id_aliases": "templates/id-aliases.example.json",
+    "chat_experience": "templates/world-package-chat-experience.template.json"
   },
   "release_policy": {
     "validated_in_test_suite": true,

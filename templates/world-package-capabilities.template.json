@@ -1,12 +1,12 @@
 {
   "template_metadata": {
-    "template_bundle_version": "2.0.0",
-    "compatible_plugin_version": "0.11.0",
-    "world_schema_version": 4,
-    "character_card_template_version": 5,
-    "purpose": "复制后修改的通用手动属性世界包；本文件自身可通过 v0.11.0 世界包体检",
+    "template_bundle_version": "4.0.0",
+    "compatible_plugin_version": "0.12.0",
+    "world_schema_version": 5,
+    "character_card_template_version": 6,
+    "purpose": "复制后修改的 v0.12.0 能力接口世界包；本文件自身可通过严格世界包体检",
     "edit_note": "请替换世界标识、设定、预设、开场、NPC引用和初始状态，不要删除协议字段",
-    "minimum_plugin_version": "0.11.0"
+    "minimum_plugin_version": "0.12.0"
   },
   "slug": "v5-capabilities-template",
   "name": "v5 能力接口模板",
@@ -761,7 +761,7 @@
   },
   "world_schema_version": 5,
   "world_content_version": "1.0.0",
-  "minimum_plugin_version": "0.11.0",
+  "minimum_plugin_version": "0.12.0",
   "protocol": {
     "core_version": 5,
     "features": {

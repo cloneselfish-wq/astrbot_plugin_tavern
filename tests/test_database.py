@@ -144,7 +144,7 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         )
 
     @unittest.skip(
-        "v0.9+ 是刻意干净基线（database.py 注释：永不读写旧版 "
+        "B1 是刻意干净基线（database.py 注释：永不读写旧版 "
         "tavern.sqlite3/catalog.sqlite3；ARCHITECTURE.md：Schema 1—7 不受支持），"
         "该用例测试的是已被移除的 v1 迁移路径，属于过时用例。"
     )

@@ -4,9 +4,9 @@ import json
 from pathlib import Path
 
 PLUGIN_NAME = "astrbot_plugin_tavern"
-PLUGIN_VERSION = "0.11.4"
-DATABASE_SCHEMA_VERSION = 10
-TEMPLATE_BUNDLE_VERSION = "3.0.0"
+PLUGIN_VERSION = "0.12.0"
+DATABASE_SCHEMA_VERSION = 12
+TEMPLATE_BUNDLE_VERSION = "4.0.0"
 CHARACTER_CARD_TEMPLATE_VERSION = 6
 NPC_IMPORT_TEMPLATE_VERSION = 2
 
@@ -75,6 +75,11 @@ MANAGEMENT_ACTIONS = {
     "申请返场": "return_request",
     "授权代控": "delegate",
     "撤销代控": "delegate_revoke",
+    "托管": "delegate",
+    "取消托管": "delegate_revoke",
+    "托管状态": "delegate_status",
+    "强制托管": "delegate_force",
+    "恢复控制": "delegate_restore",
     "退出": "leave",
     "顺序": "order",
     "轮次": "order",
@@ -133,6 +138,7 @@ MUTATING_ACTIONS = {
     "return_request",
     "delegate",
     "delegate_revoke",
+    "delegate_status",
     "leave",
     "skip",
     "next",
@@ -173,6 +179,9 @@ PLAYER_ACTIONS = {
     "return_request",
     "delegate",
     "delegate_revoke",
+    "delegate_status",
+    "delegate_force",
+    "delegate_restore",
     "leave",
     "save_list",
     "usage",

@@ -13,6 +13,7 @@ from .lifecycle import (
     validate_card_template_config,
 )
 from .world_contract import WORLD_SCHEMA_VERSION, validate_world_contract
+from .elemental import validate as validate_elemental
 from .entity_registry import EntityRegistry
 from .capability_service import CapabilityService
 from .stat_generation import (
@@ -20,6 +21,7 @@ from .stat_generation import (
     stat_generation_config,
     validate_stat_generation_config,
 )
+from .chat_experience import normalize_chat_experience, validate_chat_experience
 
 
 def _issue(
@@ -315,6 +317,76 @@ def inspect_world_package(world: Mapping[str, Any]) -> dict[str, Any]:
             )
         )
 
+    try:
+        elemental_issues = validate_elemental(world)
+        if elemental_issues:
+            issues.extend(elemental_issues)
+    except Exception:
+        pass
+
+    experience = normalize_chat_experience(world)
+    if experience.get("enabled"):
+        try:
+            validate_chat_experience(world)
+            tests.append(
+                {
+                    "name": "多人群聊体验策略",
+                    "status": "passed",
+                    "detail": {
+                        "character_creation": experience["character_creation"],
+                        "proactive_fallback": experience["delivery"]["proactive_fallback"],
+                    },
+                }
+            )
+        except Exception as exc:
+            issues.append(
+                _issue(
+                    "error",
+                    "rules.chat_experience",
+                    "invalid_chat_experience",
+                    str(exc),
+                )
+            )
+            tests.append({"name": "多人群聊体验策略", "status": "failed"})
+
+    # A16：可选经济块校验（仅警告，不阻断导入）
+    try:
+        economy = (world.get("rules") or {}).get("economy") if isinstance(world.get("rules"), dict) else None
+        if isinstance(economy, dict) and economy:
+            currency_ids = [
+                str(c.get("currency_id") or c.get("id") or "")
+                for c in economy.get("currencies") or []
+                if isinstance(c, dict)
+            ]
+            for currency in economy.get("currencies") or []:
+                if not isinstance(currency, dict):
+                    issues.append(_issue("warning", "rules.economy", "economy.currency_not_object", "货币定义必须是对象"))
+                    continue
+                cid = str(currency.get("currency_id") or currency.get("id") or "").strip()
+                if not cid:
+                    issues.append(_issue("warning", "rules.economy", "economy.currency_missing_id", "货币缺少 currency_id"))
+                if not str(currency.get("name") or "").strip():
+                    issues.append(_issue("warning", "rules.economy", "economy.currency_missing_name", f"货币 {cid or '?'} 缺少显示名称 name"))
+                try:
+                    precision = int(currency.get("precision") or 0)
+                    if not 0 <= precision <= 9:
+                        issues.append(_issue("warning", "rules.economy", "economy.precision_range", f"货币 {cid} 的 precision 应在 0..9"))
+                except (TypeError, ValueError):
+                    issues.append(_issue("warning", "rules.economy", "economy.precision_invalid", f"货币 {cid} 的 precision 必须是整数"))
+            if len(currency_ids) != len(set(currency_ids)):
+                issues.append(_issue("warning", "rules.economy", "economy.duplicate_currency", "货币 currency_id 重复"))
+            for rule in economy.get("exchange_rules") or []:
+                if not isinstance(rule, dict):
+                    continue
+                frm = str(rule.get("from") or rule.get("from_currency") or "")
+                to = str(rule.get("to") or rule.get("to_currency") or "")
+                if frm and frm not in currency_ids:
+                    issues.append(_issue("warning", "rules.economy", "economy.unknown_from_currency", f"兑换规则引用未声明货币：{frm}"))
+                if to and to not in currency_ids:
+                    issues.append(_issue("warning", "rules.economy", "economy.unknown_to_currency", f"兑换规则引用未声明货币：{to}"))
+    except Exception:
+        pass
+
     all_issues = issues
     errors = sum(item["level"] == "error" for item in all_issues)
     warnings = sum(item["level"] == "warning" for item in all_issues)
@@ -335,6 +407,7 @@ def inspect_world_package(world: Mapping[str, Any]) -> dict[str, Any]:
             "danger_levels": len(contract.get("danger_levels", [])) if contract else 0,
             "npc_count": len(world.get("characters", [])) if isinstance(world.get("characters"), list) else 0,
             "capabilities": capabilities,
+            "chat_experience": experience,
             "feature_versions": feature_versions,
             "entity_count": entity_count,
             "errors": errors,

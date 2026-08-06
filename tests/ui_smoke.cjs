@@ -256,8 +256,8 @@ function installMockBridge() {
         },
         database_size: 188416,
         database_ok: true,
-        schema_version: 2,
-        plugin_version: "0.3.0",
+        schema_version: 12,
+        plugin_version: "0.12.0",
         security: {
           admin_count: 1,
           allowed_group_count: 1,

@@ -8,11 +8,13 @@ import re
 import shutil
 import sqlite3
 import stat
+import time
 import uuid
 import zipfile
 from collections import OrderedDict
 from contextlib import closing
 from pathlib import Path, PurePosixPath
+from collections.abc import Mapping
 from typing import Any
 
 from astrbot.api.web import (
@@ -46,18 +48,45 @@ from .events import EventBroker
 from .lifecycle import normalize_time_rules
 from .diagnostics import build_diagnostic_report
 from .emergency import EmergencyService
+from .errors import PolicyRejection, report_failure
+from .dashboard import (
+    dashboard_sessions as build_dashboard_sessions,
+    session_dashboard as build_session_dashboard,
+    session_timeline as build_session_timeline,
+    session_timers as build_session_timers,
+)
 from .operations import recovery_summary
 from .world_migration import compare_world_contracts
 from .world_preflight import inspect_world_package
+from .world_market import (
+    clear_remote_cache,
+    fetch_entry,
+    fetch_remote_manifest,
+    fetch_remote_package,
+    scan_entries,
+    search_entries,
+)
 from .world_import import world_edit_payload, world_import_payload
+from .elemental import (
+    parse as parse_elemental,
+    resolve as resolve_elemental,
+    table as elemental_table,
+)
+from .world_contract import RESOLUTION_MODES, WORLD_SCHEMA_VERSION
+from .operation_engine import OPERATION_TYPES, PERSISTENCE_SCOPES
+from .api.hooks import SUPPORTED_EVENTS as HOOK_EVENTS
+from .api.registry import ExtensionRegistry
 from .rule_runtime import RuleRuntime
 from .entity_registry import EntityRegistry
+from .backup_service import build_backup_archive
 from .storage import (
     file_sha256,
     next_timestamped_path,
     replace_with_retry,
     unlink_with_retry,
 )
+from .platform_delivery import capability_matrix, send_text as deliver_text
+from .chat_experience import normalize_chat_experience
 
 
 _BACKUP_HASH_PATTERN = re.compile(r"^[0-9a-f]{64}$")
@@ -206,6 +235,132 @@ def _collision_path(path: Path) -> Path:
     raise RuntimeError("同名独立存档过多")
 
 
+def _deep_diff(left: Any, right: Any, path: str = "") -> list[dict[str, Any]]:
+    """递归字段级差异：返回 [{path, kind: added|removed|changed, old, new}]。"""
+    changes: list[dict[str, Any]] = []
+    if type(left) is not type(right):
+        changes.append({"path": path, "kind": "type_changed", "old": left, "new": right})
+        return changes
+    if isinstance(left, dict) and isinstance(right, dict):
+        for key in sorted(set(left) | set(right)):
+            sub = f"{path}.{key}" if path else key
+            if key not in left:
+                changes.append({"path": sub, "kind": "added", "old": None, "new": right[key]})
+            elif key not in right:
+                changes.append({"path": sub, "kind": "removed", "old": left[key], "new": None})
+            else:
+                changes.extend(_deep_diff(left[key], right[key], sub))
+    elif isinstance(left, list) and isinstance(right, list):
+        if left != right:
+            changes.append({"path": path or "$", "kind": "changed", "old": left, "new": right})
+    elif left != right:
+        changes.append({"path": path or "$", "kind": "changed", "old": left, "new": right})
+    return changes
+
+
+def _with_token_context(
+    usage: dict[str, Any],
+    instance: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """A16：在 Token 用量摘要上附加上下文预算与最近裁剪时间（只读展示）。"""
+    result = dict(usage) if isinstance(usage, dict) else {}
+    result["context_budget"] = {}
+    if instance and isinstance(instance.get("world_snapshot"), Mapping):
+        rules = instance["world_snapshot"].get("rules") or {}
+        if isinstance(rules, Mapping):
+            result["context_budget"] = dict(rules.get("context_budget") or {})
+    result["last_trim_at"] = ""
+    return result
+
+
+def _safe(fn: Any, default: Any) -> Any:
+    """A23: 模块级逐字段容错助手（此前误定义在类内且缺 self，导致
+    extensions/hook_events/meta_capabilities 抛 NameError）。"""
+    try:
+        return fn()
+    except Exception:
+        return default
+
+
+def _extension_catalog(registry: Any) -> tuple[dict[str, list[str]], list[str]]:
+    """Return a JSON-safe extension catalog while isolating malformed items."""
+    if registry is None:
+        return {}, []
+    errors: list[str] = []
+    try:
+        raw_catalog = registry.list()
+    except Exception as exc:
+        return {}, [f"扩展注册表读取失败：{type(exc).__name__}: {str(exc)[:160]}"]
+    if not isinstance(raw_catalog, Mapping):
+        return {}, ["扩展注册表返回了无效的数据结构"]
+
+    catalog: dict[str, list[str]] = {}
+    for raw_kind, raw_names in raw_catalog.items():
+        try:
+            kind = str(raw_kind).strip()
+            if not kind:
+                raise ValueError("扩展类型为空")
+            if isinstance(raw_names, str):
+                candidates = (raw_names,)
+            elif isinstance(raw_names, Mapping):
+                candidates = raw_names.keys()
+            else:
+                candidates = raw_names or ()
+            names: list[str] = []
+            iterator = iter(candidates)
+            while True:
+                try:
+                    candidate = next(iterator)
+                except StopIteration:
+                    break
+                except Exception as exc:
+                    errors.append(
+                        f"{kind} 扩展列表读取中断：{type(exc).__name__}: {str(exc)[:120]}"
+                    )
+                    break
+                try:
+                    name = str(candidate).strip()
+                    if name:
+                        names.append(name)
+                except Exception as exc:
+                    errors.append(
+                        f"{kind} 中有一个扩展项无法序列化：{type(exc).__name__}"
+                    )
+            catalog[kind] = sorted(set(names))
+        except Exception as exc:
+            errors.append(
+                f"一个扩展类型无法读取：{type(exc).__name__}: {str(exc)[:120]}"
+            )
+    return dict(sorted(catalog.items())), errors
+
+
+def _hook_catalog(hooks: Any) -> tuple[dict[str, int], list[str]]:
+    """Return JSON-safe subscription counts without trusting extension data."""
+    if hooks is None:
+        return {}, []
+    try:
+        raw_catalog = hooks.list_subscriptions()
+    except Exception as exc:
+        return {}, [f"事件订阅表读取失败：{type(exc).__name__}: {str(exc)[:160]}"]
+    if not isinstance(raw_catalog, Mapping):
+        return {}, ["事件订阅表返回了无效的数据结构"]
+
+    catalog: dict[str, int] = {}
+    errors: list[str] = []
+    for raw_event, raw_count in raw_catalog.items():
+        try:
+            event = str(raw_event).strip()
+            count = max(0, int(raw_count))
+            if not event:
+                raise ValueError("事件名为空")
+            catalog[event] = count
+        except Exception as exc:
+            errors.append(
+                f"一个事件订阅项无法读取：{type(exc).__name__}: {str(exc)[:120]}"
+            )
+    return dict(sorted(catalog.items())), errors
+
+
 class TavernWebConsole:
     def __init__(
         self,
@@ -218,22 +373,37 @@ class TavernWebConsole:
         logger: Any,
         allow_group: Any,
         config_lock: Any,
+        extensions: Any = None,
+        hooks: Any = None,
+        engine: Any = None,
     ) -> None:
         self.context = context
         self.plugin_config = plugin_config
         self.database = database
+        self._tavern_engine = engine
         self.broker = broker
         self.data_dir = Path(data_dir)
         self.logger = logger
         self.allow_group = allow_group
         self.config_lock = config_lock
+        # Do not name this attribute ``extensions``: that is also the public
+        # async route handler.  The old collision registered the registry
+        # object as an HTTP handler and caused GET /extensions to return 500.
+        self._extension_registry = extensions
+        self.hooks = hooks
         # 0.11.1：按 (slug, revision) 缓存 RuleRuntime，避免每次
         # world_simulate 全量重建 EntityRegistry/CapabilityService/EventPipeline。
         # RuleRuntime 在 __init__ 后只读（resolve 不修改内部状态），可安全复用。
         self._rule_runtime_cache: "OrderedDict[tuple[str, int], RuleRuntime]" = (
             OrderedDict()
         )
+        # v0.12.0：缓存时间戳表（TTL 失效用），与 _rule_runtime_cache 同键。
+        self._rule_runtime_timestamps: dict[tuple[str, int], float] = {}
         self._register_routes()
+
+    # v0.12.0（性能优化）：RuleRuntime 缓存补强——真 LRU（命中即置尾）、
+    # 闲置 TTL（超时重建）、并在世界被改动/归档/恢复时按 slug 显式失效。
+    _RUNTIME_CACHE_TTL_SECONDS = 600.0
 
     def _cached_rule_runtime(self, world: Mapping[str, Any]) -> RuleRuntime:
         slug = str(world.get("slug") or "").strip()
@@ -241,13 +411,35 @@ class TavernWebConsole:
         if not slug:
             return RuleRuntime(world)
         key = (slug, revision)
+        now = time.monotonic()
         cached = self._rule_runtime_cache.get(key)
-        if cached is None:
-            cached = RuleRuntime(world)
-            self._rule_runtime_cache[key] = cached
-            if len(self._rule_runtime_cache) > 8:
-                self._rule_runtime_cache.popitem(last=False)
+        if cached is not None:
+            created = self._rule_runtime_timestamps.get(key, 0.0)
+            if now - created <= self._RUNTIME_CACHE_TTL_SECONDS:
+                self._rule_runtime_cache.move_to_end(key)
+                return cached
+            self._rule_runtime_cache.pop(key, None)
+            self._rule_runtime_timestamps.pop(key, None)
+        cached = RuleRuntime(world)
+        self._rule_runtime_cache[key] = cached
+        self._rule_runtime_timestamps[key] = now
+        if len(self._rule_runtime_cache) > 8:
+            _, stale = self._rule_runtime_cache.popitem(last=False)
+            self._rule_runtime_timestamps.pop(stale, None)
         return cached
+
+    def _purge_rule_runtime(self, slug: str) -> None:
+        """世界被编辑/归档/恢复后按 slug 失效对应缓存条目。"""
+        slug = str(slug or "").strip()
+        if not slug:
+            return
+        stale_keys = [
+            key for key in list(self._rule_runtime_cache)
+            if key[0] == slug
+        ]
+        for key in stale_keys:
+            self._rule_runtime_cache.pop(key, None)
+            self._rule_runtime_timestamps.pop(key, None)
 
     def _register(self, path: str, handler: Any, methods: list[str], desc: str) -> None:
         self.context.register_web_api(
@@ -457,6 +649,131 @@ class TavernWebConsole:
                 "Import Tavern backup",
             ),
             ("events", self.events, ["GET"], "Tavern activity stream"),
+            ("deliveries", self.deliveries, ["GET", "POST"], "Pending text deliveries"),
+            # ── v0.12.0：副本实时仪表盘 ──────────────────────────────
+            (
+                "dashboard/sessions",
+                self.dashboard_sessions,
+                ["GET"],
+                "Session realtime overview",
+            ),
+            (
+                "dashboard/session",
+                self.dashboard_session,
+                ["GET"],
+                "Session realtime detail",
+            ),
+            (
+                "dashboard/timeline",
+                self.dashboard_timeline,
+                ["GET"],
+                "Session event timeline",
+            ),
+            (
+                "dashboard/timers",
+                self.dashboard_timers_fast,
+                ["GET"],
+                "Session timers widget",
+            ),
+            (
+                "dashboard/seed-quota",
+                self.dashboard_seed_quota,
+                ["POST"],
+                "Seed default token quota",
+            ),
+            # ── v0.12.0：世界包社区注册表 / 市场 ──────────────────────
+            ("market/list", self.market_list, ["GET"], "World package market"),
+            (
+                "market/fetch",
+                self.market_fetch,
+                ["POST"],
+                "Fetch world package content",
+            ),
+            # ── A14：元素反应与通用接口 ─────────────────────────────
+            (
+                "worlds/element-reaction",
+                self.world_element_reaction,
+                ["POST"],
+                "Resolve elemental reaction (dry-run)",
+            ),
+            (
+                "worlds/element-table",
+                self.world_element_table,
+                ["GET"],
+                "World elemental table",
+            ),
+            ("worlds/schema", self.world_schema, ["GET"], "World package schema"),
+            ("worlds/export", self.world_export, ["GET"], "Export world package"),
+            ("worlds/diff", self.world_diff, ["POST"], "Diff two world packages"),
+            (
+                "worlds/import-batch",
+                self.world_import_batch,
+                ["POST"],
+                "Batch import worlds",
+            ),
+            (
+                "worlds/simulate-batch",
+                self.world_simulate_batch,
+                ["POST"],
+                "Batch rule simulation",
+            ),
+            (
+                "worlds/resolution-table",
+                self.world_resolution_table,
+                ["GET"],
+                "World resolution tables",
+            ),
+            (
+                "sessions/turn-preflight",
+                self.session_turn_preflight,
+                ["GET"],
+                "Turn preflight (read-only)",
+            ),
+            (
+                "sessions/context-compile",
+                self.session_context_compile,
+                ["GET"],
+                "Compiled context debug snapshot",
+            ),
+            (
+                "sessions/inject-fact",
+                self.session_inject_fact,
+                ["POST"],
+                "Inject a world fact",
+            ),
+            (
+                "sessions/apply-effect",
+                self.session_apply_effect,
+                ["POST"],
+                "Validate/dry-run declared effects",
+            ),
+            (
+                "sessions/advance-clock",
+                self.session_advance_clock,
+                ["POST"],
+                "Advance a scene clock",
+            ),
+            ("extensions", self.extensions, ["GET"], "Registered extensions"),
+            ("hooks/events", self.hook_events, ["GET"], "Hook event catalog"),
+            (
+                "meta/capabilities",
+                self.meta_capabilities,
+                ["GET"],
+                "Runtime capabilities",
+            ),
+            ("sessions/token-reset", self.session_token_reset, ["POST"], "Reset session token stats"),
+            ("sessions/turn-command", self.session_turn_command, ["POST"], "Adjust turn order (DM)"),
+            ("economy/summary", self.economy_summary, ["GET"], "Economy summary"),
+            ("economy/set-enabled", self.economy_set_enabled, ["POST"], "Toggle economy"),
+            ("economy/adjust", self.economy_adjust, ["POST"], "Adjust wallet balance"),
+            ("economy/transactions", self.economy_transactions, ["GET"], "Economy transactions"),
+            ("delegations/list", self.delegations_list, ["GET"], "List delegations"),
+            ("delegations/grant", self.delegations_grant, ["POST"], "Grant delegation"),
+            ("delegations/revoke", self.delegations_revoke, ["POST"], "Revoke delegation"),
+            ("delegations/restore", self.delegations_restore, ["POST"], "Restore owner control"),
+            ("delegations/forced-choose", self.delegations_forced_choose, ["POST"], "Forced choose"),
+            ("dm/state", self.dm_console_state, ["GET"], "DM console state"),
+            ("dm/command", self.dm_command, ["POST"], "DM command"),
         ]
         for route in routes:
             self._register(*route)
@@ -472,9 +789,224 @@ class TavernWebConsole:
     def _actor(cls) -> str:
         return f"web:{cls._username()}"
 
+    # ── v0.12.0：副本实时仪表盘端点 ──────────────────────────────────
+    async def dashboard_sessions(self):
+        """副本概览列表：状态 / 世界 / 当前行动者 / 活跃计时器数。"""
+        try:
+            self._username()
+            sessions = await build_dashboard_sessions(self.database)
+            return json_response({"sessions": sessions})
+        except Exception as exc:
+            return self._handle_error(exc)
+
+    async def dashboard_session(self):
+        """单个副本的实时聚合（状态机 / 行动者 / 计时器 / 选项 / 投票）。"""
+        try:
+            self._username()
+            session_id = str(request.query.get("session_id", "") or "")
+            if not session_id:
+                raise ValueError("缺少 session_id")
+            payload = await build_session_dashboard(self.database, session_id)
+            return json_response(payload)
+        except Exception as exc:
+            return self._handle_error(exc)
+
+    async def dashboard_timeline(self):
+        """事件时间线（回放视图）。"""
+        try:
+            self._username()
+            session_id = str(request.query.get("session_id", "") or "")
+            if not session_id:
+                raise ValueError("缺少 session_id")
+            limit = int(request.query.get("limit", "30") or "30")
+            payload = await build_session_timeline(
+                self.database, session_id, limit=limit
+            )
+            return json_response(payload)
+        except Exception as exc:
+            return self._handle_error(exc)
+
+    async def dashboard_timers_fast(self):
+        """轻量倒计时列表（供嵌入式小窗口局部刷新；支持 ?order=asc|desc）。"""
+        try:
+            self._username()
+            session_id = str(request.query.get("session_id", "") or "")
+            if not session_id:
+                raise ValueError("缺少 session_id")
+            order = str(request.query.get("order", "desc") or "desc")
+            timers = await build_session_timers(
+                self.database, session_id, order=order
+            )
+            return json_response({"timers": timers})
+        except Exception as exc:
+            return self._handle_error(exc)
+
+    async def dashboard_seed_quota(self):
+        """用配置默认值给尚未配置配额策略的副本播种（F3 的控制台入口）。"""
+        try:
+            self._username()
+            payload = await self._payload()
+            session_id = str(payload.get("session_id") or "").strip()
+            if not session_id:
+                raise ValueError("缺少 session_id")
+            config = TavernConfig.from_mapping(self.plugin_config)
+            summary = await self.database.ensure_default_token_quota(
+                session_id,
+                window_seconds=config.token_quota_window_seconds,
+                token_limit=config.token_quota_token_limit,
+                enabled=config.token_quota_enabled,
+                actor_id=self._actor(),
+            )
+            return json_response(
+                {
+                    "seeded": config.token_quota_enabled,
+                    "quota": summary.get("quotas", []),
+                }
+            )
+        except Exception as exc:
+            return self._handle_error(exc)
+
+    # ── v0.12.0：世界包社区注册表 / 市场端点 ─────────────────────────
+    def _remote_market_config(self) -> TavernConfig | None:
+        """返回启用远程市场时的配置；未启用或缺少 HTTP 客户端时返回 None。"""
+        config = TavernConfig.from_mapping(self.plugin_config)
+        if not config.world_market_enabled:
+            return None
+        if not config.world_market_remote_manifest_url:
+            return None
+        if getattr(self.context, "http_client", None) is None:
+            self.logger.warning(
+                "AI 酒馆远程市场已启用，但 AstrBot 未提供 HTTP 客户端"
+            )
+            return None
+        return config
+
+    async def market_list(self):
+        """市场条目列表（本地 + 可选远程）。
+
+        - ``?manifest_url=``：控制台「GitHub 直链」入口传入时，无论配置是否启用远程市场，
+          都从该地址拉取远程清单并合并到本地条目（仍受主机白名单 / 体积上限约束）。
+        - 未传 manifest_url 时保持既有行为（仅配置启用且配置了地址才拉取）。
+        """
+        try:
+            self._username()
+            query = str(request.query.get("q", "") or "")
+            explicit_url = str(
+                request.query.get("manifest_url", "") or ""
+            ).strip()
+            # 0.12.0-A5：市场默认为空（不再内联本地示例/模板），仅通过
+            # GitHub 直链或配置的远程清单拉取条目。
+            entries: list[dict[str, Any]] = []
+            remote_enabled = False
+            config = self._remote_market_config()
+            fetch_target = explicit_url or (
+                config.world_market_remote_manifest_url
+                if config is not None
+                else ""
+            )
+            if fetch_target:
+                client = self.context.http_client
+                allowed = (
+                    config.world_market_allowed_hosts
+                    if config is not None
+                    else None
+                )
+                try:
+                    remote = await fetch_remote_manifest(
+                        client,
+                        fetch_target,
+                        allowed,
+                        max_bytes=(
+                            config.world_market_max_package_bytes
+                            if config is not None
+                            else 2_000_000
+                        ),
+                        ttl_seconds=(
+                            config.world_market_cache_ttl_seconds
+                            if config is not None
+                            else 600
+                        ),
+                    )
+                    entries = [*entries, *remote]
+                    remote_enabled = True
+                except LookupError as exc:
+                    self.logger.warning("AI 酒馆远程市场拉取失败：%s", exc)
+                except Exception as exc:
+                    report_failure(
+                        self.logger,
+                        stage="market",
+                        operation="manifest",
+                        exc=exc,
+                        transient=True,
+                    )
+            if query:
+                entries = search_entries(entries, query)
+            return json_response(
+                {
+                    "items": entries,
+                    "remote_enabled": remote_enabled,
+                    "remote_error": None,
+                }
+            )
+        except Exception as exc:
+            return self._handle_error(exc)
+
+    async def market_fetch(self):
+        """按 package_key 拉取完整世界包内容（本地或远程；供预览与导入）。"""
+        try:
+            self._username()
+            payload = await self._payload()
+            package_key = str(payload.get("package_key") or "").strip()
+            if not package_key:
+                raise ValueError("缺少 package_key")
+            root = Path(__file__).resolve().parent.parent
+            if package_key.startswith("remote:"):
+                config = self._remote_market_config()
+                if config is None:
+                    raise LookupError("远程市场未启用或缺少 HTTP 客户端")
+                entries = await fetch_remote_manifest(
+                    self.context.http_client,
+                    config.world_market_remote_manifest_url,
+                    config.world_market_allowed_hosts,
+                    max_bytes=config.world_market_max_package_bytes,
+                    ttl_seconds=config.world_market_cache_ttl_seconds,
+                )
+                entry = next(
+                    (
+                        item
+                        for item in entries
+                        if item.get("package_key") == package_key
+                    ),
+                    None,
+                )
+                if entry is None:
+                    raise LookupError("远程条目不存在")
+                content = await fetch_remote_package(
+                    self.context.http_client,
+                    entry,
+                    config.world_market_allowed_hosts,
+                    max_bytes=config.world_market_max_package_bytes,
+                    verify_sha256=config.world_market_verify_sha256,
+                )
+                report = inspect_world_package(content)
+                return json_response(
+                    {"entry": entry, "world": content, "preflight": report}
+                )
+            entry, content = fetch_entry(root, package_key)
+            report = inspect_world_package(content)
+            return json_response(
+                {"entry": entry, "world": content, "preflight": report}
+            )
+        except LookupError as exc:
+            return error_response(str(exc), status_code=404)
+        except Exception as exc:
+            return self._handle_error(exc)
+
     def _handle_error(self, exc: Exception):
         if isinstance(exc, PermissionError):
             return error_response(str(exc), status_code=401)
+        if isinstance(exc, PolicyRejection):
+            return error_response(str(exc), status_code=403)
         if isinstance(exc, DatabaseNotFoundError):
             return error_response(str(exc), status_code=404)
         if isinstance(exc, DatabaseConflictError):
@@ -486,7 +1018,14 @@ class TavernWebConsole:
                 "数据冲突：标识、群会话或名称可能已存在",
                 status_code=409,
             )
-        self.logger.exception("AI 酒馆 WebUI 请求失败")
+        # v0.12.0：未知异常统一经 report_failure 上报（含请求上下文），
+        # 避免被静默吞掉；同时保留原 500 响应语义。
+        report_failure(
+            self.logger,
+            stage="webui",
+            operation=str(getattr(request, "path", "unknown")),
+            exc=exc,
+        )
         return error_response("服务器内部错误", status_code=500)
 
     async def _payload(self) -> dict[str, Any]:
@@ -507,6 +1046,29 @@ class TavernWebConsole:
                 "allowed_group_count": len(config.allowed_group_ids),
                 "whitelist_required": config.require_group_whitelist,
                 "ready": bool(config.admin_ids),
+            }
+            # 0.12.0-A3：Token 用量（WebUI 总览顶部指标卡 / 关键数据）。
+            window = max(60, config.token_quota_window_seconds)
+            result["token_usage"] = {
+                "enabled": config.token_quota_enabled,
+                "used": await self.database.global_token_usage(window),
+                "window_seconds": window,
+                "limit": config.token_quota_token_limit,
+            }
+            # 0.12.0-A3：开馆前检查（WebUI 总览「开馆前检查」卡片）。
+            health = await self.database.list_provider_health()
+            result["provider_health"] = health
+            result["readiness"] = {
+                "admin_ready": bool(config.admin_ids),
+                "whitelisted_groups": len(config.allowed_group_ids),
+                "whitelist_required": config.require_group_whitelist,
+                "worlds_ready": int(result["counts"]["worlds"]),
+                "card_code_ttl_seconds": int(
+                    config.time_rules.get("card_code_ttl_seconds") or 1800
+                ),
+                "providers_ready": bool(health) and all(
+                    bool(item.get("success")) for item in health
+                ),
             }
             return json_response(result)
         except Exception as exc:
@@ -545,6 +1107,7 @@ class TavernWebConsole:
                 ]
                 raise ValueError("世界包体检未通过：" + "；".join(messages[:5]))
             item = await self.database.save_world(payload, self._actor())
+            self._purge_rule_runtime(str(item.get("slug") or ""))
             await self.broker.publish({"type": "world", "action": "save"})
             return json_response({"item": item, "preflight": report})
         except Exception as exc:
@@ -651,6 +1214,7 @@ class TavernWebConsole:
                 world_id,
                 self._actor(),
             )
+            self._purge_rule_runtime(world["slug"])
             await self.broker.publish({"type": "world", "action": "archive"})
             return json_response({"item": item})
         except Exception as exc:
@@ -659,10 +1223,13 @@ class TavernWebConsole:
     async def world_restore(self):
         try:
             payload = await self._payload()
+            world_id = str(payload.get("id", ""))
+            current = await self.database.get_world(world_id)
             item = await self.database.restore_world(
-                str(payload.get("id", "")),
+                world_id,
                 self._actor(),
             )
+            self._purge_rule_runtime(current["slug"])
             await self.broker.publish({"type": "world", "action": "restore"})
             return json_response({"item": item})
         except Exception as exc:
@@ -779,6 +1346,7 @@ class TavernWebConsole:
             except DatabaseNotFoundError:
                 pass
             item = await self.database.save_world(import_payload, self._actor())
+            self._purge_rule_runtime(str(item.get("slug") or ""))
             await self.broker.publish({"type": "world", "action": "save"})
             return json_response({"item": item, "mode": mode, "preflight": report})
         except Exception as exc:
@@ -940,14 +1508,24 @@ class TavernWebConsole:
                     "timer_policy": (
                         await self.database.get_timer_policy(session_id)
                     ),
-                    "token_usage": (
-                        await self.database.token_usage_summary(session_id)
+                    "token_usage": _with_token_context(
+                        await self.database.token_usage_summary(session_id),
+                        await self.database.get_instance_config(session_id),
                     ),
                     "choice": await self.database.active_choice_set(session_id),
                     "vote": await self.database.active_vote(session_id),
                     "bans": await self.database.list_bans(session_id),
                     "permissions": (
                         await self.database.list_permission_grants(session_id)
+                    ),
+                    "economy": (
+                        await self.database.economy_summary(session_id)
+                    ),
+                    "delegations": (
+                        await self.database.list_delegations(session_id)
+                    ),
+                    "pending_operations": (
+                        await self.database.pending_operations(session_id)
                     ),
                     "return_requests": (
                         await self.database.list_return_requests(session_id)
@@ -1947,97 +2525,11 @@ class TavernWebConsole:
     async def backup_export(self):
         try:
             self._username()
-            bundle = await self.database.export_bundle()
-            export_dir = self.data_dir / "exports"
-            export_dir.mkdir(parents=True, exist_ok=True)
-            path = next_timestamped_path(
-                export_dir,
-                "backup_tavern",
-                ".zip",
+            path = await build_backup_archive(
+                data_dir=self.data_dir,
+                database=self.database,
+                export_dir=self.data_dir / "exports",
             )
-            temporary = path.with_name(
-                f".{path.name}.{uuid.uuid4().hex}.tmp"
-            )
-            catalog_copy = export_dir / (
-                f".catalog.{uuid.uuid4().hex}.sqlite3"
-            )
-            bundle_bytes = (
-                json.dumps(
-                    bundle,
-                    ensure_ascii=False,
-                    indent=2,
-                    sort_keys=True,
-                )
-                + "\n"
-            ).encode("utf-8")
-            checksum_lines = [
-                (
-                    hashlib.sha256(bundle_bytes).hexdigest(),
-                    "bundle.json",
-                )
-            ]
-            try:
-                with closing(
-                    sqlite3.connect(self.database.path)
-                ) as source:
-                    with closing(sqlite3.connect(catalog_copy)) as target:
-                        source.backup(target)
-                checksum_lines.append(
-                    (
-                        file_sha256(catalog_copy),
-                        "catalog.sqlite3",
-                    )
-                )
-                group_files: list[tuple[Path, str]] = []
-                groups_dir = self.data_dir / "groups"
-                if groups_dir.exists():
-                    for item in sorted(groups_dir.rglob("*")):
-                        if (
-                            not item.is_file()
-                            or item.is_symlink()
-                            or item.name.endswith(("-wal", "-shm", ".tmp"))
-                            or item.name.startswith(".")
-                        ):
-                            continue
-                        archive_name = item.relative_to(
-                            self.data_dir
-                        ).as_posix()
-                        group_files.append((item, archive_name))
-                with zipfile.ZipFile(
-                    temporary,
-                    "w",
-                    compression=zipfile.ZIP_DEFLATED,
-                    compresslevel=6,
-                ) as archive:
-                    archive.writestr("bundle.json", bundle_bytes)
-                    archive.write(catalog_copy, "catalog.sqlite3")
-                    for item, archive_name in group_files:
-                        digest = hashlib.sha256()
-                        with item.open("rb") as source, archive.open(
-                            archive_name,
-                            "w",
-                            force_zip64=True,
-                        ) as output:
-                            for chunk in iter(
-                                lambda: source.read(1024 * 1024),
-                                b"",
-                            ):
-                                digest.update(chunk)
-                                output.write(chunk)
-                        checksum_lines.append(
-                            (digest.hexdigest(), archive_name)
-                        )
-                    archive.writestr(
-                        "checksum.sha256",
-                        "".join(
-                            f"{digest}  {name}\n"
-                            for digest, name in checksum_lines
-                        ).encode("utf-8"),
-                    )
-                replace_with_retry(temporary, path)
-            finally:
-                unlink_with_retry(temporary, suppress_errors=True)
-                unlink_with_retry(catalog_copy, suppress_errors=True)
             return file_response(
                 path,
                 filename=path.name,
@@ -2060,7 +2552,7 @@ class TavernWebConsole:
                 raise ValueError("缺少备份文件")
             filename = str(upload.filename or "").lower()
             if not filename.endswith((".json", ".zip")):
-                raise ValueError("只接受完整的 Schema 9 或 Schema 10 JSON/ZIP 备份")
+                raise ValueError("只接受完整的 Schema 9—12 JSON/ZIP 备份")
             temp_dir = self.data_dir / "imports"
             temp_dir.mkdir(parents=True, exist_ok=True)
             suffix = ".zip" if filename.endswith(".zip") else ".json"
@@ -2146,6 +2638,1330 @@ class TavernWebConsole:
                 temp_path.unlink(missing_ok=True)
             if stage_dir and stage_dir.exists():
                 shutil.rmtree(stage_dir, ignore_errors=True)
+
+
+
+    async def session_turn_command(self):
+        # A17：后台调整回合顺序（reorder/designate/skip/supersede_choices）。
+        try:
+            user = self._username()
+            payload = await self._payload()
+            session_id = str(payload.get("session_id") or "")
+            command = str(payload.get("command") or "").strip().lower()
+            if not session_id or not command:
+                raise ValueError("缺少 session_id/command")
+            await self._require_dm_capability(session_id, user)
+            db = self.database
+            result: dict[str, Any] = {}
+            if command == "reorder":
+                order = payload.get("order") or []
+                order = [str(x) for x in order if str(x or "").strip()]
+                if len(order) < 2 or len(set(order)) != len(order):
+                    raise ValueError("行动顺序必须是不重复的玩家 ID 列表")
+                await db.supersede_active_choices(session_id, user)
+                result = await db.set_turn_order(session_id, order, user)
+            elif command == "designate":
+                result = await db.designate_turn(
+                    session_id, str(payload.get("user_id") or ""), user
+                )
+            elif command == "skip":
+                result = await db.skip_turn(
+                    session_id,
+                    str(payload.get("user_id") or ""),
+                    user,
+                    force=True,
+                )
+            elif command == "supersede_choices":
+                result = {
+                    "count": await db.supersede_active_choices(session_id, user)
+                }
+            else:
+                raise ValueError("不支持的回合指令")
+            await self.broker.publish(
+                {"type": "turn", "action": command, "session_id": session_id}
+            )
+            try:
+                session = await db.get_session(session_id)
+                turn = await db.get_turn_status(session_id)
+                note = (
+                    f"🎭 行动顺序已调整（{command}）\n"
+                    f"当前行动者："
+                    f"{turn.get('current_name') or turn.get('current_user_id') or '—'}"
+                )
+                if command == "reorder":
+                    order_names = [
+                        str(x.get("name") or x.get("user_id") or "")
+                        for x in turn.get("order", [])
+                    ]
+                    note += "\n新顺序：" + " → ".join(order_names)
+                await self._send_group_text(
+                    session_id,
+                    str(session.get("unified_origin") or ""),
+                    note,
+                    kind="turn.command",
+                )
+            except Exception:
+                pass
+            return json_response({"ok": True, "result": result})
+        except Exception as exc:
+            return self._handle_error(exc)
+
+    # ── A16：统一权限助手 ──────────────────────────────────────────
+    def _config(self) -> TavernConfig:
+        try:
+            return TavernConfig.from_mapping(self.plugin_config)
+        except Exception:
+            return TavernConfig()
+
+    async def _session_control(self, session_id: str) -> dict[str, Any]:
+        try:
+            return await self.database.get_control_state(session_id)
+        except Exception:
+            return {"mode": "auto", "active_dm_user_id": ""}
+
+    async def _require_dm_capability(self, session_id: str, user: str) -> None:
+        from .permissions import can_manage_dm
+
+        control = await self._session_control(session_id)
+        if await can_manage_dm(
+            self.database, self._config(), session_id, control, user
+        ):
+            return
+        # A18: WebUI 入口本身受 AstrBot 管理台登录保护（_username 已校验非空），
+        # 已认证的 WebUI 操作者视为具备副本 DM / 管理员能力；QQ 身份校验仍保留为
+        # 额外放行路径。权限不足改为 403，避免 AstrBot 前端桥把 401 误判为
+        # 登录过期而跳转登录页。
+        if str(request.username or "").strip():
+            return
+        raise PolicyRejection("需要副本 DM 或管理员权限")
+
+    async def _require_economy_capability(self, session_id: str, user: str) -> None:
+        from .permissions import can_adjust_economy
+
+        control = await self._session_control(session_id)
+        if await can_adjust_economy(
+            self.database, self._config(), session_id, control, user
+        ):
+            return
+        if str(request.username or "").strip():
+            return
+        raise PolicyRejection("需要 DM/管理员或 host/mod 权限")
+
+    # ── A16：经济系统 WebUI ───────────────────────────────────────
+    async def economy_summary(self):
+        try:
+            self._username()
+            session_id = str(request.query.get("session_id", "") or "")
+            if not session_id:
+                raise ValueError("缺少 session_id")
+            summary = await self.database.economy_summary(session_id)
+            return json_response(summary)
+        except Exception as exc:
+            return self._handle_error(exc)
+
+    async def economy_set_enabled(self):
+        try:
+            user = self._username()
+            payload = await self._payload()
+            session_id = str(payload.get("session_id") or "")
+            if not session_id:
+                raise ValueError("缺少 session_id")
+            await self._require_dm_capability(session_id, user)
+            enabled = bool(payload.get("enabled", False))
+            result = await self.database.set_economy_enabled(
+                session_id, enabled, self._actor()
+            )
+            await self.broker.publish(
+                {"type": "economy", "action": "enabled", "session_id": session_id}
+            )
+            return json_response(result)
+        except Exception as exc:
+            return self._handle_error(exc)
+
+    async def economy_adjust(self):
+        try:
+            user = self._username()
+            payload = await self._payload()
+            session_id = str(payload.get("session_id") or "")
+            if not session_id:
+                raise ValueError("缺少 session_id")
+            await self._require_economy_capability(session_id, user)
+            result = await self.database.economy_apply(
+                session_id=session_id,
+                operation_id=str(
+                    payload.get("operation_id") or f"web:{uuid.uuid4().hex}"
+                ),
+                kind=str(payload.get("kind") or "adjust"),
+                currency_id=str(payload.get("currency_id") or ""),
+                amount=payload.get("amount"),
+                from_owner=(
+                    (str(payload["from_owner_type"]), str(payload["from_owner_ref"]))
+                    if payload.get("from_owner_type") and payload.get("from_owner_ref")
+                    else None
+                ),
+                to_owner=(
+                    (str(payload["to_owner_type"]), str(payload["to_owner_ref"]))
+                    if payload.get("to_owner_type") and payload.get("to_owner_ref")
+                    else None
+                ),
+                reason=str(payload.get("reason") or ""),
+                source="web",
+                actor_id=user,
+            )
+            await self.broker.publish(
+                {"type": "economy", "action": "apply", "session_id": session_id}
+            )
+            return json_response(result)
+        except Exception as exc:
+            return self._handle_error(exc)
+
+    async def economy_transactions(self):
+        try:
+            self._username()
+            session_id = str(request.query.get("session_id", "") or "")
+            if not session_id:
+                raise ValueError("缺少 session_id")
+            limit = int(request.query.get("limit", "100") or "100")
+            rows = await self.database.economy_list_transactions(session_id, limit)
+            return json_response({"items": rows})
+        except Exception as exc:
+            return self._handle_error(exc)
+
+    # ── A16：角色托管 / 代操作 WebUI ──────────────────────────────
+    async def delegations_list(self):
+        try:
+            self._username()
+            session_id = str(request.query.get("session_id", "") or "")
+            if not session_id:
+                raise ValueError("缺少 session_id")
+            items = await self.database.list_delegations(session_id)
+            return json_response({"items": items})
+        except Exception as exc:
+            return self._handle_error(exc)
+
+    async def delegations_grant(self):
+        try:
+            user = self._username()
+            payload = await self._payload()
+            session_id = str(payload.get("session_id") or "")
+            owner = str(payload.get("owner_user_id") or "")
+            delegate = str(payload.get("delegate_user_id") or "")
+            if not session_id or not owner or not delegate:
+                raise ValueError("缺少 session_id/owner_user_id/delegate_user_id")
+            source = str(payload.get("source") or "player")
+            if source in {"admin", "dm"}:
+                await self._require_dm_capability(session_id, user)
+            result = await self.database.grant_delegation(
+                session_id,
+                owner,
+                delegate,
+                self._actor(),
+                permissions=payload.get("permissions"),
+                expiry_kind=str(payload.get("expiry_kind") or "none"),
+                expires_round=int(payload.get("expires_round") or 0),
+                auto_restore=bool(payload.get("auto_restore", False)),
+                source=source,
+            )
+            await self.broker.publish(
+                {"type": "delegation", "action": "grant", "session_id": session_id}
+            )
+            return json_response(result)
+        except Exception as exc:
+            return self._handle_error(exc)
+
+    async def delegations_revoke(self):
+        try:
+            user = self._username()
+            payload = await self._payload()
+            session_id = str(payload.get("session_id") or "")
+            owner = str(payload.get("owner_user_id") or "")
+            if not session_id or not owner:
+                raise ValueError("缺少 session_id/owner_user_id")
+            force = user not in {owner, ""}
+            if force:
+                await self._require_dm_capability(session_id, user)
+            count = await self.database.revoke_delegation(
+                session_id, owner, self._actor(), force=force
+            )
+            await self.broker.publish(
+                {"type": "delegation", "action": "revoke", "session_id": session_id}
+            )
+            return json_response({"count": count})
+        except Exception as exc:
+            return self._handle_error(exc)
+
+    async def delegations_restore(self):
+        try:
+            user = self._username()
+            payload = await self._payload()
+            session_id = str(payload.get("session_id") or "")
+            participant_id = str(payload.get("participant_id") or "")
+            if not session_id or not participant_id:
+                raise ValueError("缺少 session_id/participant_id")
+            await self._require_dm_capability(session_id, user)
+            count = await self.database.restore_owner_control(
+                session_id, participant_id, self._actor()
+            )
+            await self.broker.publish(
+                {"type": "delegation", "action": "restore", "session_id": session_id}
+            )
+            return json_response({"count": count})
+        except Exception as exc:
+            return self._handle_error(exc)
+
+    async def delegations_forced_choose(self):
+        try:
+            user = self._username()
+            payload = await self._payload()
+            session_id = str(payload.get("session_id") or "")
+            choice_key = str(payload.get("choice_key") or "")
+            if not session_id or not choice_key:
+                raise ValueError("缺少 session_id/choice_key")
+            await self._require_dm_capability(session_id, user)
+            choice_set = await self.database.active_choice_set(session_id)
+            participant = (choice_set or {}).get("participant") or {}
+            acting_user_id = str(participant.get("group_user_id") or "")
+            acting_name = str(
+                participant.get("character_name")
+                or participant.get("display_name")
+                or acting_user_id
+            )
+            if not acting_user_id:
+                raise ValueError("当前没有可强制选择的行动角色")
+            # A17：幂等——同一 operation_id 只执行一次，防止重复点击重复消费。
+            operation_id = str(payload.get("operation_id") or "").strip() or (
+                f"forced:{session_id}:{uuid.uuid4().hex}"
+            )
+            claim = await self.database.claim_action_operation(
+                session_id,
+                operation_id,
+                "forced_choose",
+                acting_user_id,
+                user,
+                {"choice_key": choice_key},
+            )
+            if not claim["claimed"]:
+                return json_response(
+                    {
+                        "ok": False,
+                        "idempotent_replay": True,
+                        "message": "该操作已执行过，未重复提交",
+                    }
+                )
+            session = await self.database.get_session(session_id)
+            from types import SimpleNamespace
+
+            event = SimpleNamespace(
+                unified_msg_origin=str(session.get("unified_origin", "")),
+                message_obj=None,
+            )
+            reply = await self._engine().process_choice(
+                event=event,
+                session_id=session_id,
+                sender_id=user,
+                sender_name="管理员",
+                choice_key=choice_key,
+                operator_id=user,
+                force=True,
+            )
+            await self.broker.publish(
+                {
+                    "type": "delegation",
+                    "action": "forced_choose",
+                    "session_id": session_id,
+                    "hook": "forced_choose",
+                }
+            )
+            # A17/A21：后台代选成功后向群聊发送通知（失败不影响已提交操作，
+            # 但把发送结果如实返回给前端，避免误报“已通知群聊”）。
+            selected_text = ""
+            for choice_item in (choice_set.get("choices") or []):
+                if isinstance(choice_item, Mapping) and str(
+                    choice_item.get("key") or ""
+                ).upper() == str(choice_key).upper():
+                    selected_text = str(choice_item.get("text") or "")
+                    break
+            notice = (
+                f"🎭 后台代操作\n角色：{acting_name}\n"
+                f"操作者：{user}\n选择：{choice_key}. {selected_text}".rstrip()
+            )
+            parts = [part for part in (reply.story_text, reply.turn_text) if part]
+            group_text = notice + (("\n\n" + "\n\n".join(parts)) if parts else "")
+            send_result = await self._send_group_text(
+                session_id,
+                str(session.get("unified_origin") or ""),
+                group_text,
+                kind="delegation.forced_choose",
+            )
+            return json_response(
+                {
+                    "ok": True,
+                    "operation_id": operation_id,
+                    "story": reply.story_text,
+                    "turn": reply.turn_text,
+                    "actor_user_id": acting_user_id,
+                    "operator_id": user,
+                    "notice_sent": bool(send_result.get("ok")),
+                    "notice_reason": str(send_result.get("reason") or ""),
+                }
+            )
+        except Exception as exc:
+            return self._handle_error(exc)
+
+    async def _send_group_text(
+        self,
+        session_id: str,
+        origin: str,
+        text: str,
+        *,
+        kind: str = "webui.notice",
+    ) -> dict[str, Any]:
+        """Send portable text or persist it for delivery on the next event."""
+
+        policy = "next_event"
+        try:
+            instance = await self.database.get_instance_config(session_id)
+            policy = str(
+                normalize_chat_experience(instance.get("world_snapshot") or {})
+                ["delivery"]["proactive_fallback"]
+            )
+        except Exception:
+            policy = "next_event"
+        result = await deliver_text(self.context, origin, text, proactive=True)
+        payload = result.to_dict()
+        payload["queued"] = False
+        if result.ok:
+            return payload
+        if policy == "discard":
+            payload["reason"] = result.reason + "；世界包策略已丢弃未送达通知"
+            return payload
+        if str(origin or "").strip() and str(text or "").strip():
+            stored_kind = f"webui_only:{kind}" if policy == "webui_only" else kind
+            queued = await self.database.queue_delivery(
+                session_id=session_id,
+                origin=origin,
+                kind=stored_kind,
+                text=text,
+                reason=result.reason,
+            )
+            payload["queued"] = True
+            payload["delivery_id"] = queued["id"]
+            payload["reason"] = result.reason + "；已进入待投递队列"
+            await self.broker.publish(
+                {"type": "delivery", "action": "queued", "session_id": session_id}
+            )
+        return payload
+
+    async def deliveries(self):
+        """List, retry or dismiss persisted text notifications."""
+
+        try:
+            user = self._username()
+            method = str(getattr(request, "method", "GET") or "GET").upper()
+            if method == "GET":
+                session_id = str(request.query.get("session_id", "") or "")
+                status = str(request.query.get("status", "pending") or "")
+                items = await self.database.list_deliveries(
+                    session_id=session_id,
+                    status=status,
+                    limit=int(request.query.get("limit", "100") or 100),
+                )
+                return json_response({"items": items})
+            payload = await self._payload()
+            delivery_id = str(payload.get("delivery_id") or "")
+            action = str(payload.get("action") or "retry")
+            if not delivery_id:
+                raise ValueError("缺少 delivery_id")
+            items = await self.database.list_deliveries(status="", limit=500)
+            item = next((row for row in items if str(row.get("id")) == delivery_id), None)
+            if not item:
+                raise ValueError("待投递通知不存在")
+            if item.get("session_id"):
+                await self._require_dm_capability(str(item["session_id"]), user)
+            if action == "dismiss":
+                updated = await self.database.dismiss_delivery(delivery_id, self._actor())
+                await self.broker.publish({"type": "delivery", "action": "dismissed", "session_id": item.get("session_id", "")})
+                return json_response({"ok": True, "item": updated})
+            result = await deliver_text(
+                self.context,
+                item.get("origin"),
+                item.get("text"),
+                proactive=True,
+            )
+            updated = await self.database.finish_delivery(
+                delivery_id,
+                success=result.ok,
+                error=result.reason,
+            )
+            return json_response({"ok": result.ok, "item": updated, "delivery": result.to_dict()})
+        except Exception as exc:
+            return self._handle_error(exc)
+
+    def _engine(self):
+        return getattr(self, "_tavern_engine", None)
+
+    # ── A16：人工 DM 控制台 ───────────────────────────────────────
+    async def dm_console_state(self):
+        try:
+            self._username()
+            session_id = str(request.query.get("session_id", "") or "")
+            if not session_id:
+                raise ValueError("缺少 session_id")
+            session = await self.database.get_session(session_id)
+            control = await self.database.get_control_state(session_id)
+            delegations = await self.database.list_delegations(session_id)
+            pending = await self.database.pending_operations(session_id)
+            return json_response(
+                {
+                    "session": {
+                        "id": session.get("id"),
+                        "state": session.get("state"),
+                        "revision": session.get("revision"),
+                        "turn_no": session.get("turn_no"),
+                        "input_locked": int(session.get("input_locked") or 0),
+                    },
+                    "control": control,
+                    "delegations": delegations,
+                    "pending_operations": pending,
+                }
+            )
+        except Exception as exc:
+            return self._handle_error(exc)
+
+    async def dm_command(self):
+        try:
+            user = self._username()
+            payload = await self._payload()
+            session_id = str(payload.get("session_id") or "")
+            command = str(payload.get("command") or "")
+            if not session_id or not command:
+                raise ValueError("缺少 session_id/command")
+            await self._require_dm_capability(session_id, user)
+            database = self.database
+            actor = self._actor()
+            instance = await database.get_instance_config(session_id)
+            dm_policy = normalize_chat_experience(
+                instance.get("world_snapshot") or {}
+            )["dm"]
+            required_policy = {
+                "narrative": "allow_narrative_override",
+                "whisper": "allow_secret_whispers",
+                "manual_roll": "allow_manual_checks",
+                "adjust_relationship": "allow_state_intervention",
+                "adjust_economy": "allow_state_intervention",
+                "set_next_actor": "allow_state_intervention",
+                "lock_action": "allow_state_intervention",
+                "lock_input": "allow_state_intervention",
+                "replace_choices": "allow_state_intervention",
+                "force_end_vote": "allow_state_intervention",
+                "vote_as": "allow_state_intervention",
+            }.get(command)
+            if required_policy and not bool(dm_policy.get(required_policy, True)):
+                raise PermissionError(
+                    f"当前世界包已关闭该人工 DM 能力（{required_policy}）"
+                )
+            result: dict[str, Any] = {}
+            if command == "narrative":
+                result = await database.insert_dm_narrative(
+                    session_id,
+                    str(payload.get("text") or ""),
+                    actor,
+                    mode=str(payload.get("mode") or "append"),
+                )
+            elif command == "announce":
+                result = await database.publish_announcement(
+                    session_id, str(payload.get("text") or ""), actor
+                )
+            elif command == "whisper":
+                result = await database.whisper_to(
+                    session_id,
+                    str(payload.get("text") or ""),
+                    str(payload.get("participant_id") or ""),
+                    actor,
+                )
+            elif command == "set_next_actor":
+                result = await database.designate_turn(
+                    session_id, str(payload.get("user_id") or ""), actor
+                )
+            elif command == "lock_action":
+                result = await database.set_action_lock(
+                    session_id,
+                    str(payload.get("participant_id") or ""),
+                    bool(payload.get("locked", True)),
+                    actor,
+                )
+            elif command == "lock_input":
+                result = await database.set_input_lock(
+                    session_id, bool(payload.get("locked", True)), actor
+                )
+            elif command == "replace_choices":
+                import json as _json
+
+                raw = payload.get("choices")
+                choices = raw if isinstance(raw, list) else _json.loads(
+                    str(payload.get("choices_json") or "[]")
+                )
+                choice_set = await database.active_choice_set(session_id)
+                if not choice_set:
+                    raise ValueError("当前没有可替换的选项")
+                result = await database.replace_active_choices(
+                    session_id,
+                    choice_set["participant"]["id"],
+                    choices,
+                    actor_id=actor,
+                )
+            elif command == "force_end_vote":
+                result = await database.force_end_vote(
+                    session_id, str(payload.get("winner_key") or ""), actor
+                )
+            elif command == "vote_as":
+                result = await database.cast_vote(
+                    session_id,
+                    str(payload.get("user_id") or ""),
+                    str(payload.get("key") or ""),
+                )
+            elif command == "manual_roll":
+                result = await database.record_manual_roll(
+                    session_id,
+                    str(payload.get("participant_id") or ""),
+                    str(payload.get("stat") or ""),
+                    int(payload.get("total") or 0),
+                    str(payload.get("note") or ""),
+                    actor,
+                )
+            elif command == "adjust_relationship":
+                result = await database.apply_relationship_delta(
+                    session_id,
+                    str(payload.get("source") or ""),
+                    str(payload.get("target") or ""),
+                    str(payload.get("dimension") or "信任"),
+                    int(payload.get("delta") or 0),
+                    actor,
+                )
+            elif command == "adjust_economy":
+                await self._require_economy_capability(session_id, user)
+                result = await database.economy_apply(
+                    session_id=session_id,
+                    operation_id=str(
+                        payload.get("operation_id") or f"dm:{uuid.uuid4().hex}"
+                    ),
+                    kind=str(payload.get("kind") or "adjust"),
+                    currency_id=str(payload.get("currency_id") or ""),
+                    amount=payload.get("amount"),
+                    from_owner=(
+                        (str(payload["from_owner_type"]), str(payload["from_owner_ref"]))
+                        if payload.get("from_owner_type") and payload.get("from_owner_ref")
+                        else None
+                    ),
+                    to_owner=(
+                        (str(payload["to_owner_type"]), str(payload["to_owner_ref"]))
+                        if payload.get("to_owner_type") and payload.get("to_owner_ref")
+                        else None
+                    ),
+                    reason=str(payload.get("reason") or ""),
+                    source="dm",
+                    actor_id=user,
+                )
+            elif command == "pause":
+                result = await database.transition_session(
+                    session_id, "paused", actor
+                )
+            elif command == "resume":
+                result = await database.transition_session(
+                    session_id, "preparing", actor
+                )
+            elif command == "checkpoint":
+                result = await database.create_snapshot(
+                    session_id,
+                    str(payload.get("name") or "DM检查点"),
+                    actor,
+                )
+            elif command == "cancel_operation":
+                result = await database.update_operation(
+                    str(payload.get("operation_id") or ""),
+                    status="failed",
+                    phase="cancelled_by_dm",
+                    result={"reason": str(payload.get("reason") or "DM 取消卡死任务")},
+                    actor_id=actor,
+                )
+            else:
+                raise ValueError(f"不支持的 DM 指令：{command}")
+            delivery: dict[str, Any] | None = None
+            session = await database.get_session(session_id)
+            public_text = ""
+            target_origin = str(session.get("unified_origin") or "")
+            if command == "narrative":
+                public_text = str(payload.get("text") or "")
+            elif command == "announce":
+                public_text = "【主持公告】\n" + str(payload.get("text") or "")
+            elif command == "manual_roll":
+                public_text = (
+                    f"【主持检定】{payload.get('stat') or '检定'}："
+                    f"{int(payload.get('total') or 0)}"
+                )
+            elif command == "whisper":
+                participant = await database.get_participant(
+                    session_id,
+                    participant_ref=str(payload.get("participant_id") or ""),
+                )
+                target_origin = str(participant.get("private_origin") or "")
+                public_text = "【主持密语】\n" + str(payload.get("text") or "")
+            if public_text:
+                delivery = await self._send_group_text(
+                    session_id,
+                    target_origin,
+                    public_text,
+                    kind=f"dm.{command}",
+                )
+            await self.broker.publish(
+                {"type": "dm", "action": command, "session_id": session_id}
+            )
+            return json_response({"ok": True, "result": result, "delivery": delivery})
+        except Exception as exc:
+            return self._handle_error(exc)
+
+
+    async def session_token_reset(self):
+        """A16：重置副本 Token 统计（不删除剧情；管理员/DM）。"""
+        try:
+            user = self._username()
+            payload = await self._payload()
+            session_id = str(payload.get("session_id") or "")
+            if not session_id:
+                raise ValueError("缺少 session_id")
+            await self._require_dm_capability(session_id, user)
+            count = await self.database.reset_token_usage(session_id, self._actor())
+            return json_response({"ok": True, "count": count})
+        except Exception as exc:
+            return self._handle_error(exc)
+
+    # ═══ A14：元素反应与通用接口 ═══════════════════════════════════════
+    async def world_element_reaction(self):
+        """解析一次「属性元素反应」（只读干跑，不写状态）。"""
+        try:
+            self._username()
+            payload = await self._payload()
+            world_ref = str(
+                payload.get("world_id") or payload.get("id") or payload.get("slug") or ""
+            )
+            world = (
+                await self.database.get_world(world_ref)
+                if world_ref
+                else payload.get("world")
+            )
+            if not isinstance(world, dict):
+                raise ValueError("请提供 world_id 或内联 world")
+            parsed = parse_elemental(world)
+            resolver = None
+            resolver_name = str(parsed.get("resolver") or "")
+            if resolver_name and self._extension_registry is not None:
+                resolver = self._extension_registry.resolve(
+                    "element_resolver", resolver_name
+                )
+            result = resolve_elemental(
+                parsed,
+                str(payload.get("source") or ""),
+                str(payload.get("target") or ""),
+                target_element=str(payload.get("target_element") or "") or None,
+                context=payload.get("context") or {},
+                resolver=resolver,
+            )
+            return json_response(
+                {
+                    "reaction": result,
+                    "table": elemental_table(world),
+                    "resolver_used": resolver_name or "table",
+                }
+            )
+        except Exception as exc:
+            return self._handle_error(exc)
+
+    async def world_element_table(self):
+        """世界元素表（元素 / 亲和 / 反应 / 解析器）。"""
+        try:
+            self._username()
+            world_id = str(request.query.get("id", "") or "")
+            if not world_id:
+                raise ValueError("缺少世界标识")
+            world = await self.database.get_world(world_id)
+            return json_response({"table": elemental_table(world)})
+        except Exception as exc:
+            return self._handle_error(exc)
+
+    async def world_schema(self):
+        """世界包 v5 自描述结构（供第三方工具生成合法世界包）。"""
+        try:
+            self._username()
+            return json_response(
+                {
+                    "schema_version": WORLD_SCHEMA_VERSION,
+                    "elemental_contract_version": parse_elemental({})["version"],
+                    "top_level_fields": [
+                        "slug",
+                        "name",
+                        "description",
+                        "system_prompt",
+                        "opening_scene",
+                        "initial_state",
+                        "characters",
+                        "world_schema_version",
+                        "minimum_plugin_version",
+                        "protocol",
+                        "rules",
+                        "elemental",
+                    ],
+                    "rules": {
+                        "character_card": {
+                            "version": "integer",
+                            "auto_approve": "boolean",
+                            "edit_requires_review": "boolean",
+                            "fields": [{"key": "string", "label": "string", "required": "boolean", "private": "boolean", "max_chars": "integer"}],
+                            "stats": {
+                                "mode": "none|manual|preset|preset_stack",
+                                "budget": "integer",
+                                "attributes": [{"key": "string", "label": "string", "minimum": "integer", "maximum": "integer", "default": "integer"}],
+                                "modifier_table": {"integer": "integer"},
+                            },
+                        },
+                        "resolution": {
+                            "mode": sorted(RESOLUTION_MODES),
+                            "dice_system": "string (registered dice system)",
+                            "allowed_attributes": ["string"],
+                        },
+                        "player_limits": {
+                            "recommended_min": "integer",
+                            "recommended_max": "integer",
+                            "minimum_start": "integer",
+                            "maximum": "integer",
+                        },
+                        "strict_choices": "boolean",
+                        "opening_choices": ["{key, text, risk, requires_check}"],
+                    },
+                    "elemental": {
+                        "elements": ["string"],
+                        "affinities": {"target_ref": {"element": "number -2..2"}},
+                        "reactions": [{"a": "element", "b": "element", "result": "string", "effect": "operation"}],
+                        "resolver": "string (registered element_resolver)",
+                    },
+                    "protocol": {
+                        "core_version": "integer",
+                        "features": {"feature_id": "version"},
+                        "required_features": ["string"],
+                        "id_aliases": {"id": "alias"},
+                        "numeric_policies": {"key": {"min": "number", "max": "number", "overflow": "reject|clamp"}},
+                    },
+                }
+            )
+        except Exception as exc:
+            return self._handle_error(exc)
+
+    async def world_export(self):
+        """导出单个世界包为可下载 JSON。"""
+        try:
+            self._username()
+            world_id = str(
+                request.query.get("id", "") or request.query.get("slug", "") or ""
+            )
+            if not world_id:
+                raise ValueError("缺少世界标识")
+            world = await self.database.get_world(world_id)
+            payload = world_import_payload(world)
+            export_dir = self.data_dir / "exports"
+            export_dir.mkdir(parents=True, exist_ok=True)
+            slug = str(world.get("slug") or "world")
+            path = next_timestamped_path(export_dir, f"{slug}.world", ".json")
+            path.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True)
+                + "\n",
+                encoding="utf-8",
+            )
+            return file_response(
+                path,
+                filename=path.name,
+                content_type="application/json",
+            )
+        except Exception as exc:
+            return self._handle_error(exc)
+
+    async def world_diff(self):
+        """两个世界包（或版本）的字段级差异。"""
+        try:
+            self._username()
+            payload = await self._payload()
+            left_id = str(payload.get("left_id") or "")
+            right_id = str(payload.get("right_id") or "")
+            left = (
+                await self.database.get_world(left_id) if left_id else payload.get("left")
+            )
+            right = (
+                await self.database.get_world(right_id) if right_id else payload.get("right")
+            )
+            if not isinstance(left, dict) or not isinstance(right, dict):
+                raise ValueError("请提供 left_id/right_id 或内联 left/right")
+            return json_response(
+                {
+                    "changes": _deep_diff(
+                        world_import_payload(left), world_import_payload(right)
+                    )
+                }
+            )
+        except Exception as exc:
+            return self._handle_error(exc)
+
+    async def world_import_batch(self):
+        """批量导入世界包（create_only / upsert）。"""
+        try:
+            self._username()
+            payload = await self._payload()
+            worlds = payload.get("worlds")
+            if not isinstance(worlds, list) or not worlds:
+                raise ValueError("worlds 必须是世界包数组")
+            if len(worlds) > 50:
+                raise ValueError("单次批量导入上限 50 个")
+            mode = str(payload.get("mode") or "create_only")
+            if mode not in {"create_only", "upsert"}:
+                raise ValueError("mode 必须是 create_only 或 upsert")
+            results: list[dict[str, Any]] = []
+            for index, world in enumerate(worlds):
+                entry: dict[str, Any] = {"index": index}
+                if not isinstance(world, dict):
+                    entry["error"] = "世界包必须是 JSON 对象"
+                    results.append(entry)
+                    continue
+                slug = str(world.get("slug") or "")
+                entry["slug"] = slug
+                try:
+                    report = inspect_world_package(world)
+                    if not report["compatible"]:
+                        messages = [
+                            item["message"]
+                            for item in report["issues"]
+                            if item["level"] == "error"
+                        ]
+                        entry["error"] = "体检未通过：" + "；".join(messages[:3])
+                        results.append(entry)
+                        continue
+                    import_payload = world_import_payload(world)
+                    existing = None
+                    try:
+                        existing = await self.database.get_world(slug)
+                    except DatabaseNotFoundError:
+                        existing = None
+                    if existing and mode == "create_only":
+                        entry["mode"] = "skipped"
+                        entry["reason"] = "slug 已存在（create_only）"
+                        results.append(entry)
+                        continue
+                    if existing:
+                        import_payload["id"] = existing["id"]
+                        import_payload["revision"] = existing["revision"]
+                    item = await self.database.save_world(import_payload, self._actor())
+                    if item.get("slug"):
+                        self._purge_rule_runtime(str(item["slug"]))
+                    entry["id"] = item.get("id")
+                    entry["mode"] = "updated" if existing else "created"
+                except Exception as exc:
+                    entry["error"] = str(exc)[:300]
+                results.append(entry)
+            await self.broker.publish({"type": "world", "action": "batch_import"})
+            imported = sum(
+                1
+                for r in results
+                if r.get("mode") in {"created", "updated"}
+            )
+            return json_response({"results": results, "imported": imported})
+        except Exception as exc:
+            return self._handle_error(exc)
+
+    async def world_simulate_batch(self):
+        """批量规则干跑（worlds/simulate 的批处理版）。"""
+        try:
+            self._username()
+            payload = await self._payload()
+            runs = payload.get("runs")
+            if not isinstance(runs, list) or not runs:
+                raise ValueError("runs 必须是数组")
+            if len(runs) > 20:
+                raise ValueError("单次批量模拟上限 20")
+            results: list[dict[str, Any]] = []
+            for index, run in enumerate(runs):
+                entry: dict[str, Any] = {"index": index}
+                if not isinstance(run, dict):
+                    entry["error"] = "run 必须是对象"
+                    results.append(entry)
+                    continue
+                try:
+                    world_ref = str(run.get("world_ref") or "")
+                    world = (
+                        await self.database.get_world(world_ref)
+                        if world_ref
+                        else run.get("world")
+                    )
+                    if not isinstance(world, dict):
+                        raise ValueError("缺少 world_ref 或 world")
+                    if _json_size(world) > _WORLD_SIMULATE_MAX_BYTES:
+                        raise ValueError("世界包过大")
+                    if _json_depth(world):
+                        raise ValueError("世界包嵌套过深")
+                    report = inspect_world_package(world)
+                    if not report["compatible"]:
+                        raise ValueError("世界包体检未通过")
+                    intent = run.get("intent")
+                    context = run.get("context", {})
+                    if not isinstance(intent, dict) or not isinstance(context, dict):
+                        raise ValueError("intent/context 必须是 JSON 对象")
+                    entry["slug"] = world.get("slug")
+                    entry["result"] = self._cached_rule_runtime(world).resolve_action_intent(
+                        intent,
+                        context,
+                        dry_run=True,
+                        world_snapshot_id=f"preview:{world.get('slug', '')}",
+                    )
+                except Exception as exc:
+                    entry["error"] = str(exc)[:300]
+                results.append(entry)
+            return json_response({"results": results})
+        except Exception as exc:
+            return self._handle_error(exc)
+
+    async def world_resolution_table(self):
+        """世界裁定表（解析模式 / 角色卡 / 能力 / 元素 / 限制）。"""
+        try:
+            self._username()
+            world_id = str(request.query.get("id", "") or "")
+            if not world_id:
+                raise ValueError("缺少世界标识")
+            world = await self.database.get_world(world_id)
+            contract: dict[str, Any] = {}
+            try:
+                from .world_contract import validate_world_contract
+
+                contract = validate_world_contract(world)
+            except Exception:
+                contract = {}
+            rules = world.get("rules") if isinstance(world.get("rules"), dict) else {}
+            return json_response(
+                {
+                    "resolution": contract.get("resolution", {}),
+                    "stats": contract.get("stats", {}),
+                    "capabilities": contract.get("capabilities", {}),
+                    "protocol": contract.get("protocol", {}),
+                    "player_limits": rules.get("player_limits", {}),
+                    "elemental": elemental_table(world),
+                    "check_modifiers": (world.get("initial_state") or {}).get(
+                        "check_modifiers", {}
+                    ),
+                }
+            )
+        except Exception as exc:
+            return self._handle_error(exc)
+
+    async def session_turn_preflight(self):
+        """行动前预检（只读）：当前行动者 / 选项 / 投票 / 等待流程。"""
+        try:
+            self._username()
+            session_id = str(request.query.get("session_id", "") or "")
+            if not session_id:
+                raise ValueError("缺少 session_id")
+            session = await self.database.get_session(session_id)
+            turn = await self.database.get_turn_status(session_id)
+            choice_set = await self.database.active_choice_set(session_id)
+            vote = await self.database.active_vote(session_id)
+            waiting_for = "vote" if vote else (
+                "choice" if choice_set else (
+                    "preparation" if session.get("state") == SESSION_PREPARING else (
+                        "admin" if session.get("state") == SESSION_PAUSED else ""
+                    )
+                )
+            )
+            options: list[dict[str, Any]] = []
+            if choice_set and isinstance(choice_set, dict):
+                raw_choices = choice_set.get("choices_json") or choice_set.get("choices") or []
+                if isinstance(raw_choices, list):
+                    for item in raw_choices:
+                        if isinstance(item, dict):
+                            options.append(
+                                {
+                                    "key": str(item.get("key") or ""),
+                                    "text": str(item.get("text") or ""),
+                                    "risk": str(item.get("risk") or ""),
+                                    "requires_check": bool(
+                                        item.get("requires_check") or item.get("check")
+                                    ),
+                                }
+                            )
+            return json_response(
+                {
+                    "session": {
+                        "id": session.get("id"),
+                        "state": session.get("state"),
+                        "turn_no": session.get("turn_no"),
+                        "revision": session.get("revision"),
+                        "world_name": session.get("world_name"),
+                    },
+                    "turn": turn,
+                    "active_choices": options,
+                    "active_vote": vote,
+                    "waiting_for": waiting_for,
+                }
+            )
+        except Exception as exc:
+            return self._handle_error(exc)
+
+    async def session_context_compile(self):
+        """上下文编译调试快照（只读，不调用模型）。"""
+        try:
+            self._username()
+            session_id = str(request.query.get("session_id", "") or "")
+            if not session_id:
+                raise ValueError("缺少 session_id")
+            session = await self.database.get_session(session_id)
+            turn = await self.database.get_turn_status(session_id)
+            events = await self.database.recent_events(session_id, 20)
+            roster = await self.database.list_roster(session_id)
+            memories = await self.database.list_memories(
+                session_id, "", 50, include_invalidated=False
+            )
+            instance = await self.database.get_instance_config(session_id)
+            snapshot = instance.get("world_snapshot") or {}
+            config = TavernConfig.from_mapping(self.plugin_config)
+            world_state = session.get("world_state") or {}
+            return json_response(
+                {
+                    "session": {
+                        "id": session.get("id"),
+                        "state": session.get("state"),
+                        "turn_no": session.get("turn_no"),
+                        "revision": session.get("revision"),
+                    },
+                    "turn": turn,
+                    "location": (world_state or {}).get("location", ""),
+                    "recent_events": [
+                        {
+                            "role": e.get("role"),
+                            "content": str(e.get("content") or "")[:200],
+                            "created_at": e.get("created_at"),
+                        }
+                        for e in events
+                        if isinstance(e, dict)
+                    ],
+                    "roster_summary": [
+                        {
+                            "character_name": r.get("character_name") or r.get("display_name"),
+                            "card_status": r.get("card_status"),
+                            "ready": bool(r.get("ready")),
+                        }
+                        for r in roster
+                        if isinstance(r, dict)
+                    ],
+                    "memory_count": len(memories),
+                    "world_snapshot": {
+                        "name": snapshot.get("name"),
+                        "slug": snapshot.get("slug"),
+                        "revision": snapshot.get("revision"),
+                    },
+                    "prompt_budget": {
+                        "recent_turns": config.recent_turns,
+                        "memory_limit": config.memory_limit,
+                        "max_input_chars": config.max_input_chars,
+                        "max_output_chars": config.max_output_chars,
+                        "temperature": config.temperature,
+                        "max_tokens": config.max_tokens,
+                        "two_phase_checks": config.two_phase_checks,
+                    },
+                }
+            )
+        except Exception as exc:
+            return self._handle_error(exc)
+
+    async def session_inject_fact(self):
+        """向受控世界状态注入一条事实（安全快照 + 审计 + 修订号）。"""
+        try:
+            self._username()
+            payload = await self._payload()
+            session_id = str(payload.get("session_id") or "")
+            fact = str(payload.get("fact") or "").strip()
+            if not session_id:
+                raise ValueError("缺少 session_id")
+            if not fact:
+                raise ValueError("fact 不能为空")
+            if len(fact) > 2000:
+                raise ValueError("fact 过长（上限 2000 字）")
+            session = await self.database.get_session(session_id)
+            world_state = dict(session.get("world_state") or {})
+            facts = list(world_state.get("facts") or [])
+            facts = [str(item) for item in facts if isinstance(item, str)]
+            added = fact not in facts
+            if added:
+                facts.append(fact)
+                world_state["facts"] = facts[-500:]
+                await self.database.save_manual_state(
+                    session_id,
+                    world_state,
+                    int(session["revision"]),
+                    self._actor(),
+                )
+            await self.database.write_audit(
+                session_id,
+                self._actor(),
+                "world.fact.inject",
+                "",
+                {"fact": fact[:200], "added": added},
+            )
+            await self.broker.publish(
+                {"type": "session", "action": "inject_fact", "session_id": session_id}
+            )
+            return json_response(
+                {
+                    "session_id": session_id,
+                    "fact": fact,
+                    "added": added,
+                    "fact_count": len(world_state.get("facts") or []),
+                }
+            )
+        except Exception as exc:
+            return self._handle_error(exc)
+
+    async def session_apply_effect(self):
+        """校验并干跑一批声明式操作（默认不落库；commit=true 仅写审计）。"""
+        try:
+            self._username()
+            payload = await self._payload()
+            session_id = str(payload.get("session_id") or "")
+            operations = payload.get("operations")
+            if not session_id:
+                raise ValueError("缺少 session_id")
+            if not isinstance(operations, list) or not operations:
+                raise ValueError("operations 必须是操作数组")
+            instance = await self.database.get_instance_config(session_id)
+            world = instance.get("world_snapshot") or {}
+            runtime = self._cached_rule_runtime(world)
+            validated = runtime.operations.validate(operations)
+            session = await self.database.get_session(session_id)
+            state = {"world": dict(session.get("world_state") or {})}
+            _, changes, narrative = runtime.operations.apply(
+                validated, state, dry_run=True
+            )
+            commit = bool(payload.get("commit"))
+            if commit:
+                summary = "；".join(
+                    str(change.get("path") or change.get("op") or "")
+                    for change in changes[:10]
+                )
+                await self.database.write_audit(
+                    session_id,
+                    self._actor(),
+                    "world.effect.dry_run_commit",
+                    "",
+                    {
+                        "operation_count": len(validated),
+                        "changes": summary[:500],
+                    },
+                )
+            return json_response(
+                {
+                    "validated": validated,
+                    "changes": changes,
+                    "narrative": narrative,
+                    "committed": commit,
+                }
+            )
+        except Exception as exc:
+            return self._handle_error(exc)
+
+    async def session_advance_clock(self):
+        """推进场景时钟（校验 + 审计 + 修订）。"""
+        try:
+            self._username()
+            payload = await self._payload()
+            session_id = str(payload.get("session_id") or "")
+            clock_id = str(payload.get("clock_id") or "")
+            segments = payload.get("segments")
+            if not session_id or not clock_id:
+                raise ValueError("缺少 session_id 或 clock_id")
+            try:
+                delta = int(segments)
+            except (TypeError, ValueError):
+                raise ValueError("segments 必须是整数")
+            result = await self.database.advance_scene_clock(
+                session_id,
+                clock_id,
+                delta,
+                self._actor(),
+                str(payload.get("note") or ""),
+            )
+            await self.broker.publish(
+                {"type": "session", "action": "advance_clock", "session_id": session_id}
+            )
+            return json_response({"clock": result})
+        except Exception as exc:
+            return self._handle_error(exc)
+
+
+    async def extensions(self):
+        """已注册扩展点清单（逐项隔离并保证响应可 JSON 序列化）。"""
+        try:
+            self._username()
+            items, errors = _extension_catalog(self._extension_registry)
+            return json_response(
+                {
+                    "kinds": items,
+                    "total": sum(len(names) for names in items.values()),
+                    "errors": errors,
+                    "partial": bool(errors),
+                }
+            )
+        except Exception as exc:
+            return self._handle_error(exc)
+
+    async def hook_events(self):
+        """可订阅事件目录与当前订阅数（逐字段容错）。"""
+        try:
+            self._username()
+            subscriptions, errors = _hook_catalog(self.hooks)
+            return json_response(
+                {
+                    "supported": _safe(lambda: sorted(HOOK_EVENTS), []),
+                    "subscriptions": subscriptions,
+                    "subscribed_count": sum(subscriptions.values()),
+                    "errors": errors,
+                    "partial": bool(errors),
+                }
+            )
+        except Exception as exc:
+            return self._handle_error(exc)
+
+    async def meta_capabilities(self):
+        """运行时自描述能力清单（逐字段容错）。"""
+        try:
+            self._username()
+            return json_response(
+                {
+                    "world_schema_version": _safe(
+                        lambda: WORLD_SCHEMA_VERSION, 0
+                    ),
+                    "elemental_contract_version": _safe(
+                        lambda: parse_elemental({})["version"], "1.0"
+                    ),
+                    "resolution_modes": _safe(
+                        lambda: sorted(RESOLUTION_MODES), []
+                    ),
+                    "operation_types": _safe(
+                        lambda: sorted(OPERATION_TYPES), []
+                    ),
+                    "persistence_scopes": _safe(
+                        lambda: sorted(PERSISTENCE_SCOPES), []
+                    ),
+                    "extension_kinds": _safe(
+                        lambda: sorted(ExtensionRegistry._KINDS), []
+                    ),
+                    "hook_events": _safe(lambda: sorted(HOOK_EVENTS), []),
+                    "platforms": _safe(capability_matrix, []),
+                    "delivery_mode": "plain_text_with_persistent_fallback",
+                }
+            )
+        except Exception as exc:
+            return self._handle_error(exc)
 
     async def events(self):
         try:

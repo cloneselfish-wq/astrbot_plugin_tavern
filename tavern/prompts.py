@@ -6,6 +6,7 @@ from typing import Any
 
 from .constants import CORE_NARRATOR_RULES
 from .world_contract import world_contract
+from .chat_experience import narrator_directives
 
 
 def _json(value: Any) -> str:
@@ -50,10 +51,23 @@ RESOLUTION_SCHEMA = {
         ],
         "relationship_ops": [
             {
-                "source": "关系发起方",
-                "target": "关系对象",
+                "source": "关系发起方（优先用插件提供的 participant_id / NPC stable_key / 名称）",
+                "target": "关系对象（同上）",
                 "dimension": "信任/亲近/敬畏/敌意等",
                 "delta": "-20 到 20 的整数",
+            }
+        ],
+        "economy_ops": [
+            {
+                "operation_id": "唯一幂等键（必填，避免重复扣款）",
+                "kind": "credit | debit | transfer | reward | fine | purchase | sale | adjust",
+                "currency_id": "世界包声明的货币稳定 ID",
+                "amount": "主单位金额",
+                "from_owner_type": "player | party | npc | shop | faction | 世界包自定义",
+                "from_owner_ref": "所有者稳定 ID",
+                "to_owner_type": "同上",
+                "to_owner_ref": "同上",
+                "reason": "变动原因（写入交易日志）",
             }
         ],
     },
@@ -182,6 +196,7 @@ _NON_NARRATIVE_RULE_KEYS = {
     "difficulty_max",
     "difficulty_min",
     "event_pool",
+    "entity_registry",
     "opening_choices",
     "option_presentation",
     "world_schema_version",
@@ -189,9 +204,13 @@ _NON_NARRATIVE_RULE_KEYS = {
 
 _CARD_ONLY_SETTING_KEYS = {
     "attribute_progression",
+    "factions",
     "origin_regions",
+    "power_systems",
     "professions",
+    "regions",
     "social_identities",
+    "species_and_identities",
 }
 
 
@@ -257,6 +276,14 @@ def system_prompt(
             "The plugin remains authoritative for costs, targets, constraints and effects.\n"
             "</available_capabilities>\n\n"
         )
+    experience = narrator_directives(world)
+    experience_block = (
+        "<multiplayer_experience>\n"
+        f"{_json(experience)}\n"
+        "</multiplayer_experience>\n\n"
+        if experience
+        else ""
+    )
     return (
         f"{CORE_NARRATOR_RULES}\n\n"
         "<world_definition>\n"
@@ -266,6 +293,7 @@ def system_prompt(
         f"{_json(compact_world_rules(world))}\n"
         "</narrative_world_rules>\n\n"
         f"{capability_block}"
+        f"{experience_block}"
         "<required_output_schema>\n"
         f"{_json(_schema_for(allow_check=effective_allow_check))}\n"
         "</required_output_schema>\n"

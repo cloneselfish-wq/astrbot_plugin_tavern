@@ -4461,6 +4461,42 @@
         "profession_base_is_immutable": true
       }
     },
+    "chat_experience": {
+      "enabled": true,
+      "character_creation": {
+        "primary": "private_code",
+        "fallbacks": ["webui_token"]
+      },
+      "multiplayer": {
+        "spotlight": "round_robin",
+        "group_decisions": "vote",
+        "absent_player": "standby"
+      },
+      "safety": {
+        "enabled": true,
+        "anonymous_pause": false,
+        "consent_reminder": "任何玩家都可以使用安全暂停；无需解释原因。",
+        "lines": [],
+        "veils": []
+      },
+      "continuity": {
+        "recap_every_turns": 5,
+        "checkpoint_every_turns": 5,
+        "unresolved_threads_limit": 10,
+        "preserve_npc_intent": true
+      },
+      "delivery": {
+        "proactive_fallback": "next_event",
+        "mention_style": "name",
+        "max_text_length": 3500
+      },
+      "dm": {
+        "allow_narrative_override": true,
+        "allow_secret_whispers": true,
+        "allow_manual_checks": true,
+        "allow_state_intervention": true
+      }
+    },
     "world_schema_version": 5,
     "capabilities": {
       "definitions": [
@@ -5842,7 +5878,7 @@
       }
     ]
   },
-  "minimum_plugin_version": "0.11.0",
+  "minimum_plugin_version": "0.12.0",
   "protocol": {
     "core_version": 5,
     "features": {
@@ -5857,7 +5893,8 @@
       "objects": "1.0",
       "resolution_methods": "1.0",
       "interaction_rules": "1.0",
-      "action_intents": "1.0"
+      "action_intents": "1.0",
+      "chat_experience": "1.0"
     }
   },
   "required_features": [
@@ -5867,6 +5904,67 @@
     "event_pipeline@>=1.0",
     "resolution_receipt@>=1.0",
     "capabilities@>=1.0",
-    "interaction_rules@>=1.0"
-  ]
+    "interaction_rules@>=1.0",
+    "chat_experience@>=1.0"
+  ],
+  "elemental": {
+    "version": "1.0",
+    "elements": [
+      "火",
+      "水",
+      "雷",
+      "冰",
+      "风",
+      "土",
+      "光",
+      "暗"
+    ],
+    "affinities": {
+      "material.consecrated_silver": {
+        "火": -1.0,
+        "暗": -1.0,
+        "雷": 0.5
+      },
+      "npc:林语者莎芮": {
+        "风": 1.0,
+        "火": -0.5
+      },
+      "item:祝圣银制短剑": {
+        "暗": -1.5,
+        "火": -1.0
+      },
+      "target.creature_tag": {
+        "火": 0.0
+      }
+    },
+    "reactions": [
+      {
+        "a": "火",
+        "b": "冰",
+        "result": "融化",
+        "effect": {
+          "op": "emit_event",
+          "text": "冰层融化，水汽升腾。"
+        }
+      },
+      {
+        "a": "水",
+        "b": "雷",
+        "result": "导电",
+        "effect": {
+          "op": "emit_event",
+          "text": "水流导电，雷光在湿润表面蔓延。"
+        }
+      },
+      {
+        "a": "火",
+        "b": "水",
+        "result": "蒸汽",
+        "effect": {
+          "op": "emit_event",
+          "text": "水火相激，蒸腾出大片白雾。"
+        }
+      }
+    ]
+  }
 }

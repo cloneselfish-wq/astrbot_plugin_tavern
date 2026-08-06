@@ -52,6 +52,9 @@ def build_runtime(
         logger=logger,
         allow_group=allow_group,
         config_lock=config_lock,
+        extensions=extensions,
+        hooks=hooks,
+        engine=engine,
     )
     return TavernRuntime(
         database=database,

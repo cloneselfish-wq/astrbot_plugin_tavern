@@ -19,6 +19,20 @@ def clean_text(value: object, *, max_chars: int) -> str:
     return text
 
 
+def truncate_text(value: object, *, max_chars: int) -> str:
+    """Strip control characters and truncate without raising (A15).
+
+    Unlike :func:`clean_text`, over-long values are silently cut at
+    ``max_chars`` instead of raising. Used where the length of a value
+    is not a hard protocol error (e.g. collecting trusted bonus sources
+    from free-form character card fields).
+    """
+    text = _CONTROL_CHARS.sub("", str(value or "")).strip()
+    if len(text) > max_chars:
+        return text[:max_chars]
+    return text
+
+
 def validate_slug(value: object) -> str:
     slug = str(value or "").strip().lower()
     if not _SAFE_SLUG.fullmatch(slug):

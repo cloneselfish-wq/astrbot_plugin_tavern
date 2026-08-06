@@ -1,12 +1,12 @@
 {
   "template_metadata": {
-    "template_bundle_version": "2.0.0",
-    "compatible_plugin_version": "0.11.0",
-    "world_schema_version": 4,
-    "character_card_template_version": 5,
-    "purpose": "复制后修改的通用手动属性世界包；本文件自身可通过 v0.11.0 世界包体检",
+    "template_bundle_version": "4.0.0",
+    "compatible_plugin_version": "0.12.0",
+    "world_schema_version": 5,
+    "character_card_template_version": 6,
+    "purpose": "复制后修改的 v0.12.0 完整 v5 世界包；本文件自身可通过严格世界包体检",
     "edit_note": "请替换世界标识、设定、预设、开场、NPC引用和初始状态，不要删除协议字段",
-    "minimum_plugin_version": "0.11.0"
+    "minimum_plugin_version": "0.12.0"
   },
   "slug": "v5-full-example",
   "name": "v5 完整模块示例",
@@ -24,6 +24,42 @@
       "recommended_max": 4,
       "minimum_start": 1,
       "maximum": 4
+    },
+    "chat_experience": {
+      "enabled": true,
+      "character_creation": {
+        "primary": "private_code",
+        "fallbacks": ["webui_token"]
+      },
+      "multiplayer": {
+        "spotlight": "round_robin",
+        "group_decisions": "vote",
+        "absent_player": "standby"
+      },
+      "safety": {
+        "enabled": true,
+        "anonymous_pause": false,
+        "consent_reminder": "任何玩家都可以安全暂停，无需说明原因。",
+        "lines": [],
+        "veils": []
+      },
+      "continuity": {
+        "recap_every_turns": 5,
+        "checkpoint_every_turns": 5,
+        "unresolved_threads_limit": 8,
+        "preserve_npc_intent": true
+      },
+      "delivery": {
+        "proactive_fallback": "next_event",
+        "mention_style": "name",
+        "max_text_length": 3500
+      },
+      "dm": {
+        "allow_narrative_override": true,
+        "allow_secret_whispers": true,
+        "allow_manual_checks": true,
+        "allow_state_intervention": true
+      }
     },
     "character_card": {
       "version": 6,
@@ -852,7 +888,7 @@
   },
   "world_schema_version": 5,
   "world_content_version": "1.0.0",
-  "minimum_plugin_version": "0.11.0",
+  "minimum_plugin_version": "0.12.0",
   "protocol": {
     "core_version": 5,
     "features": {
@@ -866,7 +902,8 @@
       "action_intents": "1.0",
       "interaction_rules": "1.0",
       "runtime_effects": "1.0",
-      "objects": "1.0"
+      "objects": "1.0",
+      "chat_experience": "1.0"
     }
   },
   "required_features": [

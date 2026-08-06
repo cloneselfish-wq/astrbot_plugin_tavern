@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="zh-CN">
+<html lang="zh-CN" data-theme="dark">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
@@ -8,7 +8,9 @@
       content="AI 酒馆专业叙事引擎管理控制台"
     />
     <title>酒馆控制台</title>
-    <link rel="stylesheet" href="./style.css?v=0.11.4" />
+    <link rel="icon" type="image/svg+xml" href="./assets/mark.svg" />
+    <link rel="stylesheet" href="./style.css?v=0.12.0" />
+
   </head>
   <body>
     <div class="ambient ambient-a"></div>
@@ -20,32 +22,58 @@
             <img src="./assets/mark.svg" alt="" />
           </div>
           <div>
-            <div class="eyebrow">ASTRBOT EXTENSION</div>
+            <div class="eyebrow">AI TAVERN</div>
             <div class="brand-title">AI 酒馆</div>
           </div>
         </div>
 
         <nav class="nav" aria-label="控制台导航">
-          <button class="nav-item is-active" data-view="dashboard">
-            <span class="nav-icon" aria-hidden="true">⌂</span>
-            <span>总览</span>
-          </button>
-          <button class="nav-item" data-view="worlds">
-            <span class="nav-icon" aria-hidden="true">◇</span>
-            <span>世界与角色</span>
-          </button>
-          <button class="nav-item" data-view="sessions">
-            <span class="nav-icon" aria-hidden="true">◉</span>
-            <span>群会话</span>
-          </button>
-          <button class="nav-item" data-view="audit">
-            <span class="nav-icon" aria-hidden="true">⌁</span>
-            <span>审计记录</span>
-          </button>
-          <button class="nav-item" data-view="settings">
-            <span class="nav-icon" aria-hidden="true">⚙</span>
-            <span>安全与设置</span>
-          </button>
+          <div class="nav-group">
+            <div class="nav-group-title">运行与监管</div>
+            <button class="nav-item is-active" data-view="dashboard">
+              <span class="nav-icon" aria-hidden="true">⌂</span>
+              <span>总览</span>
+            </button>
+            <button class="nav-item" data-view="sessions">
+              <span class="nav-icon" aria-hidden="true">◉</span>
+              <span>群会话</span>
+            </button>
+            <button class="nav-item" data-view="todo">
+              <span class="nav-icon" aria-hidden="true">☑</span>
+              <span>待办</span>
+              <span class="nav-badge" id="todo-badge" hidden>0</span>
+            </button>
+          </div>
+          <div class="nav-group">
+            <div class="nav-group-title">内容与资源</div>
+            <button class="nav-item" data-view="worlds">
+              <span class="nav-icon" aria-hidden="true">◇</span>
+              <span>世界与角色</span>
+            </button>
+            <button class="nav-item" data-view="market">
+              <span class="nav-icon" aria-hidden="true">▦</span>
+              <span>世界市场</span>
+            </button>
+            <button class="nav-item" data-view="memories">
+              <span class="nav-icon" aria-hidden="true">❖</span>
+              <span>长期记忆</span>
+            </button>
+          </div>
+          <div class="nav-group">
+            <div class="nav-group-title">系统与审计</div>
+            <button class="nav-item" data-view="audit">
+              <span class="nav-icon" aria-hidden="true">⌁</span>
+              <span>审计记录</span>
+            </button>
+            <button class="nav-item" data-view="settings">
+              <span class="nav-icon" aria-hidden="true">⚙</span>
+              <span>安全与设置</span>
+            </button>
+            <button class="nav-item" data-view="about">
+              <span class="nav-icon" aria-hidden="true">ⓘ</span>
+              <span>关于插件</span>
+            </button>
+          </div>
         </nav>
 
         <div class="sidebar-foot">
@@ -75,6 +103,15 @@
               <span class="live-dot"></span>
               <span id="live-text">连接中</span>
             </span>
+            <button
+              class="icon-button"
+              id="theme-toggle"
+              type="button"
+              aria-label="切换浅色/深色主题"
+              title="切换浅色/深色主题"
+            >
+              ☾
+            </button>
             <button class="button button-quiet" id="refresh-button">
               刷新
             </button>
@@ -101,6 +138,14 @@
             <article class="metric-card skeleton"></article>
           </div>
 
+          <details class="panel keydata-panel">
+            <summary>
+              <span>关键数据概览</span>
+              <span class="keydata-meta" id="keydata-meta"></span>
+            </summary>
+            <table class="keydata-table" id="keydata-table"></table>
+          </details>
+
           <div class="dashboard-grid">
             <article class="panel panel-span-2">
               <div class="panel-head">
@@ -120,7 +165,7 @@
               </div>
             </article>
 
-            <article class="panel">
+            <article class="panel col-4 overview-compact">
               <div class="panel-head">
                 <div>
                   <div class="eyebrow">SYSTEM INTEGRITY</div>
@@ -130,7 +175,7 @@
               <div class="integrity-list" id="integrity-list"></div>
             </article>
 
-            <article class="panel panel-span-2">
+            <article class="panel col-4 overview-compact">
               <div class="panel-head">
                 <div>
                   <div class="eyebrow">QUICK START</div>
@@ -140,7 +185,7 @@
               <div class="checklist" id="readiness-checklist"></div>
             </article>
 
-            <article class="panel command-reference">
+            <article class="panel col-4 command-reference overview-compact">
               <div class="panel-head">
                 <div>
                   <div class="eyebrow">CHAT COMMANDS</div>
@@ -164,6 +209,34 @@
           </div>
         </section>
 
+        <section class="view" data-view-panel="todo">
+          <div class="section-toolbar">
+            <div>
+              <p>建卡审核、进行中投票、活跃倒计时与运行中副本的统一入口（刷新复用顶栏）。</p>
+            </div>
+          </div>
+          <div id="todo-root">
+            <div class="empty-state compact">
+              <div class="empty-symbol">◌</div>
+              <span>正在读取待办</span>
+            </div>
+          </div>
+        </section>
+
+        <section class="view" data-view-panel="about">
+          <div class="section-toolbar">
+            <div>
+              <p>插件版本信息、核心功能、模块构成与兼容性说明。</p>
+            </div>
+          </div>
+          <div id="about-root">
+            <div class="empty-state compact">
+              <div class="empty-symbol">◌</div>
+              <span>正在读取信息</span>
+            </div>
+          </div>
+        </section>
+
         <section class="view" data-view-panel="worlds">
           <div class="section-toolbar">
             <div>
@@ -179,6 +252,9 @@
               </button>
               <button class="button button-secondary" id="import-npc-button" type="button">
                 导入常驻NPC
+              </button>
+              <button class="button button-secondary" id="world-wizard-button" type="button">
+                向导创建
               </button>
               <button class="button button-primary" id="new-world-button">
                 ＋ 新建世界
@@ -222,10 +298,33 @@
                 type="button">下一页</button>
             </div>
           </div>
-          <div class="session-group-list" id="session-card-grid"></div>
+          <div class="session-group-stack" id="session-card-grid"></div>
         </section>
 
-        <section class="view is-hidden" data-view-panel="memories" aria-hidden="true">
+        <section class="view" data-view-panel="session_detail">
+          <div class="section-toolbar session-toolbar">
+            <div>
+              <p>LIVE OPERATIONS · 副本实时仪表盘：受控世界状态、行动者、倒计时、选项、投票与事件时间线，每 5 秒自动刷新。</p>
+            </div>
+            <div class="toolbar-actions">
+              <select id="live-session-picker" aria-label="选择副本">
+                <option value="">选择副本…</option>
+              </select>
+              <button class="button button-primary" id="live-refresh-button"
+                type="button">立即刷新</button>
+              <button class="action-button" id="live-seed-quota-button"
+                type="button" title="用配置默认值给未配置配额的副本播种">播种默认配额</button>
+            </div>
+          </div>
+          <div id="live-detail-root">
+            <div class="empty-state compact">
+              <div class="empty-symbol">◔</div>
+              <span>正在读取副本实时状态</span>
+            </div>
+          </div>
+        </section>
+
+        <section class="view" data-view-panel="memories">
           <div class="section-toolbar memory-toolbar">
             <div class="field inline-field">
               <label for="memory-session-select">群会话</label>
@@ -244,6 +343,36 @@
             </button>
           </div>
           <div class="memory-list" id="memory-grid"></div>
+        </section>
+
+        <section class="view" data-view-panel="market">
+          <div class="section-toolbar session-toolbar market-toolbar">
+            <div>
+              <p>世界包社区注册表：浏览内置世界、示例与模板，导入前自动体检与冲突检查。</p>
+            </div>
+            <div class="toolbar-actions">
+              <div class="session-search">
+                <label class="sr-only" for="market-search">检索世界包</label>
+                <input id="market-search" type="search"
+                  placeholder="检索 slug、名称、描述或标签…" />
+              </div>
+              <button class="action-button" id="market-search-clear"
+                type="button">清除</button>
+            </div>
+          </div>
+          <div class="session-results-bar market-fetch-bar">
+            <div class="remote-fetch market-fetch">
+              <label class="sr-only" for="market-url-input">GitHub 直链清单地址</label>
+              <input id="market-url-input" type="url"
+                placeholder="GitHub 直链清单（…/manifest.json），回车拉取远程世界包" />
+              <button class="action-button" id="market-url-fetch"
+                type="button">拉取远程</button>
+              <button class="action-button" id="market-url-clear"
+                type="button" hidden>清空远程</button>
+            </div>
+            <span id="market-result-count" class="market-hint">共 0 个世界包</span>
+          </div>
+          <div class="session-group-list" id="market-card-grid"></div>
         </section>
 
         <section class="view" data-view-panel="audit">
@@ -817,7 +946,29 @@
       </form>
     </dialog>
 
+    <dialog class="wizard-modal" id="world-wizard-modal">
+      <form method="dialog" id="world-wizard-form">
+        <header class="wizard-head">
+          <div>
+            <div class="eyebrow" id="wizard-kicker">WORLD WIZARD</div>
+            <h2 id="wizard-title">新建世界 · 向导</h2>
+          </div>
+          <button class="icon-button" value="cancel" aria-label="关闭" type="submit">×</button>
+        </header>
+        <div class="wizard-steps" id="wizard-steps"></div>
+        <div class="wizard-body" id="wizard-body"></div>
+        <footer class="wizard-foot">
+          <div class="wizard-draft-hint" id="wizard-draft-hint"></div>
+          <div class="table-actions">
+            <button class="button button-quiet" id="wizard-prev" type="button" disabled>上一步</button>
+            <button class="button button-primary" id="wizard-next" type="button">下一步</button>
+          </div>
+        </footer>
+      </form>
+    </dialog>
+
+
     <div class="toast-region" id="toast-region" aria-live="polite"></div>
-    <script type="module" src="./app.js?v=0.11.4"></script>
+    <script type="module" src="./app.js?v=0.12.0"></script>
   </body>
 </html>

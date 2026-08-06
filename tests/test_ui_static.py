@@ -51,6 +51,7 @@ class StaticUiTests(unittest.TestCase):
         cls.style = (PAGE / "style.css").read_text(encoding="utf-8")
         cls.parser = _PageParser()
         cls.parser.feed(cls.html)
+        cls.bridge_js = (PAGE / "core" / "bridge.js").read_text(encoding="utf-8")
 
     def test_static_ids_are_unique(self) -> None:
         duplicates = {
@@ -60,12 +61,21 @@ class StaticUiTests(unittest.TestCase):
         }
         self.assertEqual(duplicates, set())
 
+    def test_extensions_panel_has_resilient_loading_and_retry_states(self) -> None:
+        self.assertIn("Promise.allSettled", self.script)
+        self.assertIn("正在读取扩展菜单", self.script)
+        self.assertIn("扩展菜单读取失败", self.script)
+        self.assertIn("暂无已注册扩展", self.script)
+        self.assertIn("about-extensions-retry", self.script)
+        self.assertIn("prefers-reduced-motion:reduce", self.style)
+
     def test_all_local_assets_exist(self) -> None:
         for asset in self.parser.assets:
             if asset.startswith(("http://", "https://", "/", "#")):
                 continue
+            resolved = (PAGE / asset.split("?", 1)[0]).resolve()
             self.assertTrue(
-                (PAGE / asset).resolve().is_file(),
+                resolved.is_file(),
                 f"missing page asset: {asset}",
             )
 
@@ -86,11 +96,13 @@ class StaticUiTests(unittest.TestCase):
         self.assertEqual(used - defined, set())
 
     def test_page_is_self_contained_and_uses_bridge(self) -> None:
-        combined = self.html + self.script + self.style
-        self.assertNotIn("https://", combined)
+        combined = self.html + self.script + self.style + self.bridge_js
+        allowed_repository = "https://github.com/horizoe10/astrbot_plugin_tavern"
+        self.assertNotIn("https://", combined.replace(allowed_repository, ""))
         self.assertNotIn("http://", combined)
-        self.assertIn("window.AstrBotPluginPage", self.script)
-        self.assertNotIn("localStorage", self.script)
+        self.assertIn("window.AstrBotPluginPage", combined)
+        # 世界向导草稿持久化（WIZARD_DRAFT_KEY）允许使用 localStorage，
+        # 且实现已对不可用环境做 try/catch 静默降级；禁止使用 cookie。
         self.assertNotIn("document.cookie", self.script)
         self.assertIn('type="module"', self.html)
 
@@ -182,6 +194,19 @@ class StaticUiTests(unittest.TestCase):
         ):
             self.assertIn(marker, self.script)
 
+
+
+    def test_local_storage_usage_is_sandbox_safe(self) -> None:
+        """AstrBot 插件页运行在沙箱 iframe，window.localStorage 访问可能抛
+        SecurityError；所有 getItem/setItem/removeItem 必须经 safeLocalStorage()。
+        """
+        self.assertIn("function safeLocalStorage", self.script)
+        direct = re.findall(
+            r"(?<![\w.?])localStorage\.(getItem|setItem|removeItem)",
+            self.script,
+        )
+        self.assertEqual(direct, [])
+
     def test_manifest_schema_and_i18n_are_consistent(self) -> None:
         metadata = yaml.safe_load(
             (ROOT / "metadata.yaml").read_text(encoding="utf-8")
@@ -200,7 +225,15 @@ class StaticUiTests(unittest.TestCase):
             schema["runtime"]["items"]["trigger_prefix"]["default"],
             "jg",
         )
-        self.assertEqual(metadata["version"], "v0.6.0")
+        self.assertEqual(metadata["version"], "0.12.0")
+        self.assertEqual(
+            metadata["repo"],
+            "https://github.com/horizoe10/astrbot_plugin_tavern",
+        )
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        self.assertIn("QQ 群 `1094220887`", readme)
+        self.assertIn("https://github.com/horizoe10/astrbot_plugin_tavern", self.script)
+        self.assertIn("<tr><td>仓库</td>", self.script)
         self.assertEqual(
             schema["model"]["items"]["provider_id"]["_special"],
             "select_provider",
@@ -232,3 +265,4 @@ class StaticUiTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

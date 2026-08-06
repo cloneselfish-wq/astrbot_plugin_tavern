@@ -63,6 +63,14 @@ class HookRegistry:
 
         return unsubscribe
 
+    def list_subscriptions(self) -> dict[str, int]:
+        """事件 → 订阅回调数（供 WebUI 扩展/事件目录展示）。"""
+        return {
+            name: len(callbacks)
+            for name, callbacks in sorted(self._hooks.items())
+            if callbacks
+        }
+
     async def dispatch(self, event: str, payload: Mapping[str, Any]) -> list[str]:
         errors: list[str] = []
         for callback in tuple(self._hooks.get(event, ())):

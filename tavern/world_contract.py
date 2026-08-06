@@ -9,6 +9,8 @@ from .event_pipeline import EVENT_PHASES, STACKING_STRATEGIES
 from .operation_engine import OPERATION_TYPES, PERSISTENCE_SCOPES
 from .operation_engine import OperationEngine
 from .capability_service import CapabilityService
+from .chat_experience import validate_chat_experience
+from .constants import PLUGIN_VERSION
 
 
 WORLD_SCHEMA_VERSION = 5
@@ -26,6 +28,7 @@ FEATURE_VERSIONS = {
     "resolution_methods": "1.0",
     "interaction_rules": "1.0",
     "action_intents": "1.0",
+    "chat_experience": "1.0",
 }
 STAT_MODES = {"none", "manual", "preset", "preset_stack"}
 RESOLUTION_MODES = {"none", "narrative", "dice_only", "attribute"}
@@ -61,7 +64,12 @@ DEFAULT_OUTCOME_POLICY = {
 
 def _version_tuple(value: Any) -> tuple[int, int, int] | None:
     text = str(value or "").strip().lower().removeprefix("v")
-    parts = text.split(".")
+    # B1-era templates briefly used a suffix-only identifier.  Continue to
+    # accept it, while current releases use the full numeric + suffix form.
+    if text in {"b1", "b2"}:
+        return (0, 12, 0)
+    numeric = text.split("-", 1)[0]
+    parts = numeric.split(".")
     if not 1 <= len(parts) <= 3 or any(not part.isdigit() for part in parts):
         return None
     return tuple((int(parts[index]) if index < len(parts) else 0) for index in range(3))
@@ -225,11 +233,43 @@ def world_contract(world: Mapping[str, Any] | None) -> dict[str, Any]:
             or rules.get("capabilities")
             or {}
         ),
+        "economy": _economy_contract(rules),
         "preset_dimensions": list(card.get("preset_dimensions") or []),
         "knowledge_boundary": dict(
             rules.get("knowledge_boundary") or {}
         ),
         "content_boundary": dict(rules.get("content_boundary") or {}),
+        "chat_experience": validate_chat_experience(source),
+    }
+
+
+def _economy_contract(rules: Mapping[str, Any]) -> dict[str, Any]:
+    """A16：解析可选经济块（不写死任何货币/汇率语义；未声明即空）。"""
+    raw = rules.get("economy")
+    if not isinstance(raw, Mapping):
+        return {"available": False, "policy": {}}
+    currencies = raw.get("currencies") or []
+    if not isinstance(currencies, list):
+        currencies = []
+    initial_wallets = raw.get("initial_wallets") or []
+    if not isinstance(initial_wallets, list):
+        initial_wallets = []
+    exchange_rules = raw.get("exchange_rules") or []
+    if not isinstance(exchange_rules, list):
+        exchange_rules = []
+    policy = raw.get("policy")
+    if not isinstance(policy, Mapping):
+        policy = {}
+    return {
+        "available": True,
+        "currencies": [dict(item) for item in currencies if isinstance(item, Mapping)],
+        "initial_wallets": [
+            dict(item) for item in initial_wallets if isinstance(item, Mapping)
+        ],
+        "exchange_rules": [
+            dict(item) for item in exchange_rules if isinstance(item, Mapping)
+        ],
+        "policy": dict(policy),
     }
 
 
@@ -237,7 +277,7 @@ def validate_world_contract(world: Mapping[str, Any]) -> dict[str, Any]:
     contract = world_contract(world)
     if contract["version"] not in SUPPORTED_WORLD_SCHEMA_VERSIONS:
         raise ValueError(
-            "v0.11.4 仅接受世界包协议 v2、v3、v4 或 v5；"
+            f"{PLUGIN_VERSION} 仅接受世界包协议 v2、v3、v4 或 v5；"
             f"当前为 v{contract['version']}"
         )
     stats = contract["stats"]
@@ -385,6 +425,13 @@ def validate_world_contract(world: Mapping[str, Any]) -> dict[str, Any]:
                     for source_ref in transition.get("from", []):
                         registry.resolve(source_ref, "capability")
                     operation_engine.validate(transition.get("operations", []))
+        experience_module = module_value(world, "chat_experience", {})
+        if isinstance(experience_module, Mapping) and experience_module:
+            if "chat_experience" not in declared:
+                raise ValueError(
+                    "声明 chat_experience 数据时必须启用对应功能版本"
+                )
+            validate_chat_experience(world)
     resolution_mode = contract["resolution"]["mode"]
     if mode == "none" and resolution_mode == "attribute":
         raise ValueError("无数值世界不能启用 attribute 属性检定")

@@ -1,6 +1,7 @@
 """Domain repository methods extracted from the SQLite store."""
 
 from ..database_support import *
+from ..constants import PLUGIN_VERSION
 
 
 class AdminRepositoryMixin:
@@ -12,7 +13,17 @@ class AdminRepositoryMixin:
         actor_id: str,
         *,
         duration_seconds: int | None = None,
+        permissions: list[str] | None = None,
+        expiry_kind: str = "none",
+        expires_round: int = 0,
+        auto_restore: bool = False,
+        source: str = "player",
     ) -> dict[str, Any]:
+        """A16：授予角色代控权。
+
+        source=player 仅允许本人授权；source=admin/dm 允许管理员/人工 DM
+        强制托管（由上层权限判断决定）。
+        """
         return await self._run(
             self._grant_delegation,
             session_id,
@@ -20,6 +31,11 @@ class AdminRepositoryMixin:
             delegate_user_id,
             actor_id,
             duration_seconds,
+            list(permissions or []) if permissions else None,
+            str(expiry_kind or "none").strip(),
+            int(expires_round or 0),
+            bool(auto_restore),
+            str(source or "player").strip(),
         )
 
     def _grant_delegation(
@@ -29,19 +45,26 @@ class AdminRepositoryMixin:
         delegate_user_id: str,
         actor_id: str,
         duration_seconds: int | None,
+        permissions: list[str] | None,
+        expiry_kind: str,
+        expires_round: int,
+        auto_restore: bool,
+        source: str,
     ) -> dict[str, Any]:
         owner_user_id = validate_platform_id(
-            owner_user_id,
-            label="角色拥有者 ID",
+            owner_user_id, label="角色拥有者 ID"
         )
         delegate_user_id = validate_platform_id(
-            delegate_user_id,
-            label="代控用户 ID",
+            delegate_user_id, label="代控用户 ID"
         )
-        if actor_id != owner_user_id:
+        if source not in {"player", "admin", "dm", "system"}:
+            raise ValueError("托管来源必须为 player/admin/dm/system")
+        if source == "player" and actor_id != owner_user_id:
             raise PermissionError("代控只能由角色本人授权")
         if owner_user_id == delegate_user_id:
             raise ValueError("不能把自己的角色授权给自己")
+        if expiry_kind not in {"none", "datetime", "round", "instance"}:
+            raise ValueError("托管期限类型必须为 none/datetime/round/instance")
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
@@ -59,7 +82,7 @@ class AdminRepositoryMixin:
                     PARTICIPANT_ARCHIVED,
                 }:
                     raise ValueError("已经退场的角色不能授权代控")
-                if duration_seconds is None:
+                if duration_seconds is None and expiry_kind == "datetime":
                     config = connection.execute(
                         """
                         SELECT time_rules_json FROM instance_configs
@@ -84,15 +107,29 @@ class AdminRepositoryMixin:
                     (now, participant["id"]),
                 )
                 grant_id = new_id("delegation")
-                expires_at = deadline_after(duration_seconds)
-                permissions = ["choose", "reroll", "skip"]
+                expires_at = (
+                    deadline_after(duration_seconds)
+                    if expiry_kind == "datetime" and duration_seconds
+                    else ""
+                )
+                default_permissions = ["choose", "reroll", "skip"]
+                granted = permissions if permissions else default_permissions
+                allowed = {
+                    "choose", "vote", "free_action", "check", "combat",
+                    "view_private", "modify_temp", "modify_permanent",
+                }
+                granted = [p for p in granted if p in allowed]
+                if not granted:
+                    raise ValueError("托管权限列表为空或包含非法权限")
                 connection.execute(
                     """
                     INSERT INTO delegation_grants(
                         id, session_id, participant_id, owner_user_id,
                         delegate_user_id, permissions_json, status,
-                        expires_at, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)
+                        expires_at, created_at, updated_at,
+                        expiry_kind, expires_round, auto_restore, source,
+                        granted_by
+                    ) VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         grant_id,
@@ -100,10 +137,15 @@ class AdminRepositoryMixin:
                         participant["id"],
                         owner_user_id,
                         delegate_user_id,
-                        json_dump(permissions),
+                        json_dump(granted),
                         expires_at,
                         now,
                         now,
+                        expiry_kind,
+                        expires_round,
+                        int(auto_restore),
+                        source,
+                        actor_id,
                     ),
                 )
                 self._insert_audit(
@@ -114,8 +156,14 @@ class AdminRepositoryMixin:
                     grant_id,
                     {
                         "participant_id": participant["id"],
+                        "owner_user_id": owner_user_id,
                         "delegate_user_id": delegate_user_id,
+                        "permissions": granted,
+                        "expiry_kind": expiry_kind,
                         "expires_at": expires_at,
+                        "expires_round": expires_round,
+                        "auto_restore": auto_restore,
+                        "source": source,
                     },
                 )
                 row = connection.execute(
@@ -125,8 +173,7 @@ class AdminRepositoryMixin:
                 connection.execute("COMMIT")
                 result = dict(row)
                 result["permissions"] = json_load(
-                    result.pop("permissions_json"),
-                    [],
+                    result.pop("permissions_json"), []
                 )
                 return result
             except Exception:
@@ -138,12 +185,15 @@ class AdminRepositoryMixin:
         session_id: str,
         owner_user_id: str,
         actor_id: str,
+        *,
+        force: bool = False,
     ) -> int:
         return await self._run(
             self._revoke_delegation,
             session_id,
             owner_user_id,
             actor_id,
+            bool(force),
         )
 
     def _revoke_delegation(
@@ -151,8 +201,9 @@ class AdminRepositoryMixin:
         session_id: str,
         owner_user_id: str,
         actor_id: str,
+        force: bool,
     ) -> int:
-        if actor_id != owner_user_id:
+        if actor_id != owner_user_id and not force:
             raise PermissionError("代控只能由角色本人撤销")
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -173,6 +224,50 @@ class AdminRepositoryMixin:
                     actor_id,
                     "delegation.revoke",
                     owner_user_id,
+                    {"count": cursor.rowcount, "forced": force},
+                )
+                connection.execute("COMMIT")
+                return cursor.rowcount
+            except Exception:
+                connection.execute("ROLLBACK")
+                raise
+
+    async def restore_owner_control(
+        self,
+        session_id: str,
+        participant_id: str,
+        actor_id: str,
+    ) -> int:
+        """管理员/DM 恢复角色原玩家控制权（撤销全部活跃委托）。"""
+        return await self._run(
+            self._restore_owner_control, session_id, participant_id, actor_id
+        )
+
+    def _restore_owner_control(
+        self,
+        session_id: str,
+        participant_id: str,
+        actor_id: str,
+    ) -> int:
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                now = utc_now()
+                cursor = connection.execute(
+                    """
+                    UPDATE delegation_grants
+                    SET status = 'revoked', updated_at = ?
+                    WHERE session_id = ? AND participant_id = ?
+                      AND status = 'active'
+                    """,
+                    (now, session_id, participant_id),
+                )
+                self._insert_audit(
+                    connection,
+                    session_id,
+                    actor_id,
+                    "delegation.restore_owner",
+                    participant_id,
                     {"count": cursor.rowcount},
                 )
                 connection.execute("COMMIT")
@@ -180,6 +275,112 @@ class AdminRepositoryMixin:
             except Exception:
                 connection.execute("ROLLBACK")
                 raise
+
+    async def active_controller(
+        self,
+        session_id: str,
+        participant_id: str,
+    ) -> dict[str, Any]:
+        return await self._run(
+            self._active_controller, session_id, participant_id
+        )
+
+    def _active_controller(
+        self,
+        session_id: str,
+        participant_id: str,
+    ) -> dict[str, Any]:
+        with self._connect() as connection:
+            participant = connection.execute(
+                """
+                SELECT group_user_id, display_name, character_name
+                FROM participants WHERE id = ? AND session_id = ?
+                """,
+                (participant_id, session_id),
+            ).fetchone()
+            if not participant:
+                raise DatabaseNotFoundError("回合角色不存在")
+            self._expire_delegations_locked(connection, session_id, utc_now())
+            row = connection.execute(
+                """
+                SELECT * FROM delegation_grants
+                WHERE participant_id = ? AND status = 'active'
+                ORDER BY created_at DESC LIMIT 1
+                """,
+                (participant_id,),
+            ).fetchone()
+        owner_user_id = str(participant["group_user_id"] or "")
+        if not row:
+            return {
+                "participant_id": participant_id,
+                "owner_user_id": owner_user_id,
+                "controller_user_id": owner_user_id,
+                "mode": "owner",
+                "grant": None,
+            }
+        return {
+            "participant_id": participant_id,
+            "owner_user_id": owner_user_id,
+            "controller_user_id": str(row["delegate_user_id"]),
+            "mode": "delegate",
+            "grant": dict(row),
+        }
+
+    async def expire_due_delegations(self, session_id: str) -> int:
+        return await self._run(self._expire_due_delegations, session_id)
+
+    def _expire_due_delegations(self, session_id: str) -> int:
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                count = self._expire_delegations_locked(
+                    connection, session_id, utc_now()
+                )
+                connection.execute("COMMIT")
+            except Exception:
+                connection.execute("ROLLBACK")
+                raise
+        return count
+
+    def _expire_delegations_locked(
+        self,
+        connection: Any,
+        session_id: str,
+        now: str,
+    ) -> int:
+        cursor = connection.execute(
+            """
+            UPDATE delegation_grants SET status = 'expired', updated_at = ?
+            WHERE session_id = ? AND status = 'active'
+              AND expires_at <> '' AND expires_at <= ?
+            """,
+            (now, session_id, now),
+        )
+        return cursor.rowcount
+
+    async def list_delegations(self, session_id: str) -> list[dict[str, Any]]:
+        return await self._run(self._list_delegations, session_id)
+
+    def _list_delegations(self, session_id: str) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT d.*, pt.display_name AS participant_display,
+                       pt.character_name AS participant_character
+                FROM delegation_grants d
+                JOIN participants pt ON pt.id = d.participant_id
+                WHERE d.session_id = ?
+                ORDER BY d.created_at DESC
+                """,
+                (session_id,),
+            ).fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["permissions"] = json_load(item.pop("permissions_json"), [])
+            result.append(item)
+        return result
+
 
     async def authorize_participant_control(
         self,
@@ -226,6 +427,20 @@ class AdminRepositoryMixin:
                     (now, participant_id, now),
                 )
                 owner_id = str(participant["group_user_id"])
+                # A16：回合级托管到期判定（expiry_kind=round）
+                current_round = 0
+                session_row = connection.execute(
+                    "SELECT world_state_json FROM sessions WHERE id = ?",
+                    (session_id,),
+                ).fetchone()
+                if session_row:
+                    stored = json_load(session_row["world_state_json"], {})
+                    try:
+                        current_round = int(
+                            turn_state_from_world(stored).get("round_no") or 0
+                        )
+                    except Exception:
+                        current_round = 0
                 if controller_user_id == owner_id:
                     connection.execute(
                         """
@@ -236,7 +451,13 @@ class AdminRepositoryMixin:
                         (now, participant_id),
                     )
                     connection.execute("COMMIT")
-                    return {"authorized": True, "mode": "owner"}
+                    return {
+                        "authorized": True,
+                        "mode": "owner",
+                        "controller_user_id": controller_user_id,
+                        "source": "owner",
+                        "forced": False,
+                    }
                 rows = connection.execute(
                     """
                     SELECT * FROM delegation_grants
@@ -246,15 +467,33 @@ class AdminRepositoryMixin:
                     """,
                     (participant_id, controller_user_id),
                 ).fetchall()
-                authorized = any(
-                    permission in json_load(row["permissions_json"], [])
-                    for row in rows
+                active_rows = []
+                for row in rows:
+                    if (
+                        str(row["expiry_kind"]) == "round"
+                        and int(row["expires_round"] or 0) > 0
+                        and current_round > int(row["expires_round"])
+                    ):
+                        continue
+                    active_rows.append(row)
+                active_row = active_rows[0] if active_rows else None
+                authorized = bool(
+                    active_row
+                    and permission
+                    in json_load(active_row["permissions_json"], [])
                 )
                 connection.execute("COMMIT")
                 return {
                     "authorized": authorized,
                     "mode": "delegate" if authorized else "none",
                     "owner_user_id": owner_id,
+                    "controller_user_id": controller_user_id,
+                    "source": str(active_row["source"]) if active_row else "",
+                    "forced": bool(
+                        active_row
+                        and str(active_row["source"]) in {"admin", "dm"}
+                    ),
+                    "expiry_kind": str(active_row["expiry_kind"]) if active_row else "",
                 }
             except Exception:
                 connection.execute("ROLLBACK")
@@ -512,6 +751,27 @@ class AdminRepositoryMixin:
     async def overview(self) -> dict[str, Any]:
         return await self._run(self._overview)
 
+    async def global_token_usage(self, window_seconds: int) -> int:
+        """全副本滚动窗口内的已完成 Token 用量合计（0.12.0-A3）。"""
+        return await self._run(self._global_token_usage, window_seconds)
+
+    def _global_token_usage(self, window_seconds: int) -> int:
+        cutoff = (
+            datetime.now(timezone.utc)
+            - timedelta(seconds=max(1, int(window_seconds)))
+        ).isoformat(timespec="seconds")
+        with self._connect() as connection:
+            return int(
+                connection.execute(
+                    """
+                    SELECT COALESCE(SUM(total_tokens), 0)
+                    FROM token_usage
+                    WHERE status = 'completed' AND created_at >= ?
+                    """,
+                    (cutoff,),
+                ).fetchone()[0]
+            )
+
     def _overview(self) -> dict[str, Any]:
         with self._connect() as connection:
             counts = {
@@ -554,6 +814,9 @@ class AdminRepositoryMixin:
                     WHERE status = 'active'
                     """
                 ).fetchone()[0],
+                "pending_deliveries": connection.execute(
+                    "SELECT COUNT(*) FROM notification_outbox WHERE status='pending'"
+                ).fetchone()[0],
             }
             catalog_size = (
                 self.path.stat().st_size if self.path.exists() else 0
@@ -576,6 +839,57 @@ class AdminRepositoryMixin:
                     """
                 ).fetchone()[0]
             )
+            # 0.12.0-A3：近 24h 审计统计（供总览「完整性 / 群内指令」）。
+            cutoff_24h = (
+                datetime.now(timezone.utc) - timedelta(hours=24)
+            ).isoformat(timespec="seconds")
+            audit_total = int(
+                connection.execute(
+                    """
+                    SELECT COUNT(*) FROM audit_logs WHERE created_at >= ?
+                    """,
+                    (cutoff_24h,),
+                ).fetchone()[0]
+            )
+            audit_failed = int(
+                connection.execute(
+                    """
+                    SELECT COUNT(*) FROM audit_logs
+                    WHERE created_at >= ?
+                      AND (
+                          action LIKE '%.failed'
+                          OR action LIKE '%denied'
+                          OR detail_json LIKE '%"error"%'
+                      )
+                    """,
+                    (cutoff_24h,),
+                ).fetchone()[0]
+            )
+            relaxed_hits = int(
+                connection.execute(
+                    """
+                    SELECT COUNT(*) FROM audit_logs
+                    WHERE created_at >= ? AND action LIKE '%relaxed%'
+                    """,
+                    (cutoff_24h,),
+                ).fetchone()[0]
+            )
+            invalid_transitions = int(
+                connection.execute(
+                    """
+                    SELECT COUNT(*) FROM audit_logs
+                    WHERE created_at >= ?
+                      AND action IN ('state.failed', 'transition.failed')
+                    """,
+                    (cutoff_24h,),
+                ).fetchone()[0]
+            )
+            database_ok = bool(
+                connection.execute(
+                    "PRAGMA quick_check"
+                ).fetchone()[0]
+                == "ok"
+            ) and storage_errors == 0
             return {
                 "counts": counts,
                 "database_size": catalog_size + instance_size,
@@ -584,13 +898,29 @@ class AdminRepositoryMixin:
                 "instance_database_count": len(instance_paths),
                 "storage_errors": storage_errors,
                 "schema_version": DATABASE_SCHEMA_VERSION,
-                "database_ok": bool(
-                    connection.execute(
-                        "PRAGMA quick_check"
-                    ).fetchone()[0]
-                    == "ok"
-                )
-                and storage_errors == 0,
+                "database_ok": database_ok,
+                # 0.12.0-A3：运行完整性（WebUI 总览「运行完整性」卡片）。
+                "integrity": {
+                    "schema_version": DATABASE_SCHEMA_VERSION,
+                    "database_ok": database_ok,
+                    "storage_errors": storage_errors,
+                    "recovery_points": counts["snapshots"],
+                    "failed_operations_24h": audit_failed,
+                    "invalid_transitions_24h": invalid_transitions,
+                },
+                # 0.12.0-A3：群内指令统计（WebUI 总览「群内指令」卡片）。
+                "commands": {
+                    "jg_enabled": True,
+                    "command_count_24h": audit_total,
+                    "success_rate": (
+                        round(
+                            (1 - audit_failed / audit_total) * 100, 1
+                        )
+                        if audit_total
+                        else 100.0
+                    ),
+                    "relaxed_parse_hits_24h": relaxed_hits,
+                },
             }
 
     async def cleanup(self, audit_retention_days: int) -> dict[str, int]:
@@ -825,9 +1155,9 @@ class AdminRepositoryMixin:
             schema_version = int(bundle.get("schema_version", 0))
         except (TypeError, ValueError) as exc:
             raise ValueError("备份数据库版本无效") from exc
-        if schema_version not in {9, DATABASE_SCHEMA_VERSION}:
+        if schema_version not in {9, 10, 11, DATABASE_SCHEMA_VERSION}:
             raise ValueError(
-                f"v0.11.x 仅接受 Schema 9 或 {DATABASE_SCHEMA_VERSION} 备份；"
+                f"v{PLUGIN_VERSION} 仅接受 Schema 9—{DATABASE_SCHEMA_VERSION} 备份；"
                 f"当前为 Schema {schema_version}，请先升级插件或使用兼容版本转换"
             )
         data = bundle.get("data")

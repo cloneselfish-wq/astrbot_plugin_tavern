@@ -342,40 +342,136 @@
       }
     }
   },
-  "rich": {
-    "description": "富卡片（第二档真·结构化卡片）",
+  "token_quota": {
+    "description": "Token 配额默认值",
     "type": "object",
     "items": {
       "enabled": {
-        "description": "启用富卡片",
+        "description": "默认启用配额",
         "type": "bool",
-        "hint": "开启后，若当前 QQ 适配器支持（如安装 astrbot_plugin_qq_restapi），回合选项/剧情/状态等消息会以 Ark/Markdown 卡片呈现；不支持时自动退回 emoji 纯文本，不影响功能。",
-        "default": true
+        "hint": "开启后，新建副本若尚未配置任何 Token 配额策略，将按本组默认值自动创建策略；关闭则保持“无配额不限量”的运行时行为（已有策略不受影响）。",
+        "default": false
       },
-      "mode": {
-        "description": "卡片渲染方式",
-        "type": "string",
-        "options": [
-          "auto",
-          "markdown",
-          "ark",
-          "text"
-        ],
-        "labels": [
-          "自动降级（推荐）",
-          "仅 Markdown 卡片",
-          "仅 Ark 模板卡片",
-          "纯文本（关闭卡片）"
-        ],
-        "hint": "auto：优先 Markdown 通用模板，未配置 AJ 模板 ID 时自动降级到 Ark 模板 24，再不行退回 emoji 纯文本。markdown 需在 qq_restapi 适配器中填写 markdown_aj_template_id；ark 使用模板 24（文本+缩略图），主动消息免申请；text 等价于关闭。",
-        "default": "auto"
+      "window_seconds": {
+        "description": "滚动窗口秒数",
+        "type": "int",
+        "hint": "配额统计的时间窗口，例如 86400 = 按最近 24 小时累计。",
+        "default": 86400
       },
-      "title": {
-        "description": "卡片标题（留空＝自动跟随世界）",
+      "token_limit": {
+        "description": "窗口内 Token 上限",
+        "type": "int",
+        "hint": "窗口内累计消耗超过该值将拒绝新的模型请求。",
+        "default": 400000
+      }
+    }
+  },
+  "world_market": {
+    "description": "世界包远程市场",
+    "type": "object",
+    "items": {
+      "enabled": {
+        "description": "启用远程市场",
+        "type": "bool",
+        "hint": "开启后，市场视图会在本地条目之外合并拉取 remote_manifest_url 指向的远程条目。启用即代表你信任该注册表源（内容审核由注册表维护方负责，插件只做技术校验）。默认关闭。",
+        "default": false
+      },
+      "remote_manifest_url": {
+        "description": "远程清单地址",
         "type": "string",
-        "hint": "显示在 Ark 卡片标题栏。留空时自动取当前群正在游玩的副本与世界名（形如「🍺 AI 酒馆 · 阿尔维恩：灰烬王冠」），开馆/换本后自动更新；填写后则固定使用该文案。",
+        "hint": "指向一个 JSON 清单文件（条目含 package_key/url/sha256/size 等字段），如 https://raw.githubusercontent.com/{owner}/{repo}/{ref}/worlds/manifest.json。",
         "default": ""
+      },
+      "allowed_hosts": {
+        "description": "允许的远程主机白名单",
+        "type": "list",
+        "hint": "仅允许从这些主机拉取（防 SSRF）；留空则仅允许 raw.githubusercontent.com、github.com、objects.githubusercontent.com、codeload.github.com。",
+        "default": [
+          "raw.githubusercontent.com",
+          "github.com",
+          "objects.githubusercontent.com",
+          "codeload.github.com"
+        ]
+      },
+      "cache_ttl_seconds": {
+        "description": "清单缓存秒数",
+        "type": "int",
+        "hint": "清单与已拉取包的缓存时长，缓解 GitHub raw 限流。",
+        "default": 600
+      },
+      "max_package_bytes": {
+        "description": "单包体积上限",
+        "type": "int",
+        "hint": "超过该字节数的远程世界包将被拒绝（防滥用）。",
+        "default": 2000000
+      },
+      "verify_sha256": {
+        "description": "强制哈希校验",
+        "type": "bool",
+        "hint": "开启后，远程包必须匹配清单中的 sha256 才会被接受。",
+        "default": true
+      }
+    }
+  },
+  "auto_backup": {
+    "description": "自动备份",
+    "type": "object",
+    "items": {
+      "enabled": {
+        "description": "启用自动备份",
+        "type": "bool",
+        "hint": "开启后，插件按固定间隔在 data_dir/exports 下导出完整备份 ZIP（bundle.json + catalog.sqlite3 + 各群独立存档），并只保留最近 keep_count 份。默认关闭。",
+        "default": false
+      },
+      "interval_hours": {
+        "description": "备份间隔（小时）",
+        "type": "float",
+        "hint": "两次自动备份的最小间隔，最小 1 小时，最大 720 小时（30 天）。",
+        "default": 24
+      },
+      "keep_count": {
+        "description": "保留份数",
+        "type": "int",
+        "hint": "自动备份只保留最近 N 份，更早的会被自动清理（手动导出的备份不受影响）。",
+        "default": 7
+      }
+    }
+  },
+  "webhook": {
+    "description": "Webhook 事件通知",
+    "type": "object",
+    "items": {
+      "enabled": {
+        "description": "启用 Webhook 通知",
+        "type": "bool",
+        "hint": "开启后，酒馆内部事件（回合/世界/会话/备份等）会以 POST JSON 推送到下方地址，默认全部事件；可填写 events 过滤。",
+        "default": false
+      },
+      "urls": {
+        "description": "推送地址列表",
+        "type": "list",
+        "hint": "每个地址都会收到事件推送。仅支持 HTTPS/HTTP POST，请求体为 JSON 对象，包含 event / at / data 字段。",
+        "default": []
+      },
+      "secret": {
+        "description": "签名密钥（可选）",
+        "type": "string",
+        "hint": "填写后，每次推送会附加 X-Tavern-Signature: sha256=<hex> 头（对请求体做 HMAC-SHA256），接收方可据此校验来源。",
+        "default": ""
+      },
+      "events": {
+        "description": "事件类型过滤（留空＝全部）",
+        "type": "list",
+        "hint": "只推送列出的 type（如 turn、session、world、backup、settings、vote、inspiration、character）；留空推送全部。",
+        "default": []
+      },
+      "timeout_seconds": {
+        "description": "推送超时（秒）",
+        "type": "float",
+        "hint": "单次推送的最长等待时间，默认 10 秒。",
+        "default": 10
       }
     }
   }
+
 }

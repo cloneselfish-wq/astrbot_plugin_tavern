@@ -328,6 +328,11 @@ class SessionRepositoryMixin:
                 OR instr(lower(s.id), ?) > 0
                 OR instr(lower(w.name), ?) > 0
                 OR instr(lower(w.slug), ?) > 0
+                OR EXISTS (
+                    SELECT 1 FROM events e
+                    WHERE e.session_id = s.id
+                      AND instr(lower(e.content), ?) > 0
+                )
             )
         """
         where = ""
@@ -338,10 +343,10 @@ class SessionRepositoryMixin:
                 parameters.extend([normalized_query] * 3)
             elif normalized_scope == "story":
                 where = f"WHERE {story_match}"
-                parameters.extend([normalized_query] * 5)
+                parameters.extend([normalized_query] * 6)
             else:
                 where = f"WHERE ({group_match} OR {story_match})"
-                parameters.extend([normalized_query] * 8)
+                parameters.extend([normalized_query] * 9)
         with self._connect() as connection:
             base = f"""
                 FROM sessions s
@@ -2820,6 +2825,18 @@ class SessionRepositoryMixin:
                             existing["id"],
                         ),
                     )
+                    # A16.3：玩家资料里的角色名/显示名同步到 participants，
+                    # 避免「回合与行动者(players)」与「阵容/行动卡(participants)」名字不一致。
+                    if character_name:
+                        connection.execute(
+                            """
+                            UPDATE participants SET
+                                character_name = ?, display_name = ?,
+                                updated_at = ?
+                            WHERE session_id = ? AND group_user_id = ?
+                            """,
+                            (character_name, display_name, now, session_id, user_id),
+                        )
                     player_id = existing["id"]
                     action = "player.update"
                 else:

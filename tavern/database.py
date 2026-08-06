@@ -12,6 +12,9 @@ from .repositories import (
     TimerRepositoryMixin,
     AdminRepositoryMixin,
     ControlRepositoryMixin,
+    EconomyRepositoryMixin,
+    DmRepositoryMixin,
+    DeliveryRepositoryMixin,
 )
 
 
@@ -23,6 +26,13 @@ class _ManagedConnection:
     此前连接要等 GC 才释放句柄，Windows 下临时目录清理（测试/备份）
     会因文件仍被占用抛 PermissionError；这里在退出时显式 commit/rollback
     并 close，行为等价且确定性关闭。
+
+    注意（v0.12.0 评估记录）：曾尝试按线程复用连接以降低连接创建开销，
+    但任何“复用窗口”都会让连接在操作结束后短暂滞留，导致 Windows 下
+    临时目录 / 备份文件清理（严格模式）抛 WinError 32——这是 0.9.x
+    引入「退出即关闭」的原始原因，属于承重设计。因此保持即开即关，
+    性能优化改为：列表聚合用单条 SQL 汇总（见 dashboard_sessions）、
+    RuleRuntime 缓存补强，以及提供 execute_read/execute_write 统一访问层。
     """
 
     __slots__ = ("connection",)
@@ -61,6 +71,9 @@ class TavernDatabase(
     TimerRepositoryMixin,
     AdminRepositoryMixin,
     ControlRepositoryMixin,
+    EconomyRepositoryMixin,
+    DmRepositoryMixin,
+    DeliveryRepositoryMixin,
 ):
     """SQLite persistence with short, explicit transactions.
 
@@ -135,6 +148,9 @@ class TavernDatabase(
         "_disable_dm_mode",
         "_commit_dm_beat",
         "_resolve_action_intent",
+        "_queue_delivery",
+        "_finish_delivery",
+        "_dismiss_delivery",
     }
     _ALL_SESSION_MUTATIONS = {
         "_process_due_timers",
@@ -201,6 +217,44 @@ class TavernDatabase(
         connection.execute("PRAGMA journal_mode = WAL")
         connection.execute("PRAGMA synchronous = NORMAL")
         return _ManagedConnection(connection)
+
+    # ── v0.12.0（结构优化）：统一 DB 访问助手 ──────────────────────────
+    # 新增模块（dashboard / world_market 等只读聚合）优先使用这两个助手，
+    # 收敛「自行 with self._connect()」的散点写法；语义与既有 _run 一致：
+    # 在 worker 线程执行、读操作退出即提交（无副作用）、写操作显式提交。
+    async def execute_read(
+        self,
+        sql: str,
+        params: Sequence[Any] = (),
+    ) -> list[dict[str, Any]]:
+        """执行只读 SQL 并返回 dict 行列表（在 worker 线程中运行）。"""
+        return await self._run(self._execute_read, sql, tuple(params))
+
+    def _execute_read(
+        self,
+        sql: str,
+        params: Sequence[Any],
+    ) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(str(sql), params).fetchall()
+        return [dict(row) for row in rows]
+
+    async def execute_write(
+        self,
+        sql: str,
+        params: Sequence[Any] = (),
+    ) -> int:
+        """执行单条写入 SQL（隐式提交）；返回受影响行数。"""
+        return await self._run(self._execute_write, sql, tuple(params))
+
+    def _execute_write(
+        self,
+        sql: str,
+        params: Sequence[Any],
+    ) -> int:
+        with self._connect() as connection:
+            cursor = connection.execute(str(sql), params)
+        return cursor.rowcount if cursor.rowcount >= 0 else 0
 
     def _initialize(self) -> None:
         with self._schema_lock:
@@ -1178,9 +1232,141 @@ class TavernDatabase(
                         updated_at TEXT NOT NULL,
                         UNIQUE(scope_type, scope_id)
                     );
+
+                    -- v0.12.0-A16：经济系统（可选，世界包 economy 块驱动）
+                    CREATE TABLE IF NOT EXISTS economy_state (
+                        session_id TEXT PRIMARY KEY
+                            REFERENCES sessions(id) ON DELETE CASCADE,
+                        enabled INTEGER NOT NULL DEFAULT 0,
+                        updated_at TEXT NOT NULL
+                    );
+
+                    CREATE TABLE IF NOT EXISTS economy_currencies (
+                        id TEXT PRIMARY KEY,
+                        session_id TEXT NOT NULL
+                            REFERENCES sessions(id) ON DELETE CASCADE,
+                        currency_id TEXT NOT NULL,
+                        name TEXT NOT NULL,
+                        short_name TEXT NOT NULL DEFAULT '',
+                        icon TEXT NOT NULL DEFAULT '',
+                        description TEXT NOT NULL DEFAULT '',
+                        precision INTEGER NOT NULL DEFAULT 0,
+                        allow_negative INTEGER NOT NULL DEFAULT 0,
+                        transferable INTEGER NOT NULL DEFAULT 1,
+                        exchangeable INTEGER NOT NULL DEFAULT 0,
+                        public INTEGER NOT NULL DEFAULT 1,
+                        sort_order INTEGER NOT NULL DEFAULT 0,
+                        extensions_json TEXT NOT NULL DEFAULT '{}',
+                        created_at TEXT NOT NULL,
+                        UNIQUE(session_id, currency_id)
+                    );
+
+                    CREATE TABLE IF NOT EXISTS economy_wallets (
+                        id TEXT PRIMARY KEY,
+                        session_id TEXT NOT NULL
+                            REFERENCES sessions(id) ON DELETE CASCADE,
+                        owner_type TEXT NOT NULL,
+                        owner_ref TEXT NOT NULL,
+                        currency_id TEXT NOT NULL,
+                        balance INTEGER NOT NULL DEFAULT 0,
+                        updated_at TEXT NOT NULL,
+                        UNIQUE(session_id, owner_type, owner_ref, currency_id)
+                    );
+
+                    CREATE TABLE IF NOT EXISTS economy_transactions (
+                        id TEXT PRIMARY KEY,
+                        session_id TEXT NOT NULL
+                            REFERENCES sessions(id) ON DELETE CASCADE,
+                        operation_id TEXT NOT NULL UNIQUE,
+                        kind TEXT NOT NULL,
+                        currency_id TEXT NOT NULL,
+                        from_owner_type TEXT NOT NULL DEFAULT '',
+                        from_owner_ref TEXT NOT NULL DEFAULT '',
+                        to_owner_type TEXT NOT NULL DEFAULT '',
+                        to_owner_ref TEXT NOT NULL DEFAULT '',
+                        amount INTEGER NOT NULL DEFAULT 0,
+                        balance_before INTEGER NOT NULL DEFAULT 0,
+                        balance_after INTEGER NOT NULL DEFAULT 0,
+                        reason TEXT NOT NULL DEFAULT '',
+                        source TEXT NOT NULL DEFAULT '',
+                        actor_id TEXT NOT NULL DEFAULT '',
+                        target_ref TEXT NOT NULL DEFAULT '',
+                        event_id TEXT NOT NULL DEFAULT '',
+                        status TEXT NOT NULL DEFAULT 'committed'
+                            CHECK(status IN (
+                                'committed', 'reverted', 'failed'
+                            )),
+                        created_at TEXT NOT NULL
+                    );
+
+                    CREATE TABLE IF NOT EXISTS economy_exchange_rules (
+                        id TEXT PRIMARY KEY,
+                        session_id TEXT NOT NULL
+                            REFERENCES sessions(id) ON DELETE CASCADE,
+                        from_currency TEXT NOT NULL,
+                        to_currency TEXT NOT NULL,
+                        rate_numerator INTEGER NOT NULL DEFAULT 1,
+                        rate_denominator INTEGER NOT NULL DEFAULT 1,
+                        fee INTEGER NOT NULL DEFAULT 0,
+                        enabled INTEGER NOT NULL DEFAULT 1,
+                        created_at TEXT NOT NULL,
+                        UNIQUE(session_id, from_currency, to_currency)
+                    );
+
+                    CREATE INDEX IF NOT EXISTS idx_economy_tx_session_time
+                    ON economy_transactions(session_id, created_at DESC);
+
+                    -- v0.12.0-A16：统一行动操作上下文（幂等/审计/重放防护）
+                    CREATE TABLE IF NOT EXISTS action_operations (
+                        id TEXT PRIMARY KEY,
+                        session_id TEXT NOT NULL
+                            REFERENCES sessions(id) ON DELETE CASCADE,
+                        kind TEXT NOT NULL,
+                        actor_id TEXT NOT NULL DEFAULT '',
+                        operator_id TEXT NOT NULL DEFAULT '',
+                        context_json TEXT NOT NULL DEFAULT '{}',
+                        status TEXT NOT NULL DEFAULT 'pending'
+                            CHECK(status IN (
+                                'pending', 'committed', 'failed', 'cancelled'
+                            )),
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL
+                    );
+
+                    CREATE INDEX IF NOT EXISTS idx_action_ops_session
+                    ON action_operations(session_id, created_at DESC);
+
+                    -- B1：跨平台主动通知失败后的持久化补偿队列。
+                    CREATE TABLE IF NOT EXISTS notification_outbox (
+                        id TEXT PRIMARY KEY,
+                        session_id TEXT NOT NULL DEFAULT '',
+                        origin TEXT NOT NULL,
+                        kind TEXT NOT NULL DEFAULT 'notice',
+                        text TEXT NOT NULL,
+                        status TEXT NOT NULL DEFAULT 'pending'
+                            CHECK(status IN (
+                                'pending', 'sent', 'delivered_on_reply',
+                                'dismissed'
+                            )),
+                        attempts INTEGER NOT NULL DEFAULT 0,
+                        last_error TEXT NOT NULL DEFAULT '',
+                        dedupe_key TEXT NOT NULL DEFAULT '',
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL,
+                        delivered_at TEXT NOT NULL DEFAULT ''
+                    );
+
+                    CREATE INDEX IF NOT EXISTS idx_notification_outbox_pending
+                    ON notification_outbox(status, origin, created_at);
+
+                    CREATE UNIQUE INDEX IF NOT EXISTS idx_notification_outbox_dedupe
+                    ON notification_outbox(dedupe_key)
+                    WHERE dedupe_key <> '' AND status = 'pending';
                     """
                 )
                 self._migrate_schema_10(connection)
+                self._migrate_schema_11(connection)
+                self._migrate_schema_12(connection)
                 connection.execute(
                     """
                     INSERT INTO tavern_meta(key, value)
@@ -1263,6 +1449,70 @@ class TavernDatabase(
                 """,
                 (json_dump({"worlds": mapping}), utc_now()),
             )
+
+    def _migrate_schema_11(self, connection: sqlite3.Connection) -> None:
+        """v0.12.0-A16：托管/代操作与输入锁字段（幂等 ALTER）。"""
+        def _columns(table: str) -> set[str]:
+            return {
+                str(row["name"])
+                for row in connection.execute(
+                    f"PRAGMA table_info({table})"
+                ).fetchall()
+            }
+
+        delegation = _columns("delegation_grants")
+        for column, ddl in (
+            ("expiry_kind", "expiry_kind TEXT NOT NULL DEFAULT 'none'"),
+            ("expires_round", "expires_round INTEGER NOT NULL DEFAULT 0"),
+            ("auto_restore", "auto_restore INTEGER NOT NULL DEFAULT 0"),
+            ("source", "source TEXT NOT NULL DEFAULT 'player'"),
+            ("granted_by", "granted_by TEXT NOT NULL DEFAULT ''"),
+        ):
+            if column not in delegation:
+                connection.execute(
+                    f"ALTER TABLE delegation_grants ADD COLUMN {ddl}"
+                )
+
+        participants = _columns("participants")
+        if "action_locked" not in participants:
+            connection.execute(
+                "ALTER TABLE participants ADD COLUMN action_locked "
+                "INTEGER NOT NULL DEFAULT 0"
+            )
+
+        sessions = _columns("sessions")
+        if "input_locked" not in sessions:
+            connection.execute(
+                "ALTER TABLE sessions ADD COLUMN input_locked "
+                "INTEGER NOT NULL DEFAULT 0"
+            )
+
+    def _migrate_schema_12(self, connection: sqlite3.Connection) -> None:
+        """B1：记录通知补偿队列迁移，不改写任何旧存档内容。"""
+
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO migration_receipts(
+                id, migration_type, source_version, target_version,
+                receipt_json, created_at
+            ) VALUES ('schema_11_to_12', 'database_schema', '11', '12', ?, ?)
+            """,
+            (
+                json_dump(
+                    {
+                        "added": ["notification_outbox"],
+                        "preserved": [
+                            "sessions",
+                            "participants",
+                            "worlds",
+                            "snapshots",
+                            "story_storage",
+                        ],
+                    }
+                ),
+                utc_now(),
+            ),
+        )
 
     @staticmethod
     def _stable_key(value: Any, fallback: str = "") -> str:

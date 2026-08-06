@@ -1,4 +1,4 @@
-# AI 酒馆 v0.9.3 架构与扩展接口
+# AI 酒馆 v0.12.0 架构与扩展接口
 
 ## 依赖方向
 
@@ -32,6 +32,7 @@ tavern/narrative_quality.py   通用叙事质量检查
 tavern/emergency.py           管理员精确急救
 tavern/diagnostics.py         脱敏诊断
 tavern/web_console.py         管理台 API 路由
+tavern/backup_service.py      完整备份导出与自动备份清理（A15）
 pages/console/core/           前端桥接、DOM 与状态
 pages/console/                页面入口与统一设计系统
 ```
@@ -92,19 +93,21 @@ from tavern.api import (
 - `narrative_guard`
 - `summary_provider`
 - `admin_action`
+- `element_resolver`（v0.12.0-A14 起：元素反应自定义解析，异常回退声明式表）
 
 骰制提供器使用关键字参数 `check`、`check_type`、`actors` 与 `outcome_policy`，返回 `DiceResult` 或可等待的 `DiceResult`。世界包声明的 `resolution.dice_system` 必须能在开演前解析到已注册提供器；不存在时拒绝开演，不会回退到 D20。
 
-可观察事件：
+可观察事件（完整目录见 `tavern/api/hooks.py` 的 `SUPPORTED_EVENTS`）：
 
-- `session_created`
-- `character_approved`
-- `turn_started`
-- `option_selected`
-- `check_completed`
-- `vote_completed`
-- `story_generated`
-- `session_finished`
+- `session_created` / `character_approved` / `turn_started` / `option_selected`
+- `check_completed` / `vote_completed` / `story_generated` / `session_finished`
+- `dm_mode_enabled` / `dm_mode_disabled` / `dm_assigned` / `dm_directive_saved`
+- `dm_beat_started` / `dm_beat_committed` / `dm_narrative_appended`
+- `dm_handoff_started` / `dm_handoff_completed` / `dm_taken_over`
+- `preset_dimension_selected` / `preset_selection_rejected`
+- `character_presets_resolved` / `knowledge_boundary_resolved`
+- `content_boundary_resolved` / `knowledge_access_denied`
+- `content_boundary_blocked`
 
 钩子只在权威状态提交后收到脱离 SQL 连接的字典副本。钩子异常被隔离，单个异步回调最多执行 2 秒，不会回滚或长期阻塞主流程。
 

@@ -657,7 +657,12 @@ class CharacterRepositoryMixin:
             action_payload["reminder_interval_seconds"] = (
                 CARD_COMPLETION_REMINDER_INTERVAL_SECONDS
             )
-        elif reminder_interval is not None:
+        elif countdown_enabled:
+            reminder_interval = (
+                reminder_interval
+                if reminder_interval is not None
+                else TIMER_REMINDER_INTERVAL_SECONDS
+            )
             action_payload["reminder_interval_seconds"] = reminder_interval
         deadline = (
             now_dt + timedelta(seconds=timeout_seconds)
@@ -1878,15 +1883,17 @@ class CharacterRepositoryMixin:
                                 f"{definition['label']}必须选择 {minimum}—{maximum} 项"
                             )
                         continue
-                    clean_card_field(
-                        fields[key],
-                        label=str(definition["label"]),
-                        max_chars=(
-                            12
-                            if key in {"name", "code"}
-                            else int(definition["max_chars"])
-                        ),
-                    )
+                    if key in {"name", "code"}:
+                        clean_card_field(
+                            fields[key],
+                            label=str(definition["label"]),
+                            max_chars=12,
+                        )
+                    elif len(str(fields[key])) > int(definition["max_chars"]):
+                        raise ValueError(
+                            f"{definition['label']}超过 "
+                            f"{int(definition['max_chars'])} 字符上限"
+                        )
                 missing = [
                     item["label"]
                     for item in template["fields"]
@@ -2689,6 +2696,25 @@ class CharacterRepositoryMixin:
                             row["candidate_version_id"],
                             str(profile.get("name") or "")[:12],
                             str(profile.get("code") or "")[:12],
+                            now,
+                            row["participant_id"],
+                        ),
+                    )
+
+                    # A15：角色卡修订（含改名/改卡）批准后同步 players 表，
+                    # 避免回合状态（get_turn_status 读取 players.character_name）
+                    # 与行动选项（读取 participants.character_name）显示不一致。
+                    connection.execute(
+                        """
+                        UPDATE players SET character_name = ?,
+                            profile_json = ?, updated_at = ?
+                        WHERE id = (
+                            SELECT player_id FROM participants WHERE id = ?
+                        )
+                        """,
+                        (
+                            str(profile.get("name") or "")[:12],
+                            json_dump(profile),
                             now,
                             row["participant_id"],
                         ),

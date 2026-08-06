@@ -197,6 +197,15 @@ class TimerRepositoryMixin:
                             timer["status"] == "paused"
                             and payload.get("paused_by_policy")
                         ):
+                            if (
+                                current_type != "card_completion"
+                                and not payload.get(
+                                    "reminder_interval_seconds"
+                                )
+                            ):
+                                payload["reminder_interval_seconds"] = (
+                                    TIMER_REMINDER_INTERVAL_SECONDS
+                                )
                             seconds_left = max(
                                 1,
                                 int(timer["remaining_seconds"] or 1),
@@ -999,6 +1008,42 @@ class TimerRepositoryMixin:
                     payload = json_load(row["action_json"], {})
                     if not isinstance(payload, Mapping):
                         payload = {}
+                    # A24 以前的建卡计时器没有显式保存提醒开关和间隔。
+                    # 首次轮询时迁移为 120 秒节奏，但不立即发送已经过时的
+                    # 旧提醒，避免升级瞬间刷屏。
+                    if (
+                        row["timer_type"] == "card_completion"
+                        and (
+                            "reminder_enabled" not in payload
+                            or "reminder_interval_seconds" not in payload
+                        )
+                    ):
+                        migrated_payload = dict(payload)
+                        migrated_payload["reminder_enabled"] = True
+                        migrated_payload["reminder_interval_seconds"] = (
+                            CARD_COMPLETION_REMINDER_INTERVAL_SECONDS
+                        )
+                        next_at = min(
+                            deadline,
+                            now_dt + timedelta(
+                                seconds=CARD_COMPLETION_REMINDER_INTERVAL_SECONDS
+                            ),
+                        )
+                        connection.execute(
+                            """
+                            UPDATE timer_instances
+                            SET action_json = ?, reminder_at = ?,
+                                reminder_sent = 0, updated_at = ?
+                            WHERE id = ?
+                            """,
+                            (
+                                json_dump(migrated_payload),
+                                next_at.isoformat(timespec="seconds"),
+                                now,
+                                row["id"],
+                            ),
+                        )
+                        continue
                     reminder_interval = timer_reminder_interval(
                         row["timer_type"],
                         payload,
@@ -1049,6 +1094,9 @@ class TimerRepositoryMixin:
                         1,
                         int((deadline - now_dt).total_seconds()),
                     )
+                    next_reminder = now_dt + timedelta(
+                        seconds=max(1, int(reminder_interval or 1))
+                    )
                     connection.execute(
                         """
                         UPDATE timer_instances
@@ -1056,7 +1104,15 @@ class TimerRepositoryMixin:
                             updated_at = ?
                         WHERE id = ?
                         """,
-                        ("", now, row["id"]),
+                        (
+                            (
+                                next_reminder.isoformat(timespec="seconds")
+                                if next_reminder < deadline
+                                else ""
+                            ),
+                            now,
+                            row["id"],
+                        ),
                     )
                     notifications.append(
                         {
