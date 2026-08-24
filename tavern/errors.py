@@ -1,4 +1,4 @@
-"""统一错误分类与失败上报助手（v0.12.0）。
+"""统一错误分类与失败上报助手（v1.0-A2）。
 
 背景（对应规划 F2）：历史上「空 message_id 误判发送成功」「定时器轮询异常被静默
 吞掉」等问题，根源在于关键路径缺少统一的失败语义：哪些是预期内可恢复的瞬时错误、
@@ -47,7 +47,7 @@ __all__ = [
 
 
 class TavernError(Exception):
-    """AI 酒馆插件错误基类。"""
+    """321开团插件错误基类。"""
 
 
 class TransientError(TavernError):
@@ -126,7 +126,7 @@ def report_failure(
     details = "".join(
         f" {key}={value}" for key, value in (context or {}).items()
     )
-    message = f"AI 酒馆 {stage}.{operation} 失败（{category}）"
+    message = f"321开团 {stage}.{operation} 失败（{category}）"
     if details:
         message += f" [{details.strip()}]"
     if level == logging.INFO:

@@ -33,10 +33,6 @@ def _text(value: Any, limit: int = 120) -> str:
     return str(value or "").strip()[:limit]
 
 
-def _short_id(ref: str) -> str:
-    return _text(ref)[:8]
-
-
 def strip_prefix(ref: str) -> str:
     return _PREFIX_RE.sub("", str(ref or "").strip(), count=1)
 
@@ -74,8 +70,7 @@ def fallback_name(ref: str) -> str:
         return "已删除实体"
     if _readable_name(text):
         return text
-    short = _short_id(text)
-    return f"未知实体({short})"
+    return "未知实体"
 
 
 def build_participant_labels(roster: Any) -> dict[str, dict[str, Any]]:
@@ -86,15 +81,14 @@ def build_participant_labels(roster: Any) -> dict[str, dict[str, Any]]:
             continue
         pid = _text(item.get("id"))
         user_id = _text(item.get("group_user_id") or item.get("user_id"))
-        name = _text(
-            item.get("character_name") or item.get("display_name")
-        ) or user_id
+        name = _text(item.get("character_name") or item.get("display_name"))
         if not pid and not user_id:
             continue
         info = {
             "id": pid,
             "type": "participant",
-            "name": name,
+            "name": name or "角色资料读取失败",
+            "problem": "participant.public_name_missing" if not name else "",
             "source": "participant",
             "deleted": False,
             "departed": _text(item.get("participation_status")) not in {"", "active"},
@@ -138,7 +132,8 @@ def build_entity_labels(
         info = {
             "id": sid,
             "type": "npc",
-            "name": name or sid,
+            "name": name or "角色资料读取失败",
+            "problem": "character.public_name_missing" if not name else "",
             "source": "session_npc",
             "deleted": _text(item.get("lifecycle_status")) == "archived",
             "departed": False,
@@ -215,7 +210,6 @@ def resolve_label(
         "name": fallback_name(text),
         "type": "unknown",
         "id": text,
-        "short_id": _short_id(text),
         "fallback": True,
     }
 

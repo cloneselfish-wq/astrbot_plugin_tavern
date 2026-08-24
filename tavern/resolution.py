@@ -8,6 +8,22 @@ from dataclasses import dataclass
 from typing import Any, Mapping
 
 from .lifecycle import normalize_choices
+from .contracts.narrative_document import (
+    NarrativeDocument,
+    narrative_document_to_plain_text,
+    repair_narrative_document,
+)
+
+
+_RESOLUTION_FIELDS = frozenset(
+    {
+        "mode", "narrative_document", "check", "state_patch",
+        "item_ops", "economy_ops", "memories", "next_choices",
+        "group_decision", "return_progress", "entity_mentions",
+        "npc_ops", "clock_ops", "ledger_ops", "status_ops",
+        "fate_consequences", "assist_ops", "director_note",
+    }
+)
 
 
 def _text(value: Any, maximum: int = 1000) -> str:
@@ -106,19 +122,38 @@ class Resolution:
     clock_ops: tuple[dict[str, Any], ...]
     ledger_ops: tuple[dict[str, Any], ...]
     status_ops: tuple[dict[str, Any], ...]
+    fate_consequences: tuple[dict[str, Any], ...]
     assist_ops: tuple[dict[str, Any], ...]
+    entity_mentions: tuple[dict[str, str], ...]
     director_note: str
     raw: dict[str, Any]
+    narrative_document: NarrativeDocument | None = None
 
 
-def validate_resolution(payload: Mapping[str, Any]) -> Resolution:
+def validate_resolution(
+    payload: Mapping[str, Any],
+    *,
+    narrative_mode: str = "",
+    narrative_options: Mapping[str, Any] | None = None,
+) -> Resolution:
+    unknown = sorted(str(key) for key in payload if key not in _RESOLUTION_FIELDS)
+    if unknown:
+        raise ValueError(f"模型裁定包含未知字段：{unknown[0]}")
     mode = str(payload.get("mode", "resolve")).strip().lower()
     if mode not in {"resolve", "check"}:
         raise ValueError("mode 必须为 resolve 或 check")
 
-    narrative = _text(payload.get("narrative"), 6000)
+    raw_patch = payload.get("state_patch", {})
+    state_patch = (
+        dict(raw_patch) if isinstance(raw_patch, Mapping) else {}
+    )
+    document: NarrativeDocument | None = None
+    narrative = ""
     check: CheckRequest | None = None
     if mode == "check":
+        raw_document = payload.get("narrative_document")
+        if raw_document is not None and raw_document != "":
+            raise ValueError("check 模式 narrative_document 必须为 null")
         raw_check = payload.get("check")
         if not isinstance(raw_check, Mapping):
             raise ValueError("check 模式缺少检定参数")
@@ -197,13 +232,25 @@ def validate_resolution(payload: Mapping[str, Any]) -> Resolution:
                 10,
             ),
         )
-    elif not narrative:
-        raise ValueError("resolve 模式必须包含 narrative")
-
-    raw_patch = payload.get("state_patch", {})
-    state_patch = (
-        dict(raw_patch) if isinstance(raw_patch, Mapping) else {}
-    )
+    else:
+        raw_document = payload.get("narrative_document")
+        if not isinstance(raw_document, Mapping):
+            raise ValueError("resolve 模式必须包含 narrative_document")
+        expected_mode = str(narrative_mode or "").strip().lower()
+        if expected_mode and str(raw_document.get("mode") or "").lower() != expected_mode:
+            raise ValueError("NarrativeDocument.mode 与副本正文模式不一致")
+        # A raw model patch cannot establish whether a scene/time value really
+        # changed because the current world state is not available here.  The
+        # engine performs that continuity check after relationship aliases are
+        # normalized and the current state is known.  Treating mere field
+        # presence as a transition would reject an idempotent location/time
+        # patch and encourage the model to invent a transition block.
+        options = dict(narrative_options or {})
+        # Model JSON first passes the fact-preserving structural repair gate.
+        # It may normalize nullable placeholders and optional presentation
+        # metadata, but it cannot invent a dialogue speaker or alter facts.
+        document = repair_narrative_document(raw_document, **options)
+        narrative = narrative_document_to_plain_text(document)
 
     memories: list[dict[str, Any]] = []
     raw_memories = payload.get("memories", [])
@@ -476,6 +523,38 @@ def validate_resolution(payload: Mapping[str, Any]) -> Resolution:
                 }
             )
 
+    fate_consequences: list[dict[str, Any]] = []
+    raw_fate_consequences = payload.get("fate_consequences")
+    if isinstance(raw_fate_consequences, list):
+        for item in raw_fate_consequences[:16]:
+            if not isinstance(item, Mapping):
+                continue
+            severity = str(item.get("severity") or "").strip().lower()
+            target_actor = _text(item.get("target_actor"), 128)
+            source = _text(item.get("source"), 160)
+            reason = _text(item.get("reason"), 500)
+            if severity not in {"serious", "lethal"}:
+                raise ValueError(
+                    "fate_consequences.severity 必须为 serious 或 lethal"
+                )
+            if not target_actor or not source or not reason:
+                raise ValueError(
+                    "结构化后果必须包含 target_actor、source 与 reason"
+                )
+            alternatives_shown = bool(item.get("alternatives_shown"))
+            if severity == "lethal" and not alternatives_shown:
+                raise ValueError("致命后果必须先向玩家展示替代方案")
+            fate_consequences.append(
+                {
+                    "severity": severity,
+                    "target_actor": target_actor,
+                    "source": source,
+                    "reason": reason,
+                    "rescue_window": bool(item.get("rescue_window")),
+                    "alternatives_shown": alternatives_shown,
+                }
+            )
+
     assist_ops: list[dict[str, Any]] = []
     raw_assist_ops = payload.get("assist_ops")
     if isinstance(raw_assist_ops, list):
@@ -500,6 +579,8 @@ def validate_resolution(payload: Mapping[str, Any]) -> Resolution:
                 }
             )
 
+    from .copy.story_entities import normalize_entity_mentions
+
     return Resolution(
         mode=mode,
         narrative=narrative,
@@ -513,9 +594,14 @@ def validate_resolution(payload: Mapping[str, Any]) -> Resolution:
         clock_ops=tuple(clock_ops),
         ledger_ops=tuple(ledger_ops),
         status_ops=tuple(status_ops),
+        fate_consequences=tuple(fate_consequences),
         assist_ops=tuple(assist_ops),
+        entity_mentions=normalize_entity_mentions(
+            payload.get("entity_mentions")
+        ),
         director_note=_text(payload.get("director_note"), 500),
         raw=dict(payload),
+        narrative_document=document,
     )
 
 
@@ -733,22 +819,58 @@ def roll_opposed_check(
     )
 
 
+def _fact_text(value: Any) -> str:
+    """提取事实的正文文本（兼容字符串与带元数据的对象）。"""
+    if isinstance(value, Mapping):
+        return _text(
+            value.get("text")
+            or value.get("content")
+            or value.get("fact")
+            or value.get("summary")
+        )
+    return _text(value)
+
+
 def _list_of_text(value: Any, maximum_items: int, maximum_chars: int) -> list[str]:
     if not isinstance(value, list):
         return []
     result: list[str] = []
     for item in value[:maximum_items]:
-        text = _text(item, maximum_chars)
+        text = _fact_text(item)[:maximum_chars]
         if text and text not in result:
             result.append(text)
     return result
 
 
+def _append_fact(
+    facts: list[Any],
+    text: str,
+    *,
+    fact_round: int,
+    fact_time: str,
+) -> None:
+    """追加一条事实；带回合/时间元数据，仍兼容纯字符串旧事实。"""
+    entry: Any = text
+    if fact_round or fact_time:
+        entry = {"text": text, "round_no": int(fact_round or 0)}
+        if fact_time:
+            entry["time"] = str(fact_time)
+    if not any(_fact_text(item) == text for item in facts):
+        facts.append(entry)
+
+
 def apply_state_patch(
     current: Mapping[str, Any] | None,
     patch: Mapping[str, Any] | None,
+    *,
+    fact_round: int = 0,
+    fact_time: str = "",
 ) -> dict[str, Any]:
-    """Apply only explicitly allowed world-state fields."""
+    """Apply only explicitly allowed world-state fields.
+
+    1.0.0-A5：模型新增的事实（facts_add）会带上当前回合与游戏时间元数据，
+    供“受控世界状态 → 已知事实”展示“第 N 轮 / 时间”；旧字符串事实保持兼容。
+    """
 
     state: dict[str, Any] = deepcopy(dict(current or {}))
     update = dict(patch or {})
@@ -763,41 +885,17 @@ def apply_state_patch(
             if value:
                 state[key] = value
 
-    facts = _list_of_text(state.get("facts"), 200, 400)
+    facts = list(state.get("facts")) if isinstance(state.get("facts"), list) else []
     remove = set(_list_of_text(update.get("facts_remove"), 30, 400))
     if remove:
-        facts = [fact for fact in facts if fact not in remove]
+        facts = [fact for fact in facts if _fact_text(fact) not in remove]
     for fact in _list_of_text(update.get("facts_add"), 30, 400):
-        if fact not in facts:
-            facts.append(fact)
+        _append_fact(facts, fact, fact_round=fact_round, fact_time=fact_time)
     state["facts"] = facts[-200:]
 
-    inventory = state.get("inventory")
-    inventory = deepcopy(inventory) if isinstance(inventory, dict) else {}
-    operations = update.get("inventory_ops")
-    if isinstance(operations, list):
-        for operation in operations[:30]:
-            if not isinstance(operation, Mapping):
-                continue
-            owner = _text(operation.get("owner_id"), 128)
-            item = _text(operation.get("item"), 100)
-            if not owner or not item:
-                continue
-            delta = _int(operation.get("delta"), 0, -100, 100)
-            owner_items = inventory.get(owner)
-            owner_items = (
-                deepcopy(owner_items)
-                if isinstance(owner_items, dict)
-                else {}
-            )
-            old_value = _int(owner_items.get(item), 0, 0, 1_000_000)
-            new_value = max(0, old_value + delta)
-            if new_value:
-                owner_items[item] = new_value
-            else:
-                owner_items.pop(item, None)
-            inventory[owner] = owner_items
-    state["inventory"] = inventory
+    # C6：玩家物品只存在于 item_instances。world_state.inventory 和
+    # state_patch.inventory_ops 均已删除，防止模型状态补丁形成第二权威。
+    state.pop("inventory", None)
 
     relationships = state.get("relationships")
     relationships = (

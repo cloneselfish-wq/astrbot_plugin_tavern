@@ -4,7 +4,7 @@
     "type": "object",
     "items": {
       "admin_ids": {
-        "description": "酒馆管理员 ID",
+        "description": "开团管理员 ID",
         "type": "list",
         "hint": "只有这些真实平台用户 ID 可以开启、暂停、继续、关闭、读档或回滚。请填写字符串形式的 QQ 号/OpenID。",
         "default": []
@@ -12,7 +12,7 @@
       "allowed_group_ids": {
         "description": "允许群 ID",
         "type": "list",
-        "hint": "可留空；已配置的管理员首次在目标群发送 /酒馆 开启 时会自动识别并加入，然后显示副本选择。也可手动填写群号或平台群 OpenID。",
+        "hint": "可留空；已配置的管理员首次在目标群发送 /团 开启 时会自动识别并加入，然后显示副本选择。也可手动填写群号或平台群 OpenID。",
         "default": []
       },
       "require_group_whitelist": {
@@ -45,35 +45,35 @@
     "type": "object",
     "items": {
       "provider_id": {
-        "description": "固定聊天模型",
+        "description": "叙事模型",
         "type": "string",
         "_special": "select_provider",
         "hint": "留空则使用当前群会话所选模型。",
         "default": ""
       },
       "fallback_provider_1_id": {
-        "description": "备用聊天模型 1",
+        "description": "第一备用模型",
         "type": "string",
         "_special": "select_provider",
         "hint": "主模型不可用时首先尝试；留空可跳过。",
         "default": ""
       },
       "fallback_provider_2_id": {
-        "description": "备用聊天模型 2",
+        "description": "第二备用模型",
         "type": "string",
         "_special": "select_provider",
         "hint": "按编号依次回退；留空可跳过。",
         "default": ""
       },
       "fallback_provider_3_id": {
-        "description": "备用聊天模型 3",
+        "description": "第三备用模型",
         "type": "string",
         "_special": "select_provider",
         "hint": "按编号依次回退；留空可跳过。",
         "default": ""
       },
       "fallback_provider_4_id": {
-        "description": "备用聊天模型 4",
+        "description": "第四备用模型",
         "type": "string",
         "_special": "select_provider",
         "hint": "按编号依次回退；留空可跳过。",
@@ -83,7 +83,7 @@
         "description": "图片转述模型",
         "type": "string",
         "_special": "select_provider",
-        "hint": "用于把带 jg 前缀消息中的图片转成客观文字，再交给叙事模型。留空时带图行动会被明确拒绝。",
+        "hint": "用于把带 t 前缀消息中的图片转成客观文字，再交给叙事模型。留空时带图行动会被明确拒绝。",
         "default": ""
       },
       "image_caption_prompt": {
@@ -94,7 +94,7 @@
       "max_images_per_turn": {
         "description": "单回合图片上限",
         "type": "int",
-        "hint": "只读取带 jg 前缀的当前玩家消息中的图片。",
+        "hint": "只读取带 t 前缀的当前玩家消息中的图片。",
         "default": 4
       },
       "temperature": {
@@ -106,7 +106,7 @@
       "max_tokens": {
         "description": "单次最大输出 Tokens",
         "type": "int",
-        "hint": "100—300 字故事与四组选项通常不需要过高输出上限。",
+        "hint": "故事正文遵循副本当前的极简、平衡或史诗模式；史诗模式需要为正文、对白与选项保留更充足的输出空间。",
         "default": 1400
       },
       "request_timeout_seconds": {
@@ -116,6 +116,28 @@
       },
       "json_repair_attempts": {
         "description": "结构修复次数",
+        "type": "int",
+        "default": 1
+      },
+      "generation_budget_total_seconds": {
+        "description": "整回合生成预算秒数",
+        "type": "int",
+        "hint": "包含正文、结构修复、备用模型切换与最终校验；达到预算后不会提交半个回合。",
+        "default": 180
+      },
+      "generation_budget_max_calls": {
+        "description": "整回合最大模型调用次数",
+        "type": "int",
+        "default": 3
+      },
+      "generation_budget_per_call_seconds": {
+        "description": "单次调用超时上限",
+        "type": "int",
+        "hint": "每个叙事模型的独立等待上限；超时后才会尝试已配置的备用模型。",
+        "default": 90
+      },
+      "generation_budget_max_fallbacks": {
+        "description": "整回合备用模型切换上限",
         "type": "int",
         "default": 1
       }
@@ -128,14 +150,14 @@
       "default_world_slug": {
         "description": "新副本默认世界包",
         "type": "string",
-        "hint": "仅作为控制台建立副本时的初始选择；/酒馆 开启 仍要求明确选择副本。",
-        "default": "aelvion-ashen-crown"
+        "hint": "仅作为控制台建立副本时的初始选择；/团 开启 仍要求明确选择副本。",
+        "default": "thirteenth-seat-new-era"
       },
       "trigger_prefix": {
         "description": "剧情触发前缀",
         "type": "string",
-        "hint": "默认 jg。只有“前缀 + 空格 + 内容”才会进入酒馆叙事与记忆，普通群聊完全忽略。",
-        "default": "jg"
+        "hint": "默认 t。只有“前缀 + 空格 + 内容”才会进入开团叙事与记忆，普通群聊完全忽略。",
+        "default": "t"
       },
       "two_phase_checks": {
         "description": "严格两阶段行动判定",
@@ -154,9 +176,15 @@
         "default": 5000
       },
       "enforce_mobile_output": {
-        "description": "手机端短篇输出约束",
+        "description": "手机端可读输出约束",
         "type": "bool",
-        "hint": "开启后每回合故事正文强制 100—300 字，每个选项（含括号）最多 50 字。",
+        "hint": "开启后故事正文仍严格遵循副本当前的极简、平衡或史诗模式；每个选项（含括号）最多 50 字并保持当前行动者一致。",
+        "default": true
+      },
+      "qqbot_markdown_enabled": {
+        "description": "自定义平台实例使用 Markdown",
+        "type": "bool",
+        "hint": "全部 BOT 文本先生成 Markdown 标准载荷；已知 QQ 官方实时回复、事件分段、主动通知和队列续发会自动携带 Markdown 标志。仅当自定义平台实例 ID 无法识别适配器类型时启用此开关；不支持 Markdown 的平台会在最终适配层降级为同源纯文本。",
         "default": true
       },
       "recent_turns": {
@@ -180,6 +208,18 @@
         "description": "自动快照间隔回合",
         "type": "int",
         "default": 5
+      },
+      "story_generation_reminder_enabled": {
+        "description": "故事生成等待提醒",
+        "type": "bool",
+        "hint": "开启后，故事仍在生成时按固定间隔发送简短等待进度；完成、失败、取消或进入恢复后立即停止。",
+        "default": true
+      },
+      "story_generation_reminder_interval_seconds": {
+        "description": "故事生成提醒间隔（秒）",
+        "type": "int",
+        "hint": "范围 30—600 秒，必须为 15 秒的倍数；新生成流程会冻结当时设置，运行中修改不会改变该次提醒序列。",
+        "default": 60
       },
       "ooc_prefixes": {
         "description": "场外发言前缀",
@@ -206,17 +246,17 @@
             "default": 604800
           },
           "card_completion_timeout_seconds": {
-            "description": "等待完成建卡秒数（-1 不限时）",
+            "description": "等待完成建卡秒数",
             "type": "int",
             "default": -1
           },
           "preparation_timeout_seconds": {
-            "description": "准备大厅最长秒数（-1 不限时）",
+            "description": "准备大厅最长秒数",
             "type": "int",
             "default": -1
           },
           "ready_timeout_seconds": {
-            "description": "玩家准备确认秒数（-1 不限时）",
+            "description": "玩家准备确认秒数",
             "type": "int",
             "default": -1
           },
@@ -236,12 +276,12 @@
             "default": -1
           },
           "standby_timeout_seconds": {
-            "description": "候补自动退场秒数（-1 不限时）",
+            "description": "候补自动退场秒数",
             "type": "int",
             "default": -1
           },
           "delegation_ttl_seconds": {
-            "description": "代控授权有效秒数（-1 不限时）",
+            "description": "代控授权有效秒数",
             "type": "int",
             "default": -1
           },
@@ -261,7 +301,7 @@
             "default": -1
           },
           "all_idle_pause_seconds": {
-            "description": "全员无互动后自动暂停秒数（留空关闭）",
+            "description": "全员无互动后自动暂停秒数",
             "type": "int",
             "default": -1
           },
@@ -366,53 +406,6 @@
       }
     }
   },
-  "world_market": {
-    "description": "世界包远程市场",
-    "type": "object",
-    "items": {
-      "enabled": {
-        "description": "启用远程市场",
-        "type": "bool",
-        "hint": "开启后，市场视图会在本地条目之外合并拉取 remote_manifest_url 指向的远程条目。启用即代表你信任该注册表源（内容审核由注册表维护方负责，插件只做技术校验）。默认关闭。",
-        "default": false
-      },
-      "remote_manifest_url": {
-        "description": "远程清单地址",
-        "type": "string",
-        "hint": "指向一个 JSON 清单文件（条目含 package_key/url/sha256/size 等字段），如 https://raw.githubusercontent.com/{owner}/{repo}/{ref}/worlds/manifest.json。",
-        "default": ""
-      },
-      "allowed_hosts": {
-        "description": "允许的远程主机白名单",
-        "type": "list",
-        "hint": "仅允许从这些主机拉取（防 SSRF）；留空则仅允许 raw.githubusercontent.com、github.com、objects.githubusercontent.com、codeload.github.com。",
-        "default": [
-          "raw.githubusercontent.com",
-          "github.com",
-          "objects.githubusercontent.com",
-          "codeload.github.com"
-        ]
-      },
-      "cache_ttl_seconds": {
-        "description": "清单缓存秒数",
-        "type": "int",
-        "hint": "清单与已拉取包的缓存时长，缓解 GitHub raw 限流。",
-        "default": 600
-      },
-      "max_package_bytes": {
-        "description": "单包体积上限",
-        "type": "int",
-        "hint": "超过该字节数的远程世界包将被拒绝（防滥用）。",
-        "default": 2000000
-      },
-      "verify_sha256": {
-        "description": "强制哈希校验",
-        "type": "bool",
-        "hint": "开启后，远程包必须匹配清单中的 sha256 才会被接受。",
-        "default": true
-      }
-    }
-  },
   "auto_backup": {
     "description": "自动备份",
     "type": "object",
@@ -444,7 +437,7 @@
       "enabled": {
         "description": "启用 Webhook 通知",
         "type": "bool",
-        "hint": "开启后，酒馆内部事件（回合/世界/会话/备份等）会以 POST JSON 推送到下方地址，默认全部事件；可填写 events 过滤。",
+        "hint": "开启后，开团内部事件（回合/世界/会话/备份等）会以 POST JSON 推送到下方地址，默认全部事件；可填写 events 过滤。",
         "default": false
       },
       "urls": {
@@ -470,6 +463,54 @@
         "type": "float",
         "hint": "单次推送的最长等待时间，默认 10 秒。",
         "default": 10
+      }
+    }
+  },
+  "remote_panel": {
+    "description": "独立 Web 面板",
+    "type": "object",
+    "items": {
+      "enabled": {
+        "description": "启用独立 Web 面板",
+        "type": "bool",
+        "hint": "默认开启，并由下方地址/端口直接托管完整的 321开团 WebUI 控制台（默认仅本机 127.0.0.1），不依赖 AstrBot 管理后台页面。首次本机登录使用 admin/admin；已有自定义密码不会被覆盖。",
+        "default": true
+      },
+      "host": {
+        "description": "监听地址",
+        "type": "string",
+        "hint": "默认 127.0.0.1（仅本机）。如需外网直连请改为 0.0.0.0，并务必配置 HTTPS 反代/隧道或开启 allow_insecure_http（不推荐）。",
+        "default": "127.0.0.1"
+      },
+      "port": {
+        "description": "监听端口",
+        "type": "int",
+        "hint": "独立面板的 TCP 端口（1—65535）。",
+        "default": 8766
+      },
+      "allow_insecure_http": {
+        "description": "允许明文 HTTP 登录",
+        "type": "bool",
+        "hint": "默认关闭：非本机访问时要求 HTTPS（反代/隧道）。开启后允许明文传输密码，风险自负。",
+        "default": false
+      },
+      "external_scheme": {
+        "description": "外部访问协议",
+        "type": "string",
+        "hint": "经 HTTPS 反向代理/隧道访问时设为 https；此时登录 Cookie 强制携带 Secure。默认 http（仅本机）。",
+        "default": "http"
+      },
+      "secure_cookie": {
+        "description": "强制登录 Cookie 携带 Secure 标记",
+        "type": "bool",
+        "hint": "留空时自动跟随 external_scheme；显式设为 false 且 external_scheme=https 时拒绝启动（矛盾配置）。",
+        "default": null
+      },
+      "trusted_proxy_cidrs": {
+        "description": "可信反向代理来源段",
+        "type": "list",
+        "hint": "仅来自这些 CIDR 的直连对端才会读取 X-Forwarded-Proto 等转发头；默认仅回环。",
+        "default": ["127.0.0.1", "::1"]
       }
     }
   }

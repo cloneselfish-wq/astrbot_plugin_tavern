@@ -8,6 +8,8 @@ from .api import ExtensionRegistry, HookRegistry, TavernPublicAPI
 from .database import TavernDatabase
 from .engine import TavernEngine
 from .events import EventBroker
+from .modules import PluginModuleManager
+from .protocol import TwpPackageService
 from .web_console import TavernWebConsole
 
 
@@ -20,6 +22,8 @@ class TavernRuntime:
     hooks: HookRegistry
     extensions: ExtensionRegistry
     public_api: TavernPublicAPI
+    modules: PluginModuleManager
+    world_twp: TwpPackageService
 
 
 def build_runtime(
@@ -34,6 +38,8 @@ def build_runtime(
 ) -> TavernRuntime:
     hooks = HookRegistry()
     extensions = ExtensionRegistry()
+    modules = PluginModuleManager(state_path=Path(data_dir) / "plugin_modules.json")
+    world_twp = TwpPackageService(data_dir)
     broker = EventBroker(hooks=hooks)
     database = TavernDatabase(data_dir)
     engine = TavernEngine(
@@ -55,6 +61,8 @@ def build_runtime(
         extensions=extensions,
         hooks=hooks,
         engine=engine,
+        modules=modules,
+        world_twp=world_twp,
     )
     return TavernRuntime(
         database=database,
@@ -64,4 +72,6 @@ def build_runtime(
         hooks=hooks,
         extensions=extensions,
         public_api=TavernPublicAPI(database, hooks, extensions, engine),
+        modules=modules,
+        world_twp=world_twp,
     )

@@ -7,6 +7,7 @@ from .lifecycle import (
     card_stat_allocation,
     card_template,
     resolve_profession_stats,
+    stage_required_missing,
 )
 from .stat_generation import (
     sync_preset_stack_fields,
@@ -23,12 +24,10 @@ def validate_card_revision(
 
     template = card_template(world)
     fields = dict(profile)
+    # D1：分阶段世界只要求 A 组完整；B/C 组缺失进入待补充，不阻塞修订审核。
     missing = [
         str(item.get("label") or item.get("key"))
-        for item in template["fields"]
-        if item.get("required")
-        and item.get("type") != "derived"
-        and not str(fields.get(str(item.get("key") or ""), "")).strip()
+        for item in stage_required_missing(template, fields)
     ]
     if missing:
         raise ValueError("尚未填写：" + "、".join(missing))

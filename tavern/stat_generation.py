@@ -5,11 +5,29 @@ from itertools import product
 from typing import Any
 
 from .card_wizard import PRESET_REFS_KEY, preset_options
+from .candidates import normalize_candidate_rules
+from .entity_registry import split_ref
 
 
 PRESET_STACK_MODE = "preset_stack"
 STAT_GENERATION_SNAPSHOT_KEY = "stat_generation_snapshot"
 MAX_PRESET_COMBINATIONS = 100_000
+
+# D1-DATA-005：角色确认后的职业运行状态契约。
+RUNTIME_STATE_KEYS = frozenset(
+    {
+        "profession",
+        "resources",
+        "abilities",
+        "career_specialties",
+        "runtime_states",
+        "combination_unlocks",
+        "grants",
+    }
+)
+RUNTIME_UNLOCK_KINDS = frozenset(
+    {"capability", "ability_track", "resource", "runtime_effect"}
+)
 
 
 def _sequence(value: Any) -> list[Any]:
@@ -234,7 +252,8 @@ def _selected_option(
             return current_matches[0]
         if len(current_matches) > 1:
             raise ValueError(
-                f"属性来源 {source_id} 的当前值对应多个预设，请使用稳定 ID"
+                f"属性来源 {source_id} 的当前值对应多个同名预设，"
+                "请返回该字段重新选择具体选项"
             )
     candidates = {
         str(ref.get("id") or "").casefold(),
@@ -426,14 +445,284 @@ def format_preset_stack_result(resolved: Mapping[str, Any]) -> str:
     return "\n".join(lines)
 
 
+# ---------------------------------------------------------------------------
+# D1-DATA-005 运行状态快照契约与资源修饰器纯应用
+# ---------------------------------------------------------------------------
+
+
+def _runtime_typed_ref(value: Any, path: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        raise ValueError(f"{path} 不能为空")
+    try:
+        split_ref(text)
+    except ValueError:
+        raise ValueError(f"{path} 必须是稳定类型化引用（如 resource:contract_echo）") from None
+    return text
+
+
+def _runtime_ref_entry(value: Any, *, path: str, allow_kind: bool = False) -> dict[str, Any]:
+    if isinstance(value, str):
+        return {
+            "ref": _runtime_typed_ref(value, path),
+            "label": "",
+        }
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{path} 必须是字符串或对象")
+    allowed = {"ref", "label"}
+    if allow_kind:
+        allowed.add("kind")
+    unknown = set(value) - allowed
+    if unknown:
+        raise ValueError(
+            f"{path} 包含未知字段："
+            + "、".join(sorted(str(item) for item in unknown))
+        )
+    ref = _runtime_typed_ref(value.get("ref"), f"{path}.ref")
+    label = str(value.get("label") or "").strip()
+    entry: dict[str, Any] = {"ref": ref, "label": label}
+    if allow_kind:
+        kind = str(value.get("kind") or "").strip()
+        if kind and kind not in RUNTIME_UNLOCK_KINDS:
+            raise ValueError(
+                f"{path}.kind 必须是 " + "、".join(sorted(RUNTIME_UNLOCK_KINDS))
+            )
+        entry["kind"] = kind
+    return entry
+
+
+def normalize_runtime_state_snapshot(raw: Any) -> dict[str, Any]:
+    """Return the canonical D1-DATA-005 runtime state snapshot.
+
+    Unknown top-level keys, malformed resources and invalid refs raise
+    immediately; an empty input yields the canonical empty state.
+    """
+
+    if raw is None or raw == "":
+        raw = {}
+    if not isinstance(raw, Mapping):
+        raise ValueError("runtime state 必须是对象")
+    unknown = set(raw) - RUNTIME_STATE_KEYS
+    if unknown:
+        raise ValueError(
+            "runtime state 包含未知字段："
+            + "、".join(sorted(str(item) for item in unknown))
+        )
+    normalized: dict[str, Any] = {
+        "profession": None,
+        "resources": {},
+        "abilities": [],
+        "career_specialties": [],
+        "runtime_states": [],
+        "combination_unlocks": [],
+        "grants": [],
+    }
+    profession = raw.get("profession")
+    if profession not in (None, ""):
+        if not isinstance(profession, Mapping):
+            raise ValueError("runtime state.profession 必须是对象")
+        profession_unknown = set(profession) - {"id", "label", "specialization"}
+        if profession_unknown:
+            raise ValueError(
+                "runtime state.profession 包含未知字段："
+                + "、".join(sorted(str(item) for item in profession_unknown))
+            )
+        profession_id = str(profession.get("id") or "").strip()
+        profession_label = str(profession.get("label") or "").strip()
+        if not profession_id or not profession_label:
+            raise ValueError("runtime state.profession 必须包含 id 与 label")
+        specialization = profession.get("specialization")
+        normalized_profession: dict[str, Any] = {
+            "id": profession_id,
+            "label": profession_label,
+            "specialization": None,
+        }
+        if specialization not in (None, ""):
+            if not isinstance(specialization, Mapping):
+                raise ValueError("runtime state.profession.specialization 必须是对象")
+            specialization_unknown = set(specialization) - {"id", "label"}
+            if specialization_unknown:
+                raise ValueError(
+                    "runtime state.profession.specialization 包含未知字段："
+                    + "、".join(sorted(str(item) for item in specialization_unknown))
+                )
+            specialization_id = str(specialization.get("id") or "").strip()
+            specialization_label = str(specialization.get("label") or "").strip()
+            if not specialization_id or not specialization_label:
+                raise ValueError(
+                    "runtime state.profession.specialization 必须包含 id 与 label"
+                )
+            normalized_profession["specialization"] = {
+                "id": specialization_id,
+                "label": specialization_label,
+            }
+        normalized["profession"] = normalized_profession
+
+    resources = raw.get("resources")
+    if resources not in (None, ""):
+        if not isinstance(resources, Mapping):
+            raise ValueError("runtime state.resources 必须是对象")
+        for ref, entry in resources.items():
+            resource_ref = _runtime_typed_ref(
+                ref, f"runtime state.resources.{ref}"
+            )
+            if not isinstance(entry, Mapping):
+                raise ValueError(f"runtime state.resources.{ref} 必须是对象")
+            entry_unknown = set(entry) - {"label", "current", "maximum"}
+            if entry_unknown:
+                raise ValueError(
+                    f"runtime state.resources.{ref} 包含未知字段："
+                    + "、".join(sorted(str(item) for item in entry_unknown))
+                )
+            label = str(entry.get("label") or "").strip()
+            if not label:
+                raise ValueError(f"runtime state.resources.{ref}.label 不能为空")
+            current = entry.get("current")
+            maximum = entry.get("maximum")
+            if isinstance(current, bool) or not isinstance(current, int):
+                raise ValueError(f"runtime state.resources.{ref}.current 必须是整数")
+            if isinstance(maximum, bool) or not isinstance(maximum, int):
+                raise ValueError(f"runtime state.resources.{ref}.maximum 必须是整数")
+            if current < 0 or maximum < 0:
+                raise ValueError(
+                    f"runtime state.resources.{ref} 的数值不能为负"
+                )
+            if current > maximum:
+                raise ValueError(
+                    f"runtime state.resources.{ref} 的当前值不能超过上限"
+                )
+            normalized["resources"][resource_ref] = {
+                "label": label,
+                "current": current,
+                "maximum": maximum,
+            }
+
+    for key in ("abilities", "career_specialties", "runtime_states"):
+        raw_list = raw.get(key)
+        if raw_list in (None, ""):
+            continue
+        if not isinstance(raw_list, Sequence) or isinstance(raw_list, (str, bytes)):
+            raise ValueError(f"runtime state.{key} 必须是数组")
+        normalized[key] = [
+            _runtime_ref_entry(item, path=f"runtime state.{key}[{index}]")
+            for index, item in enumerate(raw_list)
+        ]
+    raw_unlocks = raw.get("combination_unlocks")
+    if raw_unlocks not in (None, ""):
+        if not isinstance(raw_unlocks, Sequence) or isinstance(
+            raw_unlocks, (str, bytes)
+        ):
+            raise ValueError("runtime state.combination_unlocks 必须是数组")
+        normalized["combination_unlocks"] = [
+            _runtime_ref_entry(
+                item,
+                path=f"runtime state.combination_unlocks[{index}]",
+                allow_kind=True,
+            )
+            for index, item in enumerate(raw_unlocks)
+        ]
+    raw_grants = raw.get("grants")
+    if raw_grants not in (None, ""):
+        if not isinstance(raw_grants, Sequence) or isinstance(
+            raw_grants, (str, bytes)
+        ):
+            raise ValueError("runtime state.grants 必须是数组")
+        grants: list[dict[str, Any]] = []
+        for index, item in enumerate(raw_grants):
+            if not isinstance(item, Mapping):
+                raise ValueError(f"runtime state.grants[{index}] 必须是对象")
+            grant_unknown = set(item) - {"ref", "kind", "label", "policy", "when"}
+            if grant_unknown:
+                raise ValueError(
+                    f"runtime state.grants[{index}] 包含未知字段："
+                    + "、".join(sorted(str(value) for value in grant_unknown))
+                )
+            grant_ref = _runtime_typed_ref(
+                item.get("ref"), f"runtime state.grants[{index}].ref"
+            )
+            kind = str(item.get("kind") or "").strip()
+            if kind and kind not in RUNTIME_UNLOCK_KINDS:
+                raise ValueError(
+                    f"runtime state.grants[{index}].kind 必须是 "
+                    + "、".join(sorted(RUNTIME_UNLOCK_KINDS))
+                )
+            policy = str(item.get("policy") or "").strip()
+            when = item.get("when")
+            if when is not None and not isinstance(when, Mapping):
+                raise ValueError(f"runtime state.grants[{index}].when 必须是对象")
+            grants.append(
+                {
+                    "ref": grant_ref,
+                    "kind": kind,
+                    "label": str(item.get("label") or "").strip(),
+                    "policy": policy,
+                    "when": dict(when) if isinstance(when, Mapping) else None,
+                }
+            )
+        normalized["grants"] = grants
+    return normalized
+
+
+def apply_resource_modifiers(
+    resources: Mapping[str, Any],
+    modifiers: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Apply D1 resource modifiers purely and return a new resource table.
+
+    ``modifiers`` may be raw D1 declarations or already normalized entries;
+    they are normalized through the shared candidate-rule contract so every
+    consumer sees identical strict validation.
+    """
+
+    rules = normalize_candidate_rules({"resource_modifiers": list(modifiers)})
+    result = normalize_runtime_state_snapshot(
+        {"resources": dict(resources)}
+    )["resources"]
+    for modifier in rules["resource_modifiers"]:
+        resource_ref = str(modifier["resource_ref"])
+        if resource_ref not in result:
+            raise ValueError(
+                f"资源 {resource_ref} 尚未声明，不能应用修饰（请先由世界包声明初始资源）"
+            )
+        op = str(modifier["op"])
+        value = int(modifier["value"])
+        entry = result[resource_ref]
+        current = int(entry["current"])
+        maximum = int(entry["maximum"])
+        if op == "set":
+            current = value
+        elif op == "add":
+            current = current + value
+        elif op == "subtract":
+            current = current - value
+        elif op == "cap":
+            current = min(current, value)
+        elif op == "floor":
+            current = max(current, value)
+        else:
+            raise ValueError(f"不支持的资源修饰操作：{op}")
+        if current < 0:
+            raise ValueError(f"资源 {resource_ref} 不足，无法完成本次消耗")
+        if current > maximum:
+            raise ValueError(
+                f"资源 {resource_ref} 超过上限 {maximum}，无法应用修饰"
+            )
+        entry["current"] = current
+    return result
+
+
 __all__ = [
     "MAX_PRESET_COMBINATIONS",
     "PRESET_STACK_MODE",
+    "RUNTIME_STATE_KEYS",
+    "RUNTIME_UNLOCK_KINDS",
     "STAT_GENERATION_SNAPSHOT_KEY",
+    "apply_resource_modifiers",
     "assess_preset_stack_migration",
     "calculate_preset_stack_stats",
     "clear_generated_stats",
     "format_preset_stack_result",
+    "normalize_runtime_state_snapshot",
     "stat_generation_config",
     "sync_preset_stack_fields",
     "uses_preset_stack_stats",
