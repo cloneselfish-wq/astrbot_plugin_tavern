@@ -173,6 +173,12 @@ class TavernPlugin(PrivateMessagesMixin, GroupMessagesMixin, PluginLifecycleMixi
     tavern_card_fill = tavern.command("填写", priority=200)(
         CommandMethods.tavern_card_fill
     )
+    tavern_card_random = tavern.command(
+        "随机", alias={"sj"}, priority=200
+    )(CommandMethods.tavern_card_random)
+    tavern_card_expand = tavern.command(
+        "补全", alias={"bq"}, priority=200
+    )(CommandMethods.tavern_card_expand)
     tavern_card_previous = tavern.command("上一步", priority=200)(
         CommandMethods.tavern_card_previous
     )

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from ..card_ai import CardAIComposer, CardAIError
 from .plugin_shared import *
 from .startup import StartupMethods
 from .delivery import DeliveryMethods
@@ -31,7 +32,10 @@ class PrivateMessagesMixin:
             config_lock=self._config_lock,
         )
         self.database = runtime.database
-        self.card_commands = CardCommandService(self.database)
+        self.card_commands = CardCommandService(
+            self.database,
+            ai=CardAIComposer(self._card_ai_generate),
+        )
         self.admin_commands = AdminCommandService(self.database)
         self.growth_commands = GrowthCommandService(self.database)
         self.tendency_commands = TendencyApplicationService(self.database)
@@ -126,6 +130,66 @@ class PrivateMessagesMixin:
         self.application_orchestrator = ApplicationCommandOrchestrator(
             self.application_router
         )
+
+    async def _card_ai_generate(
+        self,
+        origin: str,
+        prompt: str,
+        system_prompt: str,
+        *,
+        max_tokens: int,
+        temperature: float,
+    ) -> str:
+        """为建卡 AI 指令（/团 随机、/团 补全）挑选可用模型并生成文本。
+
+        依次尝试插件配置的叙事主模型与备用模型；全部失败时抛出最后一个
+        异常，由 ``CardAIComposer`` 统一转换为玩家可见的失败文案。
+        """
+
+        config = self.runtime_config()
+        primary = str(getattr(config, "provider_id", "") or "").strip()
+        if not primary:
+            try:
+                primary = await self.context.get_current_chat_provider_id(
+                    umo=origin
+                )
+            except Exception:
+                primary = ""
+        candidates = [primary]
+        candidates.extend(
+            str(item or "").strip()
+            for item in tuple(
+                getattr(config, "fallback_provider_ids", ()) or ()
+            )
+        )
+        ordered = list(dict.fromkeys(item for item in candidates if item))
+        last_error: Exception | None = None
+        for provider_id in ordered:
+            try:
+                response = await self.context.llm_generate(
+                    chat_provider_id=provider_id,
+                    prompt=prompt,
+                    system_prompt=system_prompt or None,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                )
+            except Exception as exc:
+                last_error = exc
+                logger.warning(
+                    "321开团建卡 AI 模型 %s 调用失败", provider_id, exc_info=True
+                )
+                continue
+            completion = str(
+                getattr(response, "completion_text", "") or ""
+            ).strip()
+            if completion:
+                return completion
+        if last_error is not None:
+            raise last_error
+        raise CardAIError(
+            "没有可用的语言模型，请先在插件配置中选择叙事模型。"
+        )
+
     async def on_loaded(self):
         config = self.runtime_config()
         cleaned = {"audit_logs": 0}
