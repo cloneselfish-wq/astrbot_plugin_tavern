@@ -30,8 +30,8 @@
     },
     {
       "path": "CHANGELOG.md",
-      "bytes": 17790,
-      "sha256": "3c66c3c8b0ef0b57cb1766eaf75bfe35684ecd3bd8e0ed317c3807c0317dd88d"
+      "bytes": 17939,
+      "sha256": "81489d35287e63947a5f57b0c27d4b632b041d5949485179f816667d14ac3da8"
     },
     {
       "path": "data/t2i_templates/astrbot_powershell.html",
@@ -65,8 +65,8 @@
     },
     {
       "path": "metadata.yaml",
-      "bytes": 929,
-      "sha256": "c11d1e69cbf1d173c157add3d7d113c82f1e694f2ccbb8c728972b20c651b180"
+      "bytes": 959,
+      "sha256": "8bdc138dff035c680c66e975942e3f939b878643de64af188cb83523be6ff4d8"
     },
     {
       "path": "pages/console/app/actions.js",
@@ -560,13 +560,13 @@
     },
     {
       "path": "pages/console/webui-build-manifest.json",
-      "bytes": 38683,
-      "sha256": "1cd9c72a164b51f607c80819447781ed34fcc9587f4e173d2eb170ce099bd7d8"
+      "bytes": 39895,
+      "sha256": "dacaa08c301dd32f7c813c160f7f846ba58d0737be111f1c0955acad71013398"
     },
     {
       "path": "README.md",
-      "bytes": 11196,
-      "sha256": "eb55ea3e28c64e5ca1098e7ab373f05a37a3709c045c5c3b5405884a7c8bc70a"
+      "bytes": 11337,
+      "sha256": "e934942802de6bd74162cba2b34417df4f24f1f6f764b0f0380cb7a72e3ed4d0"
     },
     {
       "path": "tavern/__init__.py",
@@ -670,8 +670,8 @@
     },
     {
       "path": "tavern/card_ai.py",
-      "bytes": 22317,
-      "sha256": "2586d46ac13d6b2131d997163dc45e2f47b1f1ed32b8fb33897a5195f6d02a71"
+      "bytes": 22957,
+      "sha256": "0e9da2d82b35e71ec7711e5043fe61cb38ee42b782630a8ddab22c91d930e0ce"
     },
     {
       "path": "tavern/card_delivery.py",
