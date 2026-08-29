@@ -510,9 +510,17 @@
         "description": "可信反向代理来源段",
         "type": "list",
         "hint": "仅来自这些 CIDR 的直连对端才会读取 X-Forwarded-Proto 等转发头；默认仅回环。",
-        "default": ["127.0.0.1", "::1"]
+        "default": [
+          "127.0.0.1",
+          "::1"
+        ]
+      },
+      "public_url": {
+        "description": "网页建卡公网访问地址",
+        "type": "string",
+        "hint": "网页建卡链接的前缀（含协议，结尾不带斜杠），例如 https://www.example.com。留空时使用 http://监听地址:端口，仅本机/内网可访问。",
+        "default": ""
       }
     }
   }
-
 }

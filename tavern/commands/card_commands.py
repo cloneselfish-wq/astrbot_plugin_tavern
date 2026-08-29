@@ -35,9 +35,11 @@
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any, Mapping
 
 from ..card_ai import CardAIComposer, CardAIError
+from ..card_web_wizard import web_active_until
 from ..card_delivery import (
     WIZARD_DELIVERY_KEY,
     build_candidate_bundle,
@@ -91,6 +93,7 @@ PRIVATE_CARD_ACTIONS = frozenset(
         "card_abandon",
         "card_random",
         "card_expand",
+        "card_web",
     }
 )
 
@@ -106,6 +109,7 @@ _CANDIDATE_PREFLIGHT_EXEMPT = frozenset(
         "card_cancel",
         "card_restart",
         "card_abandon",
+        "card_web",
     }
 )
 
@@ -118,6 +122,8 @@ _PRIVATE_CARD_HELP_TEXT = (
     "AI 设定助手（由模型代写或扩写当前字段）\n"
     "/团 随机\n"
     "/团 补全 <初始设定>\n\n"
+    "网页建卡（浏览器逐项填写，含 AI 按钮）\n"
+    "/团 网页建卡\n\n"
     "返回或修改\n"
     "/团 上一步\n"
     "/团 修改 <完整字段名称>\n\n"
@@ -188,10 +194,13 @@ class CardCommandService:
         self,
         database: CardFlowProtocol,
         ai: CardAIComposer | None = None,
+        web: Any = None,
     ) -> None:
         self.database = database
         # AI 设定助手（/团 随机、/团 补全）；未注入时对应指令返回未启用提示。
         self.ai = ai
+        # 网页建卡链接网关（/团 网页建卡）；未注入时返回未启用提示。
+        self.web = web
 
     def handles(self, action: str) -> bool:
         """该命令动作是否属于建卡命令（供路由分发使用）。"""
@@ -211,6 +220,11 @@ class CardCommandService:
 
         origin = ctx.origin
         draft = await self.database.card_draft_for_private(origin)
+        if web_active_until(
+            draft.get("fields") if isinstance(draft, Mapping) else None
+        ) > time.time():
+            # 网页建卡激活期间，聊天侧不再拦截/推送候选，避免双端刷屏。
+            return None
         if not draft:
             return None
         try:
@@ -618,6 +632,8 @@ class CardCommandService:
                     ),
                 ),
             )
+        if command.matched and command.action == "card_web":
+            return await self._issue_web_link(ctx, draft)
         if command.matched and command.action in {
             "card_random",
             "card_expand",
@@ -739,6 +755,34 @@ class CardCommandService:
         )
         return (body, (), result)
 
+    async def _issue_web_link(
+        self,
+        ctx: RequestContext,
+        draft: Mapping[str, Any] | None,
+    ) -> tuple[str, tuple[DeliveryIntent, ...]]:
+        """签发网页建卡魔法链接（一次性、15 分钟有效）。"""
+
+        if not draft:
+            raise DatabaseNotFoundError("当前私聊没有进行中的角色卡")
+        if self.web is None:
+            return (
+                "网页建卡未启用：插件缺少网页建卡网关。",
+                (),
+            )
+        url, error = await self.web.issue_link(ctx.origin, draft)
+        if error:
+            return (error, ())
+        return (
+            "【网页建卡已就绪】\n\n"
+            "请在本机或手机浏览器打开下面的链接（15 分钟内有效，仅可使用一次）：\n"
+            f"{url}\n\n"
+            "网页里可以逐项填写资料，每项旁有「随机」「补全」AI 按钮；"
+            "预览、修改和确认建卡也都能在网页完成。\n"
+            "链接泄露给他人等于交出你的建卡权，请勿转发；"
+            "链接失效后重新发送 /团 网页建卡 即可。",
+            (),
+        )
+
     async def _group_created_intents(
         self,
         result: Mapping[str, Any],
@@ -800,7 +844,12 @@ class CardCommandService:
         平台发送与 ``set_card_delivery_state`` 持久化留给入口层。
         """
 
-        if not draft or command.action == "card_detail":
+        if (
+            not draft
+            or command.action == "card_detail"
+            or web_active_until(draft.get("fields")) > time.time()
+        ):
+            # 网页建卡激活期间聊天侧候选静默；网页操作会刷新该截止时间。
             return ()
         bundle = build_candidate_bundle(draft, platform_id=ctx.platform)
         if not bundle:

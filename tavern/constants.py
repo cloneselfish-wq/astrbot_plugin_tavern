@@ -2,8 +2,8 @@ from __future__ import annotations
 
 
 PLUGIN_NAME = "astrbot_plugin_tavern"
-PLUGIN_VERSION = "1.0.0-rc11"
-PLUGIN_DISPLAY_VERSION = "v1.0.0-rc11"
+PLUGIN_VERSION = "1.0.0-rc12"
+PLUGIN_DISPLAY_VERSION = "v1.0.0-rc12"
 WORLD_PROTOCOL_VERSION = "TWP 1.0.0-rc10"
 TWP_VERSION = "1.0.0-rc10"
 TWP_CORE_VERSION = "1.0.0-rc10"
@@ -68,6 +68,7 @@ MANAGEMENT_ACTIONS = {
     "sj": "card_random",
     "补全": "card_expand",
     "bq": "card_expand",
+    "网页建卡": "card_web",
     "上一步": "card_previous",
     "修改": "card_modify",
     "当前步骤": "card_current",
@@ -177,6 +178,7 @@ MUTATING_ACTIONS = {
     "card_fill",
     "card_random",
     "card_expand",
+    "card_web",
     "card_previous",
     "card_modify",
     "card_next",
@@ -247,6 +249,7 @@ PLAYER_ACTIONS = {
     "card_fill",
     "card_random",
     "card_expand",
+    "card_web",
     "card_previous",
     "card_modify",
     "card_current",

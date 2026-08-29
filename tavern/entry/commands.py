@@ -239,6 +239,13 @@ class CommandMethods:
         async for result in self._run_card_ai_command(event, "card_expand"):
             yield result
 
+    async def tavern_card_web(self, event: AstrMessageEvent):
+        """签发网页建卡链接（一次性、15 分钟有效）。"""
+
+        response = await self._run_native_command(event, "card_web")
+        if response:
+            yield await self._message_result(event, response)
+
     async def _run_card_ai_command(
         self,
         event: AstrMessageEvent,

@@ -179,6 +179,9 @@ class TavernPlugin(PrivateMessagesMixin, GroupMessagesMixin, PluginLifecycleMixi
     tavern_card_expand = tavern.command(
         "补全", alias={"bq"}, priority=200
     )(CommandMethods.tavern_card_expand)
+    tavern_card_web = tavern.command("网页建卡", priority=200)(
+        CommandMethods.tavern_card_web
+    )
     tavern_card_previous = tavern.command("上一步", priority=200)(
         CommandMethods.tavern_card_previous
     )

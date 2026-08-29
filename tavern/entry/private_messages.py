@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from ..card_ai import CardAIComposer, CardAIError
+from ..card_web_wizard import CardWebLinkGateway
 from .plugin_shared import *
 from .startup import StartupMethods
 from .delivery import DeliveryMethods
@@ -32,9 +33,11 @@ class PrivateMessagesMixin:
             config_lock=self._config_lock,
         )
         self.database = runtime.database
+        self.card_web_linker = CardWebLinkGateway(self)
         self.card_commands = CardCommandService(
             self.database,
             ai=CardAIComposer(self._card_ai_generate),
+            web=self.card_web_linker,
         )
         self.admin_commands = AdminCommandService(self.database)
         self.growth_commands = GrowthCommandService(self.database)
@@ -250,6 +253,7 @@ class PrivateMessagesMixin:
                     external_scheme=config.remote_panel_external_scheme,
                     secure_cookie=config.remote_panel_secure_cookie,
                     trusted_proxy_cidrs=config.remote_panel_trusted_proxy_cidrs,
+                    card_ai=self.card_commands.ai,
                 )
                 if started:
                     self._panel_server, self._panel_thread = started
