@@ -1,7 +1,7 @@
 {
   "format": "astrbot-plugin-runtime",
   "format_version": 2,
-  "version": "1.0.0-rc11",
+  "version": "1.0.0-rc12",
   "members": [
     {
       "path": ".astrbot-plugin/i18n/en-US.json",
@@ -25,13 +25,13 @@
     },
     {
       "path": "_conf_schema.json",
-      "bytes": 18813,
-      "sha256": "9c93e3987e6bd11c82d4ff3ccbbda36ac1e064e725a200ccc062e5bd7d08a421"
+      "bytes": 19178,
+      "sha256": "815ef5878f14084fd0203494c4dd640ad11fce6f9e12e968b0aea48074b1432b"
     },
     {
       "path": "CHANGELOG.md",
-      "bytes": 17939,
-      "sha256": "81489d35287e63947a5f57b0c27d4b632b041d5949485179f816667d14ac3da8"
+      "bytes": 18965,
+      "sha256": "b9b9316768e81287c0634b33fdf019750ae7c32466d2c4a9747da6c9f782b4bd"
     },
     {
       "path": "data/t2i_templates/astrbot_powershell.html",
@@ -60,13 +60,13 @@
     },
     {
       "path": "main.py",
-      "bytes": 12074,
-      "sha256": "8279c4bb6f7f1a355598b1d8e46c7e9bbc217bef5592ee6772e9d0599bfa4387"
+      "bytes": 12190,
+      "sha256": "3f977fe5bd3ecf2e702b74468d831362ae0c7342c09d7e45f15d723a90e175a2"
     },
     {
       "path": "metadata.yaml",
       "bytes": 959,
-      "sha256": "8bdc138dff035c680c66e975942e3f939b878643de64af188cb83523be6ff4d8"
+      "sha256": "9069542be01691d6c1598ac05ba613b18597b83798d8bf1ed6391643f9e53361"
     },
     {
       "path": "pages/console/app/actions.js",
@@ -561,12 +561,12 @@
     {
       "path": "pages/console/webui-build-manifest.json",
       "bytes": 39895,
-      "sha256": "dacaa08c301dd32f7c813c160f7f846ba58d0737be111f1c0955acad71013398"
+      "sha256": "1230a70ef1336cfb9fa5251645c81373620e752ac32e42b8258f328ad205e588"
     },
     {
       "path": "README.md",
       "bytes": 11337,
-      "sha256": "e934942802de6bd74162cba2b34417df4f24f1f6f764b0f0380cb7a72e3ed4d0"
+      "sha256": "211a542cd372f2e5b58af19db63b57824f918f91f4dfd225577600566c1f9dc4"
     },
     {
       "path": "tavern/__init__.py",
@@ -689,6 +689,11 @@
       "sha256": "8c10b04c586e704d6463a8a265404303420da6f3d53279fbd4c88f47e620bf81"
     },
     {
+      "path": "tavern/card_web_wizard.py",
+      "bytes": 42668,
+      "sha256": "acbbd69dbf80a5c39cf2a9ff2b0124a11b12e6867863fdee3f34cc9e2a7e07ba"
+    },
+    {
       "path": "tavern/card_wizard/__init__.py",
       "bytes": 872,
       "sha256": "5a05c51af5448d9930946019e5915000907902c50d7da82d82e92f264027787e"
@@ -745,8 +750,8 @@
     },
     {
       "path": "tavern/commands/card_commands.py",
-      "bytes": 36970,
-      "sha256": "fb3038a31eeae53ac4d20c755896200ff211b84ccb2821f9b6a6d5af8bc4ea59"
+      "bytes": 39112,
+      "sha256": "4494b9b4ccdc9518df21b4a5b34616f7bc0ce5b5b357ecc24dcbfbc3e96016bf"
     },
     {
       "path": "tavern/commands/challenge_commands.py",
@@ -845,13 +850,13 @@
     },
     {
       "path": "tavern/config.py",
-      "bytes": 33026,
-      "sha256": "3cfd7bdde62c8b263677936361298c843daec8ba0c446eb77309d93f40180b48"
+      "bytes": 33201,
+      "sha256": "92750518991818901f03f27e766ac190a962f34142cdac267f537b34d1394097"
     },
     {
       "path": "tavern/constants.py",
-      "bytes": 9145,
-      "sha256": "281d1a5860f03a5529007ea6393849fba8be8567a1478ed5447b90b915156c45"
+      "bytes": 9212,
+      "sha256": "cf257c3116ef5baf397a487a65067f8f0eada4ccf900b7ec5d07a2a6affce11c"
     },
     {
       "path": "tavern/context/__init__.py",
@@ -1215,8 +1220,8 @@
     },
     {
       "path": "tavern/entry/commands.py",
-      "bytes": 36174,
-      "sha256": "fba302aa589b7565bd7cca0e4f7ec784f5947d682f0c53450111a1fd1c77b6f4"
+      "bytes": 36472,
+      "sha256": "267141178ab0a74e7a218bf7c39d00ca22113feaebafbc6ac963e950db3ed78c"
     },
     {
       "path": "tavern/entry/delivery.py",
@@ -1260,13 +1265,13 @@
     },
     {
       "path": "tavern/entry/plugin_shared.py",
-      "bytes": 19807,
-      "sha256": "eab337607e49c10b08e599ac323d57a26a9828f0fb7b7f5de545dc773d8bc7af"
+      "bytes": 19889,
+      "sha256": "b655c328a6a89620e11c6ba4330ae6246926ef39e5e48db6a1b0700e36eac2c3"
     },
     {
       "path": "tavern/entry/private_messages.py",
-      "bytes": 19780,
-      "sha256": "cc4999f8c7309b8b717c1aab1cd2040f883f7db758c32084b460d23d1ff51cd8"
+      "bytes": 19978,
+      "sha256": "61380b27e0f158f7fe94d6cf79859a2949d841f967b6acc987350c46e6385f76"
     },
     {
       "path": "tavern/entry/shutdown.py",
@@ -1325,8 +1330,8 @@
     },
     {
       "path": "tavern/help_topics.py",
-      "bytes": 3518,
-      "sha256": "6a5d904c648c5275acec01d15029aa8df8d7485876f002302c054030814fe1b4"
+      "bytes": 3647,
+      "sha256": "18a4fbbf706d1b78c500a046f6f56992771fdf82bdc8c49f32ecb6f6fb98dd8a"
     },
     {
       "path": "tavern/host_lifecycle.py",
@@ -1745,8 +1750,8 @@
     },
     {
       "path": "tavern/remote_panel/__init__.py",
-      "bytes": 24853,
-      "sha256": "f0357821de6d7a9b3dd3fc7c59cf0f6c5453add65555412d035cab7761da8a9e"
+      "bytes": 25120,
+      "sha256": "fe9322679fe35c0ddf2c8c06dee42b4a21717402d40c33b49550e90e864f0b68"
     },
     {
       "path": "tavern/remote_panel/api.py",
@@ -1755,8 +1760,8 @@
     },
     {
       "path": "tavern/remote_panel/assets.py",
-      "bytes": 25728,
-      "sha256": "a428a1c4c59d9ed36855981689c5dc1e339bb7710995fdf5204f0e207f0caa7a"
+      "bytes": 26036,
+      "sha256": "3114214f81caa47089a940dafa600c10726d59a661eec030cf1e42faabe83851"
     },
     {
       "path": "tavern/remote_panel/auth.py",
@@ -1770,8 +1775,8 @@
     },
     {
       "path": "tavern/repositories/__init__.py",
-      "bytes": 13212,
-      "sha256": "b14dc01c497dc8c70889861cb796c0dffc5024a2567493f2c0cf9cb01408b347"
+      "bytes": 13318,
+      "sha256": "23a576c7385b7d90bc4a9db6390bed02bb4fd1e9cb2e4b68d0192bb1caf75689"
     },
     {
       "path": "tavern/repositories/_split_manifest.json",
@@ -1877,6 +1882,11 @@
       "path": "tavern/repositories/character_runtime_queries.py",
       "bytes": 14045,
       "sha256": "8550f239b7bc84fb9042b2b8f766888bc59c9c6bc9829c7b197bf5368dc78048"
+    },
+    {
+      "path": "tavern/repositories/character_web_state.py",
+      "bytes": 3660,
+      "sha256": "50ee013dbe47d757182ec754fb92dda9bfcf5fcf0e64844880b8bcde93da4e6e"
     },
     {
       "path": "tavern/repositories/characters_support.py",
