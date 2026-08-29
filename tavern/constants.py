@@ -2,8 +2,8 @@ from __future__ import annotations
 
 
 PLUGIN_NAME = "astrbot_plugin_tavern"
-PLUGIN_VERSION = "1.0.0-rc10"
-PLUGIN_DISPLAY_VERSION = "v1.0.0-rc10"
+PLUGIN_VERSION = "1.0.0-rc11"
+PLUGIN_DISPLAY_VERSION = "v1.0.0-rc11"
 WORLD_PROTOCOL_VERSION = "TWP 1.0.0-rc10"
 TWP_VERSION = "1.0.0-rc10"
 TWP_CORE_VERSION = "1.0.0-rc10"
