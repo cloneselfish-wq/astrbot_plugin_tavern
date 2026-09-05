@@ -20,6 +20,8 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import random
+import re
 import secrets
 import threading
 import time
@@ -27,6 +29,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from .card_ai import CardAIError
+from .database_support import DatabaseNotFoundError
 from .card_wizard import (
     preset_options,
     resolve_current_wizard_step,
@@ -52,6 +55,11 @@ _EXCHANGE_IP_LIMIT = 10
 _EXCHANGE_IP_WINDOW = 60.0
 
 _MODES = ("random", "expand")
+
+# 字段类型分组：文本类可随机/补全（走 LLM），选项类只可随机（本地随机函数），
+# 数值类不支持自动生成。
+_TEXT_FIELD_TYPES = frozenset({"text", "textarea"})
+_OPTION_FIELD_TYPES = frozenset({"select", "preset_select", "multi_select"})
 
 
 def _hash_token(token: str) -> str:
@@ -85,6 +93,8 @@ class CardWebRegistry:
         self._lock = threading.RLock()
         self._links: dict[str, dict[str, float]] = {}  # origin -> entry
         self._sessions: dict[str, dict[str, Any]] = {}  # token_hash -> entry
+        self._review_links: dict[str, dict[str, Any]] = {}  # admin_id -> entry
+        self._review_sessions: dict[str, dict[str, Any]] = {}  # token_hash -> entry
         self._exchange_hits: dict[str, list[float]] = {}
         self.ai_semaphore = threading.BoundedSemaphore(AI_GLOBAL_CONCURRENCY)
 
@@ -154,6 +164,63 @@ class CardWebRegistry:
                 if entry.get("origin") == str(origin or "")
             ]:
                 self._sessions.pop(digest, None)
+
+    # ── 网页审核（/cw/review）令牌 ──
+    def issue_review_link(
+        self, admin_id: str, *, bypass_host: bool = False
+    ) -> str:
+        token = secrets.token_urlsafe(32)
+        with self._lock:
+            self._review_links[str(admin_id or "")] = {
+                "token_hash": _hash_token(token),
+                "expires_at": time.time() + LINK_TTL_SECONDS,
+                "bypass_host": bool(bypass_host),
+            }
+        return token
+
+    def consume_review_link(self, token: str) -> dict[str, Any]:
+        """一次性兑换：成功返回 ``{"admin_id", "bypass_host"}`` 并作废链接。"""
+
+        digest = _hash_token(token)
+        now = time.time()
+        with self._lock:
+            for admin_id, entry in list(self._review_links.items()):
+                if entry.get("expires_at", 0) < now:
+                    self._review_links.pop(admin_id, None)
+                    continue
+                if hmac_equal(entry.get("token_hash"), digest):
+                    self._review_links.pop(admin_id, None)
+                    return {
+                        "admin_id": str(admin_id or ""),
+                        "bypass_host": bool(entry.get("bypass_host")),
+                    }
+        raise ValueError("链接无效或已过期，请在 QQ 私聊重新发送 /团 审核")
+
+    def issue_review_session(
+        self, admin_id: str, *, bypass_host: bool = False
+    ) -> str:
+        token = secrets.token_urlsafe(32)
+        with self._lock:
+            self._review_sessions[_hash_token(token)] = {
+                "admin_id": str(admin_id or ""),
+                "bypass_host": bool(bypass_host),
+                "expires_at": time.time() + SESSION_TTL_SECONDS,
+            }
+        return token
+
+    def resolve_review_session(self, token: str) -> dict[str, Any]:
+        digest = _hash_token(token)
+        now = time.time()
+        with self._lock:
+            entry = self._review_sessions.get(digest)
+            if not entry or entry.get("expires_at", 0) < now:
+                self._review_sessions.pop(digest, None)
+                return {}
+            entry["expires_at"] = now + SESSION_TTL_SECONDS
+            return {
+                "admin_id": str(entry.get("admin_id") or ""),
+                "bypass_host": bool(entry.get("bypass_host")),
+            }
 
     # ── 兑换接口按 IP 限速 ──
     def exchange_allowed(self, ip: str) -> bool:
@@ -255,20 +322,41 @@ class CardWebLinkGateway:
                 "网页建卡未启用：请在插件配置中开启独立 Web 面板并重新加载插件后，"
                 "再发送 /团 网页建卡。",
             )
+        base, note = self._panel_base_url()
+        token = registry.issue_link(origin)
+        return f"{base}/cw?token={token}", note
+
+    async def issue_review_link(
+        self, admin_id: str, *, bypass_host: bool = False
+    ) -> tuple[str, str]:
+        """为主持人签发网页审核链接（/cw/review，一次性令牌）。"""
+
+        server = getattr(self._plugin, "_panel_server", None)
+        registry = getattr(server, "card_registry", None)
+        if server is None or registry is None:
+            return (
+                "",
+                "网页审核未启用：请在插件配置中开启独立 Web 面板并重新加载插件后，"
+                "再发送 /团 审核。",
+            )
+        base, note = self._panel_base_url()
+        token = registry.issue_review_link(admin_id, bypass_host=bypass_host)
+        return f"{base}/cw/review?token={token}", note
+
+    def _panel_base_url(self) -> tuple[str, str]:
         config = self._plugin.runtime_config()
         base = str(
             getattr(config, "remote_panel_public_url", "") or ""
         ).strip().rstrip("/")
         if base:
-            url = f"{base}/cw"
-        else:
-            host = str(getattr(config, "remote_panel_host", "") or "127.0.0.1")
-            port = int(getattr(config, "remote_panel_port", 8766) or 8766)
-            url = f"http://{host}:{port}/cw"
-            if host in {"127.0.0.1", "::1", "localhost", ""}:
-                url += "（当前仅本机可访问；公网使用请在插件配置 remote_panel.public_url 填写外网地址）"
-        token = registry.issue_link(origin)
-        return f"{url}?token={token}", ""
+            return base, ""
+        host = str(getattr(config, "remote_panel_host", "") or "127.0.0.1")
+        port = int(getattr(config, "remote_panel_port", 8766) or 8766)
+        url = f"http://{host}:{port}"
+        note = ""
+        if host in {"127.0.0.1", "::1", "localhost", ""}:
+            note = "（当前仅本机可访问；公网使用请在插件配置 remote_panel.public_url 填写外网地址）"
+        return url, note
 
 
 class CardWebMixin:
@@ -280,6 +368,12 @@ class CardWebMixin:
             if path == "/cw":
                 if self.command == "GET":
                     self._send_html(_CARD_WIZARD_HTML)
+                    return
+                self._send_json({"error": "不支持的方法"}, status=405)
+                return
+            if path == "/cw/review":
+                if self.command == "GET":
+                    self._send_html(_CARD_REVIEW_HTML)
                     return
                 self._send_json({"error": "不支持的方法"}, status=405)
                 return
@@ -297,6 +391,16 @@ class CardWebMixin:
                 if action == "exchange":
                     self._cw_exchange()
                     return
+                if action == "review-exchange":
+                    self._cw_review_exchange()
+                    return
+            # 网页审核 API 使用独立的审核会话令牌，不走建卡会话认证。
+            if action == "review-state" and self.command == "GET":
+                self._cw_review_state()
+                return
+            if action == "review-decide" and self.command == "POST":
+                self._cw_review_decide()
+                return
             if self.command != "GET" and self.command != "POST":
                 self._send_json({"error": "不支持的方法"}, status=405)
                 return
@@ -463,9 +567,6 @@ class CardWebMixin:
         self._send_json(_state_payload(origin, result))
 
     def _cw_ai(self, origin: str) -> None:
-        composer = getattr(self.panel, "card_ai", None)
-        if composer is None:
-            raise CardAIError("AI 设定助手未启用：面板未接入语言模型。")
         payload = self._read_json(max_bytes=65536)
         mode = str(payload.get("mode") or "").strip()
         if mode not in _MODES:
@@ -481,8 +582,51 @@ class CardWebMixin:
         field = _current_field(draft)
         if field is None:
             raise CardAIError("角色卡必填资料已填写完成，无需 AI 生成。")
+        if field.kind == "synthetic":
+            raise CardAIError(
+                f"当前步骤是「{field.label}」，需要玩家亲自选择建卡方式，"
+                "不适用随机/补全。"
+            )
+        if not field.user_fillable or field.auto_filled:
+            raise CardAIError(
+                f"当前字段「{field.label}」由系统代填，无法使用 AI 生成。"
+            )
+        field_type = field.field_type
+        template = draft.get("template")
+        template = template if isinstance(template, Mapping) else {}
+        fields = draft.get("fields")
+        fields = fields if isinstance(fields, Mapping) else {}
+
+        # 选项类字段：随机走本地随机函数，不调用大模型、不消耗每日配额；
+        # 补全对选择题无意义，直接拒绝。
+        if field_type in _OPTION_FIELD_TYPES:
+            if mode == "expand":
+                raise CardAIError(
+                    f"「{field.label}」是选择题，不需要补全；可点「随机」或直接选择。"
+                )
+            value = _random_pick_options(
+                template,
+                field.definition,
+                fields,
+                label=field.label,
+                multi=(field_type == "multi_select"),
+            )
+            self._cw_touch(origin)
+            self._send_json(
+                {"value": value, "field_label": field.label, "filled": False}
+            )
+            return
+
+        # 文本类字段：随机/补全走 LLM，受每日配额与全局并发双重限制。
+        if field_type not in _TEXT_FIELD_TYPES:
+            raise CardAIError(
+                f"当前字段「{field.label}」不支持自动生成，请手动填写。"
+            )
+        composer = getattr(self.panel, "card_ai", None)
+        if composer is None:
+            raise CardAIError("AI 设定助手未启用：面板未接入语言模型。")
         field_key = str(field.step_key or "")
-        if quota_left_for_field(draft.get("fields"), field_key, mode) <= 0:
+        if quota_left_for_field(fields, field_key, mode) <= 0:
             raise CardAIError(
                 f"「{field.label}」今日的{'随机' if mode == 'random' else '补全'}次数已用完，"
                 "明天再来，或直接手动修改内容。"
@@ -491,7 +635,7 @@ class CardWebMixin:
         if mode == "expand" and not user_draft:
             raise ValueError("补全需要先填写你的初始设定")
         # 配额先扣后生成：生成失败会在下方退回，避免同秒并发绕过每日限制。
-        quota = consume_quota_for_field(draft.get("fields"), field_key, mode)
+        quota = consume_quota_for_field(fields, field_key, mode)
         self._run_async(
             self.panel.database.set_card_web_state(origin, {AI_QUOTA_KEY: quota})
         )
@@ -500,7 +644,7 @@ class CardWebMixin:
             # 退回本次预扣的配额。
             self._run_async(
                 self.panel.database.set_card_web_state(
-                    origin, {AI_QUOTA_KEY: _unconsume(draft.get("fields"), field_key, mode)}
+                    origin, {AI_QUOTA_KEY: _unconsume(fields, field_key, mode)}
                 )
             )
             self._send_json(
@@ -522,26 +666,22 @@ class CardWebMixin:
             self._run_async(
                 self.panel.database.set_card_web_state(
                     origin,
-                    {AI_QUOTA_KEY: _unconsume(draft.get("fields"), field_key, mode)},
+                    {AI_QUOTA_KEY: _unconsume(fields, field_key, mode)},
                 )
             )
             raise
         finally:
             if semaphore is not None:
                 semaphore.release()
-        result = self._run_async(
-            self.panel.database.fill_card_draft(
-                origin,
-                value,
-                source_event_id=f"cw-ai:{secrets.token_hex(8)}",
-            )
-        )
         self._cw_touch(origin)
+        # 生成值仅回填给玩家审核，不落库、不推进游标；玩家确认后点
+        # 「提交并下一项」才走 fill_card_draft 正式填入。
         self._send_json(
             {
-                "generated": generated,
+                "value": value,
                 "field_label": field_label,
-                **_state_payload(origin, result),
+                "generated": generated,
+                "filled": False,
             }
         )
 
@@ -592,6 +732,74 @@ class CardWebMixin:
         self._cw_touch(origin)
         self._send_json(_state_payload(origin, restarted))
 
+    # ---- 网页审核（/cw/review） ----
+    def _cw_review_principal(self) -> dict[str, Any]:
+        header = self.headers.get("Authorization") or ""
+        scheme, _, token = header.partition(" ")
+        if scheme.strip().lower() != "bearer":
+            return {}
+        registry = self._cw_registry()
+        if registry is None:
+            return {}
+        return registry.resolve_review_session(token.strip())
+
+    def _cw_review_exchange(self) -> None:
+        registry = self._cw_registry()
+        if registry is None:
+            self._send_json(
+                {"error": "网页审核未启用：面板未就绪，请稍后重试或联系管理员"},
+                status=503,
+            )
+            return
+        ip = self._client_ip()
+        if not registry.exchange_allowed(ip):
+            self._send_json({"error": "尝试过于频繁，请一分钟后再试"}, status=429)
+            return
+        payload = self._read_json(max_bytes=4096)
+        token = str(payload.get("token") or "").strip()
+        if not token:
+            raise ValueError("链接缺少令牌")
+        principal = registry.consume_review_link(token)
+        session_token = registry.issue_review_session(
+            principal["admin_id"],
+            bypass_host=principal["bypass_host"],
+        )
+        self._send_json({"token": session_token})
+
+    def _cw_review_state(self) -> None:
+        principal = self._cw_review_principal()
+        if not principal:
+            self._send_json(
+                {"error": "会话已失效，请在 QQ 私聊重新发送 /团 审核"},
+                status=401,
+            )
+            return
+        state = self._run_async(
+            _build_review_state(self.panel.database, principal)
+        )
+        self._send_json(state)
+
+    def _cw_review_decide(self) -> None:
+        principal = self._cw_review_principal()
+        if not principal:
+            self._send_json(
+                {"error": "会话已失效，请在 QQ 私聊重新发送 /团 审核"},
+                status=401,
+            )
+            return
+        payload = self._read_json(max_bytes=8192)
+        result = self._run_async(
+            _decide_review(
+                self.panel.database,
+                principal,
+                str(payload.get("session_id") or ""),
+                str(payload.get("participant_id") or ""),
+                bool(payload.get("approved")),
+                str(payload.get("note") or "").strip()[:500],
+            )
+        )
+        self._send_json(result)
+
     def _revoke(self, origin: str) -> None:
         registry = self._cw_registry()
         if registry is not None:
@@ -615,6 +823,217 @@ def _unconsume(
     return quota
 
 
+def _random_pick_options(
+    template: Mapping[str, Any],
+    definition: Mapping[str, Any],
+    fields: Mapping[str, Any],
+    *,
+    label: str,
+    multi: bool,
+) -> str:
+    """选择题的本地随机：从候选中随机挑一项（多选则按 min/max 随机挑若干项）。
+
+    不调用大模型、不消耗每日配额，返回以顿号连接的候选外显名称，供前端回填。
+    """
+
+    try:
+        options = preset_options(template, definition, fields)
+    except ValueError as exc:
+        raise CardAIError(str(exc)) from exc
+    if not options:
+        raise CardAIError(
+            f"字段「{label}」当前没有可用候选，无法随机选择；请直接手动选择。"
+        )
+    if multi:
+        minimum = max(0, int(definition.get("min_choices", 0) or 0))
+        maximum = max(minimum, int(definition.get("max_choices", 100) or 100))
+        maximum = min(maximum, len(options))
+        minimum = min(minimum, maximum)
+        if minimum < 1:
+            minimum = 1
+        count = random.randint(minimum, maximum)
+        picked = random.sample(options, count)
+    else:
+        picked = [random.choice(options)]
+    return "、".join(
+        str(item.get("label") or item.get("value") or "") for item in picked
+    )
+
+
+def _review_reference_of(participant: Mapping[str, Any]) -> str:
+    """审核号（与群内 /团 审核 展示一致）：R-XXXXXXXX。"""
+
+    raw = str(participant.get("id") or "").split("_", 1)[-1]
+    token = re.sub(r"[^a-zA-Z0-9]", "", raw).upper()
+    return f"R-{(token or 'UNKNOWN')[:8]}"
+
+
+def _pending_review_cards_of(roster: Any) -> list[Mapping[str, Any]]:
+    from .presentation.reviews import _pending_review_cards
+
+    return list(_pending_review_cards(roster))
+
+
+async def _review_hosted_pending(
+    database: Any, principal: Mapping[str, Any]
+) -> list[tuple[Mapping[str, Any], list[Mapping[str, Any]]]]:
+    """返回审核人可主持且有待审核卡的副本及其待审列表。
+
+    host 角色是必要条件；签发链接时验证过的面板管理员可凭
+    ``bypass_host`` 放行（与群内 is_host 判定保持一致）。
+    """
+
+    admin_id = str(principal.get("admin_id") or "")
+    bypass = bool(principal.get("bypass_host"))
+    hosted: list[tuple[Mapping[str, Any], list[Mapping[str, Any]]]] = []
+    for session in await database.list_sessions():
+        if str(session.get("state") or "") == "finished":
+            continue
+        session_id = str(session.get("id") or "")
+        if not session_id:
+            continue
+        if not bypass:
+            roles = await database.permission_roles(session_id, admin_id)
+            if "host" not in roles:
+                continue
+        roster = await database.list_roster(session_id)
+        pending = _pending_review_cards_of(roster)
+        if pending:
+            hosted.append((session, pending))
+    return hosted
+
+
+async def _build_review_state(
+    database: Any, principal: Mapping[str, Any]
+) -> dict[str, Any]:
+    from .presentation.story import format_review_card
+
+    hosted = await _review_hosted_pending(database, principal)
+    items: list[dict[str, Any]] = []
+    for session, pending in hosted:
+        try:
+            instance = await database.get_instance_config(
+                str(session.get("id") or "")
+            )
+            instance = instance if isinstance(instance, Mapping) else {}
+            template = instance.get("character_card_template")
+            template = template if isinstance(template, Mapping) else {}
+            world = instance.get("world_snapshot")
+            world = world if isinstance(world, Mapping) else {}
+        except Exception:
+            template, world = {}, {}
+        session_name = str(
+            session.get("instance_name") or session.get("instance_slug") or ""
+        )
+        for ordinal, target in enumerate(pending, 1):
+            try:
+                detail = str(
+                    format_review_card(target, template, world)
+                ).strip()
+            except Exception:
+                detail = (
+                    "角色卡详情渲染失败；请使用群内 /团 审核 <序号> 查看。"
+                )
+            items.append(
+                {
+                    "session_id": str(session.get("id") or ""),
+                    "session_name": session_name,
+                    "ordinal": ordinal,
+                    "review_ref": _review_reference_of(target),
+                    "participant_id": str(target.get("id") or ""),
+                    "character_name": str(
+                        target.get("character_name")
+                        or target.get("display_name")
+                        or ""
+                    ),
+                    "character_code": str(
+                        target.get("character_code") or ""
+                    ),
+                    "player_name": str(
+                        target.get("display_name") or ""
+                    ),
+                    "card_version_no": int(
+                        target.get("card_version_no") or 1
+                    ),
+                    "detail_text": detail,
+                }
+            )
+    return {"items": items, "count": len(items)}
+
+
+async def _decide_review(
+    database: Any,
+    principal: Mapping[str, Any],
+    session_id: str,
+    participant_id: str,
+    approved: bool,
+    note: str,
+) -> dict[str, Any]:
+    from .operations import operation_key
+
+    admin_id = str(principal.get("admin_id") or "")
+    bypass = bool(principal.get("bypass_host"))
+    session_id = str(session_id or "")
+    try:
+        if not bypass:
+            roles = await database.permission_roles(session_id, admin_id)
+            if "host" not in roles:
+                return {
+                    "ok": False,
+                    "error": "你不是该副本的主持人，无法审批。",
+                }
+        session = await database.get_session(session_id)
+        roster = await database.list_roster(session_id)
+        pending = _pending_review_cards_of(roster)
+        target = next(
+            (
+                item
+                for item in pending
+                if str(item.get("id") or "") == participant_id
+            ),
+            None,
+        )
+        if target is None:
+            return {
+                "ok": False,
+                "error": "该角色卡不在待审核列表中（可能已被审批或已失效）。",
+            }
+        expected_version = int(target.get("card_version_no") or 0)
+        review_key = operation_key(
+            session_id,
+            "card.review",
+            turn_no=int(session.get("turn_no") or 0),
+            actor_id=admin_id,
+            source_id="web-review",
+            payload={
+                "participant": participant_id,
+                "version": expected_version,
+                "action": "approve" if approved else "reject",
+                "note": note,
+            },
+        )
+        participant = await database.review_character_card(
+            session_id,
+            participant_id,
+            approved,
+            admin_id,
+            note,
+            expected_version,
+            review_key,
+        )
+        return {
+            "ok": True,
+            "character_name": str(
+                participant.get("character_name") or ""
+            ),
+            "decision": "已通过" if approved else "已驳回",
+        }
+    except DatabaseNotFoundError as exc:
+        return {"ok": False, "error": str(exc)}
+    except (ValueError, PermissionError) as exc:
+        return {"ok": False, "error": str(exc)}
+
+
 def _confirm_message(result: Mapping[str, Any]) -> str:
     if result.get("needs_revision"):
         return "部分依赖字段需要重新选择，请回 QQ 私聊发送 /团 当前步骤 查看详情。"
@@ -625,7 +1044,7 @@ def _confirm_message(result: Mapping[str, Any]) -> str:
     return (
         f"「{name}」已保存。"
         + ("角色卡已自动通过，可回群发送 /团 准备。" if approved else
-           "角色卡已提交审核，通过后回群发送 /团 准备。")
+           "角色卡已提交主持人审核：主持人在团局群发送 /团 审核 即可查看并审批，通过后回群发送 /团 准备。")
     )
 
 
@@ -670,8 +1089,18 @@ def _field_payload(draft: Mapping[str, Any]) -> dict[str, Any] | None:
     definition = wizard.definition
     field_type = wizard.field_type
     options: list[dict[str, Any]] = []
-    if field_type not in {"text", "textarea", "integer"}:
+    if field_type in _OPTION_FIELD_TYPES:
         options = _options_payload(draft, definition, fields, template)
+    if field_type in _OPTION_FIELD_TYPES:
+        # 选项类字段：随机走本地随机函数、不限次数（-1 表示不限），无补全。
+        quota = {"random": -1, "expand": 0}
+    elif field_type in _TEXT_FIELD_TYPES:
+        quota = {
+            "random": quota_left_for_field(fields, wizard.step_key, "random"),
+            "expand": quota_left_for_field(fields, wizard.step_key, "expand"),
+        }
+    else:
+        quota = {"random": 0, "expand": 0}
     payload = {
         "key": wizard.step_key,
         "label": wizard.label,
@@ -684,10 +1113,7 @@ def _field_payload(draft: Mapping[str, Any]) -> dict[str, Any] | None:
         "max_choices": int(definition.get("max_choices", 0) or 0) or None,
         "value": None,
         "options": options,
-        "quota": {
-            "random": quota_left_for_field(fields, wizard.step_key, "random"),
-            "expand": quota_left_for_field(fields, wizard.step_key, "expand"),
-        },
+        "quota": quota,
     }
     if field_type == "integer":
         payload["minimum"] = int(definition.get("minimum", -100) or 0)
@@ -753,15 +1179,28 @@ def _state_payload(
     fields = fields if isinstance(fields, Mapping) else {}
     world = draft.get("world")
     world = world if isinstance(world, Mapping) else {}
-    total = sum(
-        1
-        for item in template.get("fields") or []
-        if isinstance(item, Mapping) and not str(item.get("key") or "").startswith("_")
-    )
+    # D1：进度口径与向导实际提问一致——分阶段世界开演前只问 A 组字段，
+    # B/C 组留给剧情补充；不分阶段的世界统计全部字段。
+    staged = staged_creation(template)
+    fillable_keys: set[str] = set()
+    deferred = 0
+    for item in template.get("fields") or []:
+        if not isinstance(item, Mapping):
+            continue
+        key = str(item.get("key") or "")
+        if not key or key.startswith("_"):
+            continue
+        if str(item.get("type") or "") == "derived":
+            continue
+        if staged and str(item.get("stage") or CARD_STAGE_A) != CARD_STAGE_A:
+            deferred += 1
+            continue
+        fillable_keys.add(key)
+    total = len(fillable_keys)
     filled = sum(
         1
         for key, value in fields.items()
-        if not str(key).startswith("_") and value not in (None, "")
+        if key in fillable_keys and value not in (None, "")
     )
     return {
         "complete": _current_field(draft) is None,
@@ -773,7 +1212,7 @@ def _state_payload(
         ),
         "session_name": str(draft.get("instance_name") or draft.get("name") or ""),
         "character_name": str(draft.get("name") or ""),
-        "progress": {"filled": filled, "total": total},
+        "progress": {"filled": filled, "total": total, "deferred": deferred},
         "field": _field_payload(draft),
         "preview": _preview_rows(draft),
     }
@@ -883,17 +1322,27 @@ function fieldHtml(f){
     body=(f.options||[]).map(o=>`<label class="opt"><input type="${kind}" name="v" value="${esc(o.label)}"><span><span class="name">${o.ordinal}. ${esc(o.label)}</span>${o.description?`<span class="brief">${esc(o.description)}</span>`:""}</span></label>`).join("")||'<p class="desc">当前没有可选项。</p>';
   }
   const quota=f.quota||{};
-  const ai=f.type!=="integer"?`<div class="ai">
+  const isOption=["select","preset_select","multi_select"].includes(f.type);
+  const isText=f.type==="text"||f.type==="textarea";
+  let ai="";
+  if(!f.synthetic){
+    if(isOption){
+      ai=`<div class="ai"><button id="ai-r">🎲 随机选一项</button></div>`;
+    }else if(isText){
+      ai=`<div class="ai">
     <button id="ai-r" ${quota.random<=0?"disabled":""}>🎲 随机<span class="left">今日剩余 ${quota.random??0} 次</span></button>
     <button id="ai-e" ${quota.expand<=0?"disabled":""}>✍️ 补全<span class="left">今日剩余 ${quota.expand??0} 次</span></button>
-  </div>`:"";
+  </div>`;
+    }
+  }
   return `<div class="card"><h2>${esc(f.label)}${f.required?" *":""}</h2>
     ${f.description?`<p class="desc">${esc(f.description)}</p>`:""}${ai}${body}
     ${f.type==="multi_select"&&f.min_choices?`<p class="desc">需选择 ${f.min_choices}${f.max_choices&&f.max_choices!==f.min_choices?"—"+f.max_choices:""} 项。</p>`:""}
-    <div class="actions" style="margin-top:12px"><button class="primary" id="submit">提交并下一项</button></div></div>`;
+    <div class="actions" style="margin-top:12px"><button class="ghost" id="prev">上一项</button><button class="primary" id="submit">提交并下一项</button></div></div>`;
 }
 function render(d){
-  $("#meta").innerHTML=`${esc(d.world_name||"")} · ${esc(d.session_name||"")} · 已填 ${d.progress.filled}/${d.progress.total}${d.remaining_seconds!=null?" · "+remainingText(d.remaining_seconds):""}`;
+  window.__state=d;
+  $("#meta").innerHTML=`${esc(d.world_name||"")} · ${esc(d.session_name||"")} · 已填 ${d.progress.filled}/${d.progress.total}${d.progress.deferred?`（另有 ${d.progress.deferred} 项剧情中补充）`:""}${d.remaining_seconds!=null?" · "+remainingText(d.remaining_seconds):""}`;
   $("#bar").style.width=(d.progress.total?Math.round(100*d.progress.filled/Math.max(1,d.progress.total)):0)+"%";
   if(d.suspended){$("#app").innerHTML='<div class="card center"><h2>建卡已暂停</h2><p class="desc">副本已关闭，系统保留你的建卡资料。</p></div>';return;}
   if(d.needs_revision){note(d.content_update_notice||"世界内容已更新，部分选择需要重新确认。","err");}
@@ -912,6 +1361,8 @@ function render(d){
   }
   const sub=$("#submit");
   if(sub)sub.addEventListener("click",doSubmit);
+  const prev=$("#prev");
+  if(prev)prev.addEventListener("click",doPrev);
   const r=$("#ai-r"),e=$("#ai-e");
   if(r)r.addEventListener("click",()=>doAi("random"));
   if(e)e.addEventListener("click",()=>doAi("expand"));
@@ -933,18 +1384,49 @@ async function doSubmit(){
     window.__state=d;note("已保存。","ok");render(d);window.scrollTo(0,0);
   }catch(e){note(e.message,"err");}
 }
-async function doAi(mode){
-  const btn=$(mode==="random"?"#ai-r":"#ai-e");
-  let draft="";
-  if(mode==="expand"){
-    draft=prompt("输入你的初始设定（将保留你的创意进行扩写）：")||"";
-    if(!draft.trim())return;
+async function doAi(mode,draftOverride){
+  if(mode==="expand"&&draftOverride==null){
+    showExpand();
+    return;
   }
-  btn.disabled=true;note("AI 正在生成，通常需要十几秒…");
+  const btn=$(mode==="random"?"#ai-r":"#ai-e");
+  const draft=mode==="expand"?(draftOverride||""):"";
+  if(btn)btn.disabled=true;
+  note(mode==="random"?"正在随机选择…":"AI 正在生成，通常需要十几秒…");
   try{
     const d=await api("/cw/api/ai",{method:"POST",body:JSON.stringify({mode,draft})});
-    window.__state=d;note(`AI 已生成「${d.field_label||""}」并填入。`,"ok");render(d);window.scrollTo(0,0);
-  }catch(e){note(e.message,"err");btn.disabled=false;load();}
+    applyValue(d.value);
+    note(`已${mode==="random"?"随机选出":"生成"}「${d.field_label||""}」，请确认后点「提交并下一项」。`,"ok");
+  }catch(e){note(e.message,"err");}
+  finally{if(btn)btn.disabled=false;}
+}
+function showExpand(){
+  const ai=$(".ai");
+  if(!ai||$("#expand-box"))return;
+  const box=document.createElement("div");
+  box.id="expand-box";
+  box.style.marginBottom="12px";
+  box.innerHTML='<textarea id="expand-draft" style="min-height:80px" placeholder="输入你的初始设定，AI 将保留你的创意进行扩写…" maxlength="2000"></textarea>'+
+    '<div class="actions" style="margin-top:8px"><button class="primary" id="expand-ok">开始补全</button><button class="ghost" id="expand-cancel">取消</button></div>';
+  ai.after(box);
+  const ta=$("#expand-draft");
+  if(ta)ta.focus();
+  $("#expand-ok").addEventListener("click",()=>{
+    const d=ta.value.trim();
+    if(!d){note("请先输入你的初始设定","err");return;}
+    box.remove();
+    doAi("expand",d);
+  });
+  $("#expand-cancel").addEventListener("click",()=>box.remove());
+}
+function applyValue(value){
+  const f=(window.__state||{}).field||{};
+  if(f.type==="text"||f.type==="textarea"||f.type==="integer"){
+    const v=$("#v");if(v){v.value=value||"";const c=$("#cnt");if(c)c.textContent=[...(value||"")].length;}
+  }else{
+    const parts=String(value||"").split(/[、,，]/).map(s=>s.trim()).filter(Boolean);
+    document.querySelectorAll('input[name="v"]').forEach(i=>{i.checked=parts.includes(i.value);});
+  }
 }
 window.doConfirm=async function(){
   if(!confirm("确认提交角色卡？提交后网页会话将失效。"))return;
@@ -986,6 +1468,112 @@ window.doPreview=function(){
   }catch(e){
     $("#app").innerHTML=`<div class="card center"><h2>无法打开</h2><p class="desc">${esc(e.message||"链接无效")}</p>
       <p class="desc">请在 QQ 私聊机器人重新发送 <b>/团 网页建卡</b>。</p></div>`;
+  }
+})();
+</script>
+</body>
+</html>
+"""
+
+_CARD_REVIEW_HTML = """<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>321开团 · 网页审核</title>
+<style>
+:root{color-scheme:light;--bg:#f3f6f8;--card:#fff;--ink:#14202c;--muted:#6c7d8c;--line:#d6e0e7;--accent:#b66b16;--accent-soft:#f7ecdf;--danger:#bd3e34;--ok:#2e7d5b}
+*{box-sizing:border-box}
+body{margin:0;min-height:100vh;background:var(--bg);color:var(--ink);font-family:"Segoe UI","Microsoft YaHei",system-ui,sans-serif}
+.wrap{max-width:680px;margin:0 auto;padding:16px 14px 48px}
+.top{margin:6px 0 14px}
+h1{font-size:20px;margin:0 0 4px}
+.meta{color:var(--muted);font-size:13px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px 16px;margin:12px 0;box-shadow:0 1px 3px rgba(20,32,44,.05)}
+.item-head{display:flex;justify-content:space-between;align-items:baseline;gap:8px;cursor:pointer}
+.item-head b{font-size:16px}
+.tag{font-size:12px;color:var(--muted)}
+button{font:inherit;border:none;border-radius:9px;padding:9px 16px;cursor:pointer}
+button.primary{background:var(--accent);color:#fff}
+button.ok{background:var(--ok);color:#fff}
+button.danger{background:var(--danger);color:#fff}
+button.ghost{background:var(--accent-soft);color:var(--accent)}
+button:disabled{opacity:.5;cursor:not-allowed}
+.detail{display:none;margin-top:10px}
+.detail.open{display:block}
+pre{white-space:pre-wrap;word-break:break-word;background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:10px 12px;font-size:13px;line-height:1.65;font-family:inherit;margin:0 0 10px}
+textarea{width:100%;font:inherit;border:1px solid var(--line);border-radius:8px;padding:8px 10px;min-height:56px;resize:vertical;background:#fff;color:var(--ink)}
+.actions{display:flex;gap:10px;margin-top:10px}
+.actions button{flex:1}
+.done{color:var(--ok);font-weight:600}
+.note-msg{font-size:13px;margin-top:8px;color:var(--muted)}
+.center{text-align:center}
+.empty{color:var(--muted);text-align:center;padding:24px 0}
+#msg{position:fixed;left:50%;bottom:24px;transform:translateX(-50%);background:var(--ink);color:#fff;padding:9px 18px;border-radius:20px;font-size:13px;opacity:0;transition:.25s;pointer-events:none;max-width:88vw}
+#msg.show{opacity:.95}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="top"><h1>321开团 · 网页审核</h1><div class="meta" id="meta">正在加载…</div></div>
+  <div id="app"><div class="card empty">正在加载待审核列表…</div></div>
+</div>
+<div id="msg"></div>
+<script>
+const $=s=>document.querySelector(s);
+const esc=s=>String(s==null?"":s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+let __token="";
+function note(t,kind){const m=$("#msg");m.textContent=t;m.className=kind==="err"?"show err":"show";m.style.background=kind==="err"?"#bd3e34":"#14202c";clearTimeout(m.__t);m.__t=setTimeout(()=>m.classList.remove("show"),3200);}
+async function api(p,opt={}){const r=await fetch(p,{...opt,headers:{"Content-Type":"application/json","Authorization":"Bearer "+__token}});const d=await r.json().catch(()=>({}));if(!r.ok)throw new Error(d.error||("HTTP "+r.status));return d;}
+async function exchange(linkToken){const r=await fetch("/cw/api/review-exchange",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({token:linkToken})});const d=await r.json().catch(()=>({}));if(!r.ok)throw new Error(d.error||"兑换失败");__token=d.token;sessionStorage.setItem("tavern_review_token",__token);}
+function decidedKey(it){return "decided:"+it.session_id+":"+it.participant_id+":"+it.card_version_no;}
+function render(d){
+  $("#meta").textContent="待审核 "+d.count+" 张 · 会话 30 分钟有效，可刷新页面继续";
+  if(!d.count){$("#app").innerHTML='<div class="card empty">当前没有待审核的角色卡。</div>';return;}
+  $("#app").innerHTML=d.items.map((it,i)=>`
+  <div class="card" data-pid="${esc(it.participant_id)}" data-sid="${esc(it.session_id)}" data-ver="${it.card_version_no}">
+    <div class="item-head" onclick="this.parentNode.querySelector('.detail').classList.toggle('open')">
+      <b>${i+1}. ${esc(it.character_name||"未命名")}${it.character_code?"（"+esc(it.character_code)+"）":""}</b>
+      <span class="tag">${esc(it.session_name)} · ${esc(it.review_ref)}</span>
+    </div>
+    <div class="tag" style="margin-top:2px">玩家：${esc(it.player_name||"未知")} · 版本 v${it.card_version_no} · 点击标题展开详情</div>
+    <div class="detail"><pre>${esc(it.detail_text)}</pre>
+      <textarea placeholder="备注（可选，驳回时建议填写原因）"></textarea>
+      <div class="actions">
+        <button class="ok" onclick="decide(this,true)">通过</button>
+        <button class="danger" onclick="decide(this,false)">驳回</button>
+      </div>
+      <div class="note-msg result"></div>
+    </div>
+  </div>`).join("");
+  d.items.forEach(it=>{if(sessionStorage.getItem(decidedKey(it))){const card=document.querySelector(`[data-pid="${it.participant_id}"]`);if(card){card.querySelectorAll("button").forEach(b=>b.disabled=true);card.querySelector(".result").innerHTML='<span class="done">✔ 已处理（'+esc(sessionStorage.getItem(decidedKey(it)))+'）</span>';}}});
+}
+async function load(){try{const d=await api("/cw/api/review-state");render(d);}catch(e){$("#app").innerHTML=`<div class="card center"><h2>无法加载</h2><p class="desc">${esc(e.message)}</p><p class="desc">请在 QQ 私聊机器人重新发送 <b>/团 审核</b>。</p></div>`;}}
+window.decide=async function(btn,approved){
+  const card=btn.closest(".card");
+  const noteText=card.querySelector("textarea").value.trim();
+  if(!approved&&!noteText){note("驳回建议填写原因备注","err");return;}
+  if(!confirm(approved?"确认通过该角色卡？":"确认驳回该角色卡？"))return;
+  btn.disabled=true;
+  try{
+    const d=await api("/cw/api/review-decide",{method:"POST",body:JSON.stringify({session_id:card.dataset.sid,participant_id:card.dataset.pid,approved,note:noteText})});
+    if(!d.ok)throw new Error(d.error||"操作失败");
+    sessionStorage.setItem(decidedKey({session_id:card.dataset.sid,participant_id:card.dataset.pid,card_version_no:card.dataset.ver}),d.decision);
+    card.querySelectorAll("button").forEach(b=>b.disabled=true);
+    card.querySelector(".result").innerHTML=`<span class="done">✔ 「${esc(d.character_name)}」${esc(d.decision)}</span>`;
+    note("已"+d.decision+"「"+d.character_name+"」");
+  }catch(e){note(e.message,"err");btn.disabled=false;}
+};
+(async function init(){
+  const link=new URLSearchParams(location.search).get("token");
+  __token=sessionStorage.getItem("tavern_review_token")||"";
+  try{
+    if(link){await exchange(link);}
+    if(!__token){throw new Error("链接无效或已过期");}
+    await load();
+  }catch(e){
+    $("#app").innerHTML=`<div class="card center"><h2>无法打开</h2><p class="desc">${esc(e.message||"链接无效")}</p>
+      <p class="desc">请在 QQ 私聊机器人重新发送 <b>/团 审核</b> 获取新链接。</p></div>`;
   }
 })();
 </script>

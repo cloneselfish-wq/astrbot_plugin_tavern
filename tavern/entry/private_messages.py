@@ -134,6 +134,88 @@ class PrivateMessagesMixin:
             self.application_router
         )
 
+    async def _private_review_web_entry(self, event, command) -> str:
+        """私聊 /团 审核：为主持人签发网页审核链接（/cw/review）。
+
+        返回空字符串表示未处理（非主持人也没有任何待审核时交给后续流程）。
+        """
+
+        from ..presentation.reviews import _pending_review_cards
+
+        sender_id = str(event.get_sender_id() or "")
+        config = self.runtime_config()
+        argument = str(command.argument or "").strip()
+
+        hosted: list[tuple[Mapping[str, Any], list[Any]]] = []
+        for session in await self.database.list_sessions():
+            if str(session.get("state") or "") == SESSION_FINISHED:
+                continue
+            session_id = str(session.get("id") or "")
+            if not session_id:
+                continue
+            roles = await self.database.permission_roles(
+                session_id, sender_id
+            )
+            if "host" not in roles and not config.is_admin(sender_id):
+                continue
+            roster = await self.database.list_roster(session_id)
+            pending = list(_pending_review_cards(roster))
+            if pending:
+                hosted.append((session, pending))
+        if not hosted:
+            return "【网页审核】当前没有待审核的角色卡。"
+
+        if argument:
+            selected = None
+            if argument.isdigit() and 1 <= int(argument) <= len(hosted):
+                selected = hosted[int(argument) - 1]
+            else:
+                matches = [
+                    item
+                    for item in hosted
+                    if str(item[0].get("instance_name") or "").strip()
+                    == argument
+                ]
+                if len(matches) == 1:
+                    selected = matches[0]
+            if selected is None:
+                lines = ["【网页审核】没有匹配的副本。可选择的副本："]
+                for index, (session, pending) in enumerate(hosted, 1):
+                    lines.append(
+                        f"{index}. {session.get('instance_name')}"
+                        f"（待审 {len(pending)} 张）"
+                    )
+                return "\n".join(lines)
+            hosted = [selected]
+
+        if len(hosted) > 1:
+            lines = [
+                "【网页审核】你主持的多个副本都有待审核角色卡，"
+                "请发送 /团 审核 <序号>："
+            ]
+            for index, (session, pending) in enumerate(hosted, 1):
+                lines.append(
+                    f"{index}. {session.get('instance_name')}"
+                    f"（待审 {len(pending)} 张）"
+                )
+            return "\n".join(lines)
+
+        bypass_host = config.is_admin(sender_id)
+        url, error = await self.card_web_linker.issue_review_link(
+            sender_id,
+            bypass_host=bypass_host,
+        )
+        if error:
+            return f"【网页审核】{error}"
+        session, pending = hosted[0]
+        return (
+            f"【网页审核】{session.get('instance_name')}"
+            f" · 待审 {len(pending)} 张\n"
+            f"{url}\n"
+            "链接 15 分钟内有效，可在网页中查看角色卡详情并通过 / 驳回；"
+            "审核会话 30 分钟内可刷新继续。"
+        )
+
     async def _card_ai_generate(
         self,
         origin: str,
@@ -378,6 +460,19 @@ class PrivateMessagesMixin:
                 "下一步：重新发送 /团 成长 查看当前状态。",
             )
             return
+        if command.action == "review":
+            try:
+                response = await self._private_review_web_entry(event, command)
+            except Exception:
+                logger.exception("321开团私聊网页审核入口失败")
+                response = (
+                    "【网页审核】生成审核链接失败。\n"
+                    "下一步：请稍后重试；若持续失败，请联系管理员检查独立面板状态。"
+                )
+            if response:
+                event.stop_event()
+                yield await self._message_result(event, response)
+                return
         if active_draft:
             try:
                 fields = active_draft.get("fields")

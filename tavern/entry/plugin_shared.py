@@ -488,6 +488,7 @@ from ..presentation import (
     _pending_review_cards,
     _resolve_pending_review,
     format_pending_reviews,
+    format_pending_reviews_compact,
     format_review_card,
     _format_remaining_time,
     _story_reply_parts,

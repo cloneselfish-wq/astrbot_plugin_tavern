@@ -482,8 +482,19 @@ class CommandMethods:
             yield await self._message_result(event, response)
 
     async def tavern_help(self, event: AstrMessageEvent):
-        """显示开团指令帮助。"""
+        """显示开团指令帮助（渲染为图片）。
+        私聊 / 群聊都可用。图片渲染失败时回退到纯文本。"""
 
+        import logging as _logging
+        _logging.getLogger("ai_tavern.cmd").info(
+            "tavern_help ENTRY group_id=%r", self._group_id(event)
+        )
+        scope = "private" if not self._group_id(event) else "group"
+        image_path = await self._render_help_image(event, scope=scope)
+        if image_path:
+            event.stop_event()  # 必须 stop_event，否则 priority=100 的 on_group_message 会再发 contextual_help 大段文本
+            yield event.image_result(image_path)
+            return
         response = await self._run_native_command(event, "help")
         if response:
             yield await self._message_result(event, response)

@@ -560,7 +560,7 @@ class CardCommandService:
             status = (
                 "角色卡已自动通过，可以回群发送 /团 准备。"
                 if result.get("auto_approved")
-                else "角色卡已提交审核，审核通过后再回群准备。"
+                else "角色卡已提交主持人审核：主持人在团局群发送 /团 审核 即可查看并审批，通过后再回群准备。"
             )
             extras = []
             pending_count = int(result.get("card_stage_pending_count") or 0)

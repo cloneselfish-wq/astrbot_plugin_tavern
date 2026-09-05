@@ -2,8 +2,8 @@ from __future__ import annotations
 
 
 PLUGIN_NAME = "astrbot_plugin_tavern"
-PLUGIN_VERSION = "1.0.0-rc12"
-PLUGIN_DISPLAY_VERSION = "v1.0.0-rc12"
+PLUGIN_VERSION = "1.0.0-rc13"
+PLUGIN_DISPLAY_VERSION = "v1.0.0-rc13"
 WORLD_PROTOCOL_VERSION = "TWP 1.0.0-rc10"
 TWP_VERSION = "1.0.0-rc10"
 TWP_CORE_VERSION = "1.0.0-rc10"
@@ -93,6 +93,8 @@ MANAGEMENT_ACTIONS = {
     "强制全员准备": "force_ready",
     "阵容": "roster",
     "审核": "review",
+    "网页审核": "review",
+    "审核链接": "review",
     "选择": "choose",
     "灵感": "inspiration",
     "灵感重投": "inspiration_reroll",
